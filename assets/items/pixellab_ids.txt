@@ -1,0 +1,27 @@
+hair_ponytail_black 2411ea32-d0b5-4216-8089-d871f7da9ec6
+hair_spiky_blonde bf251895-1bb3-4b8f-a63d-367047484fe9
+hair_curly_ginger 197831be-c02a-4943-b4d4-aeab29620590
+hair_bob_blue 16d9122d-caae-4577-8d73-045308e8193b
+hair_mohawk_green 7fc3e1b8-5bcd-44ca-a336-2fa3a9ff1bd0
+hat_cap_red 28e7c797-b1e0-4443-a4b4-30c7a49c2bb8
+hat_straw 9c5cabeb-dfaf-4786-bb13-04994dbae1d0
+hat_knight_helmet 47231930-c93c-42f5-a16f-af1e1b3ccc38
+hat_beanie_green 7db0425a-9dcb-4c15-b791-8614e346dc85
+hat_bandana_red efdebc92-de44-4074-946a-d42b2827ca86
+shirt_leather_jacket cb831d23-08e9-47de-9645-0285c5e3351d
+shirt_hoodie_blue 81798149-07dc-4d7b-a556-2677cabfbd78
+shirt_tunic_green b108b341-074b-4dac-87cb-89dc80751677
+shirt_sailor_striped d9be3989-951e-440a-adc1-ce8289774c51
+shirt_chestplate_iron 66299ef2-779c-4487-9131-f2d885cc1d0a
+pants_jeans_blue 241e6089-f09b-4734-b689-29d2a03bc62d
+pants_leather_brown dfafaad8-2c55-4492-b01c-d2bf0e0c0fb0
+pants_black c82e647e-b499-4846-b45c-85fe7e571162
+shoes_boots_brown 9102c70b-837a-4d4b-b125-7e1d657fdeb4
+shoes_sneakers_red 685a369f-247c-4d6b-83c7-57d3ae4bc3c9
+hair_brown 8b74bab9-c42e-448c-8c71-b225641cd127
+shirt_red b0951388-46e9-462a-9323-59d73d001180
+shoes_boots_iron 5db32c5b-19f1-4119-861f-b8700963a48d
+face_goggles ee4884b4-8568-4a09-9457-674786c554ba
+# hair sheet (20 items, inpaint job 7a6dddcc-84f2-46eb-9532-67b6fe32f5b2): hair_spiky_orange ponytail_brown afro_black bob_blonde mohawk_blue buzz_brown buns_pink fringe_purple wavy_red messy_green slick_grey braids_brown pigtails_blonde topknot_black undercut_brown curly_orange long_navy anime_red emo_black fluffy_white
+# pickaxes (object 951d7608-a7c1-4b3e-bb4c-cf98bd4d5cfc frames 0-19; frames 20-63 are unused bonus designs): wood stone iron gold diamond obsidian copper emerald ruby rusty bone ice fire lightning drill rainbow nature shadow candy royal
+# shirt/pants/wings sheets: inpaint ba5d2114-b770-4637-9659-63fb6d9d56e7 / 06d5a5f8-9a7b-4668-8caf-f9dd44de7864 / 68c7697b-c8b7-45d3-b95e-2b28c6dc8cec

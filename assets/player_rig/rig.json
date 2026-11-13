@@ -1,0 +1,75 @@
+{
+  "size": 48,
+  "facing": "east",
+  "order": [
+    "arm_back",
+    "leg_back",
+    "leg_front",
+    "torso",
+    "head",
+    "arm_front"
+  ],
+  "pivots": {
+    "head": [
+      24,
+      20
+    ],
+    "torso": [
+      27,
+      38
+    ],
+    "arm_front": [
+      21,
+      25
+    ],
+    "leg_front": [
+      24,
+      41
+    ],
+    "leg_back": [
+      28,
+      41
+    ],
+    "arm_back": [
+      23,
+      25
+    ]
+  },
+  "skin_ramps": {
+    "light": [
+      "#f8dcb3",
+      "#f5c596",
+      "#e1936f",
+      "#c37a60",
+      "#8e5143"
+    ],
+    "tan": [
+      "#f0c08e",
+      "#d99a68",
+      "#b8704c",
+      "#965740",
+      "#6a3a2c"
+    ],
+    "brown": [
+      "#c98e62",
+      "#a96d47",
+      "#8a5236",
+      "#6c3e2a",
+      "#4a291d"
+    ],
+    "dark": [
+      "#9a6a4b",
+      "#7c5038",
+      "#5f3a28",
+      "#47291e",
+      "#2f1b14"
+    ],
+    "pale": [
+      "#fdeee0",
+      "#f7dcc8",
+      "#e8b9a0",
+      "#cf9a84",
+      "#9c6b5a"
+    ]
+  }
+}
