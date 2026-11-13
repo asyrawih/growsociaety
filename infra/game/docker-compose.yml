@@ -10,15 +10,23 @@ services:
       dockerfile: infra/game/Dockerfile
     ports:
       - "7777:7777/udp"
+      - "127.0.0.1:8090:8090"   # account HTTP API; only nginx reaches it
     environment:
       GAME_SERVER_CERT: /data/world_server_cert.der
+      GAME_PUBLIC_ADDR: 76.13.196.13:7777
+      GAME_SERVER_ID: prod-1
       GAME_ADMIN_TOKENS: ${GAME_ADMIN_TOKENS:-}
       GAME_MOD_TOKENS: ${GAME_MOD_TOKENS:-}
+      # Account names with Role::Owner at login; the list lives only in .env.
+      GAME_SUPER_ADMINS: ${GAME_SUPER_ADMINS:-}
       DATABASE_URL: postgres://game:${POSTGRES_PASSWORD}@db:5432/game
       # Voice (docs/knowledge/12): unset = voice off. Key/secret in .env, matching /opt/livekit/livekit.yaml.
       LIVEKIT_URL: ${LIVEKIT_URL:-}
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-}
+      # Account HTTP API (login/register → signed token for Hello), behind nginx TLS on the host.
+      GAME_HTTP_ADDR: 0.0.0.0:8090
+      GAME_AUTH_SECRET: ${GAME_AUTH_SECRET:?set in .env}
     volumes:
       - world-data:/data
     depends_on:
@@ -37,7 +45,6 @@ services:
       - "127.0.0.1:5433:5432"
     volumes:
       - db-data:/var/lib/postgresql/data
-      - ../../server/world_server/migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U game -d game"]
       interval: 5s
