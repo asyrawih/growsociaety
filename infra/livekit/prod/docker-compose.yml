@@ -1,0 +1,11 @@
+# Production LiveKit (voice, docs/knowledge/12). Runs on the game host from /opt/livekit, not from this repo.
+#   copy this dir to /opt/livekit, put the real key in livekit.yaml, then: docker compose up -d
+# The same key/secret go in infra/game/.env as LIVEKIT_API_KEY / LIVEKIT_API_SECRET.
+services:
+  livekit:
+    image: livekit/livekit-server:latest
+    command: --config /etc/livekit.yaml
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro

@@ -1,0 +1,16 @@
+# Template: the real key lives only in /opt/livekit/livekit.yaml (chmod 600) and infra/game/.env.
+# Generate: key = API + `openssl rand -hex 6`, secret = `openssl rand -base64 32 | tr -d "=+/"`.
+port: 7880
+bind_addresses: ["127.0.0.1"]   # only nginx (TLS) talks to it; clients use wss://livekit.kelasmalam.app
+rtc:
+  tcp_port: 7881                # open: 7881/tcp
+  port_range_start: 50000       # open: 50000-60000/udp
+  port_range_end: 60000
+  use_external_ip: true
+turn:
+  enabled: true
+  udp_port: 3478                # open: 3478/udp (relay 30000-40000/udp). No TURN/TLS yet.
+keys:
+  APIxxxxxxxxxxxx: REPLACE_WITH_SECRET
+logging:
+  level: info
