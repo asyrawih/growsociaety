@@ -46,3 +46,104 @@ Rebuild the body: `uv run --with pillow python docs/art/rig_split.py assets/play
 PixelLab tileset ids: grass `f2ae29cf-6aa7-4af8-8b89-9732243c3449`, dirt `d4357c74-d336-4234-ac31-5c88b3f76686`,
 stone `b7d0c1de-e98b-486a-aed7-a0c50949b06d`, sand `41917343-5351-4341-a94d-e1bf93e2842b`.
 Player character id: `b654b0ae-2ad5-48d1-ad8c-3aebed0604b0`.
+
+## UI (`assets/ui/`)
+
+Wood-and-parchment kit from PixelLab (template `bbe2b58c-499b-4f00-93f1-3efc79e80878`). Reference layout: `ui/_mockup.png`.
+Use nearest-neighbour sampling. 9-slice insets (px, every side unless noted) keep the corners crisp when stretched:
+
+| File | Size | 9-slice | Use |
+|---|---|---|---|
+| `panel.png` | 139×125 | 18 | Window background: inventory, wardrobe, store |
+| `slot.png` | 37×37 | 8 | Item slot (inventory grid, hotbar) |
+| `slot_selected.png` | 37×37 | 8 | Selected slot (gold rim) |
+| `slot_worn.png` | 37×37 | 8 | Wardrobe slot holding an item (green check badge, bottom-right) |
+| `slot_equip_empty.png` | 37×37 | 8 | Empty wardrobe slot; draw `slot_icon_<slot>.png` on top |
+| `slot_icon_{hair,hat,face,shirt,pants,shoes,back,hand}.png` | 32×32 | – | Grey silhouette for an empty slot, names = `Slot` enum |
+| `preview_frame.png` | 94×97 | 20 | Wardrobe character preview. Stretch it to **at least 136×150** for the rig at 2× (96 px plus room for wings and big hair), centre the rig and put its feet ~10 px above the inner bottom edge |
+| `tab.png` | 51×23 | 8 | Tab button (e.g. Inventory / Wardrobe, store categories) |
+| `close.png` | 27×27 | – | Close button, top-right corner of a panel |
+| `hotbar.png` | 138×47 | – | Has 5 cells baked in, so don't stretch it. Prefer a row of `slot.png` |
+
+Wardrobe layout (see mockup): left column hair, hat, face, shirt; right column pants, shoes, back, hand; character
+preview in the middle. **Equipment never appears in the hotbar**: the hotbar lists non-equipment items only. Clothes
+are equipped from the wardrobe/inventory.
+
+Overhead player name: plain text with a 1 px dark outline, no background. Its colour comes from the player's level
+(Growtopia-style tiers, white until levels exist).
+
+Every equipment item has `items/<name>/icon.png` (32×32) for slots. Pickaxe icons are hand-made; the rest come from
+`docs/art/item_icons.py`, which stacks the item's own layers. Run it again after adding items.
+
+## Font (`assets/fonts/`)
+
+`growsociaety_pixel.ttf`: a pixel font made in PixelLab (job `397c882a-b5f9-4d47-9864-88def5302ace`). Glyphs are drawn
+on a 16 px grid, so use font sizes that are multiples of 16 (16, 32) to keep pixels crisp; other sizes blur.
+Preview: `fonts/_preview.png`. It covers A-Z a-z 0-9, space and `. , ! ? : ; ' " - + ( ) / % * = _ $`.
+**Missing:** `@ # & < > [ ] { } | ~ ^ \` and backtick, plus accented letters. Text containing those (mostly chat)
+needs the default font, or input limited to the covered set.
+
+### Voice chat icons (`ui/voice_*.png`, `ui/settings_gear.png`), 32×32
+
+`voice_mic_on`, `voice_mic_muted`, `voice_mic_talking` (green, while transmitting), `voice_speaker_on`,
+`voice_speaker_muted`, `voice_speaking` (bubble above a talking player's head), `voice_level_bars` (mic level),
+`voice_key_v` (push-to-talk hint), `voice_headphones`, `settings_gear` (voice settings menu).
+
+### Lobby (`ui/lobby/`)
+
+Login and register screen. Reference layout: `ui/lobby/_mockup.png`.
+- `background.png` (480×270, scale ×4): parallax layers and a terrain strip with trees, made from existing assets.
+- `input.png` (241×37, 9-slice 8): text field. Draw the text inside the dark area.
+- `button_primary.png` (green, Login/Register) and `button_secondary.png` (brown, Register/Back), 151×45,
+  9-slice 10, each with `_hover` and `_pressed` versions.
+- `checkbox_off.png` / `checkbox_on.png` (29×29) for "Remember me". `eye.png` (+ `_hover`/`_pressed`) toggles
+  showing the password.
+- Panel = `ui/panel.png`. Title in the pixel font at 32 px.
+
+## Flags (`assets/flags/`)
+
+247 country flags, about 16×11, named by ISO 3166-1 alpha-2 code (`id.png`, `jp.png`, …), plus `england`,
+`scotland`, `wales`, `catalonia`, `europeanunion`. Drawn left of the overhead name, vertically centred on the text.
+Source: famfamfam flag icons, **public domain** (`gg.png` left out because it needs attribution). A few flags are not
+16×11 (`np` 9×11, `ch`/`va` 11×11), so centre them in a 16×11 box.
+
+## Foliage (`assets/foliage/`)
+
+Decoration only: no collision, can't be punched. Preview: `foliage/_preview.png`.
+Every sprite's base touches its **bottom edge**, so place it with the bottom on top of a solid block. Two exceptions,
+`vines_hanging` and `moss_hanging`, touch the **top edge** and hang under a block.
+- 32×32 (one tile): grass_short, grass_tall, grass_seeds, clover, dandelions, tulips, bluebells, daisies, poppies,
+  lavender, pink_flowers, sunflower, mushrooms_brown, mushrooms_glow, toadstool, fern_sprout, bush_round, berry_bush,
+  bramble, reeds, lily_pads (on water), rock_mossy, pebbles, stump, log_short, vines_hanging, moss_hanging, ivy,
+  cactus and desert_shrub (sand), grass_snowy, pumpkin.
+- 64×64 (2×2 tiles, centred on its tile): tree_pine, tree_birch, tree_willow, tree_maple_autumn, tree_palm (sand),
+  tree_dead, tree_apple, tree_mushroom, bush_large, hedge_flowers, reeds_tall, boulder_ferns, log_hollow, bamboo,
+  tree_pine_snowy, crystal_plant.
+Suggested world-gen use: on surface grass tiles, each tile rolls for a small plant (~25%) or, with room, a tree
+(~6%). Sand gets cactus/desert_shrub/tree_palm. Undersides of floating blocks get the hanging pieces.
+
+## Audio (`assets/audio/`)
+
+Made with ElevenLabs (flow `2urSGR1SMmQCjMh7gbr8`). Files are **OGG Vorbis**, which Bevy plays with its default features.
+They were converted from the MP3 originals with ffmpeg's built-in `vorbis` encoder (this Homebrew ffmpeg has no libvorbis).
+- `bgm/world.ogg`: 120 s cozy village loop (acoustic guitar, flute, marimba) for in-world play. Loop it. Both ends
+  are at the same level with a 15 ms fade, so the loop point doesn't click.
+- `bgm/lobby.ogg`: 60 s title theme (strings, guitar, glockenspiel) for the login/register lobby. It ends on a
+  fade-out, so looping sounds like the song restarting.
+- `sfx/`, 0.5–2 s, dry (no reverb): `punch_dirt`, `block_place`, `gem` (collect), `land`, `footstep_grass`,
+  `harvest`, `door` (enter), `equip`, `purchase`, `chat` (incoming message), `level_up`, `punch_stone`, `block_break`,
+  `denied` (action refused), `item_pickup`, `jump`, `ui_click`, `panel_open`, `plant` (seed planted).
+
+### Top bar and settings (`ui/settings/`)
+
+Reference: `ui/settings/_mockup.png`. PixelLab kit `cbfdcc96-9393-4bbc-bf52-0131bb7249d7`, icons `a74d9866-9437-4a32-bfeb-6b372a9c4dc0`.
+- `topbar.png` (242×35, 9-slice 10): strip in the **top-right corner** holding round icon buttons, from left: shop,
+  inventory, wardrobe, chat, voice mic (`ui/voice_mic_on`/`_muted`), settings (`ui/settings_gear`).
+- `icon_button.png` (41×41, round, empty face): draw a 32×32 icon centred on top.
+- Icons, 32×32: `icon_shop`, `icon_inventory`, `icon_wardrobe`, `icon_chat`, `icon_friends`, `icon_world`,
+  `icon_exit`, `icon_help`, `icon_home`, `icon_notification`. Settings tabs use `icon_audio`, `icon_voice`,
+  `icon_display`, `icon_controls`, `icon_account` and `icon_language`.
+- Controls: `slider_track.png` (151×16, 9-slice 7) + `slider_knob.png` (25×25); `toggle_off.png` / `toggle_on.png`
+  (57×29); `dropdown.png` (100×29, 9-slice 10, arrow on the right); `divider.png` (246×17, 9-slice left/right 8).
+- The settings panel is `ui/panel.png` with tabs (`ui/tab.png`): Audio (music / SFX / voice volume sliders),
+  Voice (push-to-talk V and open mic toggles, mic dropdown), Display, Controls, Account (skin tone, language).
