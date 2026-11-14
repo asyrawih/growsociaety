@@ -6,6 +6,7 @@
 mod accounts;
 mod commands;
 mod conn;
+mod deed;
 mod http;
 mod leases;
 mod reset;

@@ -269,6 +269,57 @@ def bubble_tail():
     return im
 
 
+def pull_tab(open_, hover):
+    """Bag pull tab on the hotbar's top edge (docs/knowledge/ux/bottom-hud.md): 32x16 wood grip, rounded top,
+    flat open bottom so it sits on the hotbar frame. Closed shows an UP arrow (open the bag), open a DOWN arrow."""
+    w, h, r = 32, 16, 5
+    im = Image.new("RGBA", (w, h))
+    px = im.load()
+    for y in range(h):
+        for x in range(w):
+            if y < r:  # only the top corners are rounded
+                cx = min(max(x, r), w - 1 - r)
+                d = math.hypot(x - cx, y - r)
+                if d > r + 0.35:
+                    continue
+                edge = d > r - 0.65
+            else:
+                edge = x in (0, w - 1)
+            if edge or y == 0:
+                px[x, y] = (5, 1, 1, 255)
+            elif y == 1:
+                px[x, y] = (242, 195, 114, 255)  # gold top trim (tab.png)
+            elif y == 2 or x == 1:
+                px[x, y] = (179, 120, 54, 255)
+            else:
+                px[x, y] = (77, 42, 31, 255)  # wood fill, continues into the hotbar frame (no bottom outline)
+    # chevron arrow, 9 wide x 5 tall, centred in the tab body
+    ox, oy = w // 2, 8
+    for k in range(5):
+        row = oy + (k - 2 if not open_ else 2 - k)  # closed → UP (tip at top); open → DOWN (tip at bottom)
+        for dx in (-k, k):
+            for t in (0, 1):  # 2 px thick strokes
+                x = ox + dx + (t if dx >= 0 else -t) - (1 if dx >= 0 else 0)
+                if 0 <= x < w and 0 <= row < h:
+                    px[x, row] = (255, 226, 140, 255)
+    # dark outline around the arrow so it stays crisp at 2x
+    arrow = {(x, y) for y in range(h) for x in range(w) if px[x, y] == (255, 226, 140, 255)}
+    for x, y in arrow:
+        for ddx, ddy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            n = (x + ddx, y + ddy)
+            if n not in arrow and 0 <= n[0] < w and 2 < n[1] < h and px[n][3]:
+                px[n] = (25, 12, 8, 255)
+    if hover:  # slightly lighter
+        lit = Image.new("RGBA", (w, h))
+        lp = lit.load()
+        for y in range(h):
+            for x in range(w):
+                rr, g, b, a = px[x, y]
+                lp[x, y] = (min(255, int(rr * 1.18 + 8)), min(255, int(g * 1.18 + 6)), min(255, int(b * 1.18 + 4)), a)
+        return lit
+    return im
+
+
 def strip(frames, w, h):
     out = Image.new("RGBA", (w * len(frames), h))
     for i, f in enumerate(frames):
@@ -335,6 +386,10 @@ def main():
     icon_search().save(ROOT / "assets/ui/icon_search.png")
     bubble().save(ROOT / "assets/ui/bubble.png")
     bubble_tail().save(ROOT / "assets/ui/bubble_tail.png")
+    for open_ in (False, True):
+        for hover in (False, True):
+            name = "pull_tab" + ("_open" if open_ else "") + ("_hover" if hover else "")
+            pull_tab(open_, hover).save(ROOT / f"assets/ui/{name}.png")
     print("wrote block_break_dust, soil_puff, splice_swirl, drop_glow (fx) + chip, chip_active, icon_search (ui)")
     assert ring.size == (192, 24) and puff.size == (192, 32) and sparkle.size == (64, 16)
     print("wrote assets/ui/respawn_ring.png, assets/fx/respawn_puff.png + .json, assets/fx/ready_sparkle.png + .json")

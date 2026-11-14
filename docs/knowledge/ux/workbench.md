@@ -33,7 +33,7 @@ Workbench, and nothing says so. The station rule (recipes need a Workbench withi
 ## Input
 
 - Keyboard: C opens/closes; arrows move; Enter crafts; `[` `]` switch bag tabs; Esc closes.
-- Gamepad: Y opens/closes (unused today); A crafts; B closes.
+- Gamepad: Y opens the bag (bottom-hud.md), LB/RB to its Craft tab; A crafts; B closes.
 - Touch: the top-bar Craft button; tap a recipe, tap Craft.
 
 ## Do NOT build

@@ -3,6 +3,7 @@
 pub mod claims;
 pub mod commands;
 pub mod crafting;
+pub mod deeds;
 pub mod farming;
 pub mod inventory;
 pub mod items;

@@ -307,7 +307,13 @@ impl Room {
                     self.target_ok(id, target)?;
                 }
                 let held = held_before(&self.state, &admin);
+                let world_claim = self.state.world.world_claim;
                 let result = apply_admin(&mut self.state, id, admin, now);
+                // An admin clearing the world claim block voids the world's deed too.
+                if world_claim.is_some() && self.state.world.world_claim.is_none() {
+                    let voided = self.void_deed(id, now);
+                    self.broadcast(&voided, None);
+                }
                 self.touched |= result.is_ok();
                 if let Ok(events) = &result {
                     self.broadcast(events, None);
@@ -1011,6 +1017,7 @@ mod reset_tests {
             xp: 0,
             notices: vec![notice.into()],
             ignores: vec![],
+            deeds: vec![],
         };
         let mut seat = join(&mut room, 3, Role::Player, Some(save));
         assert_eq!(room.state.players[&seat.id].inventory.count(SMALL_CLAIM), 1);
@@ -1042,6 +1049,7 @@ mod reset_tests {
             xp: 0,
             notices: vec![],
             ignores: vec![PlayerId(2)],
+            deeds: vec![],
         };
         let mut me = join(&mut room, 1, Role::Player, Some(save));
         assert_eq!(ignoring_msgs(&mut me), [vec![PlayerId(2)]], "sent on join");

@@ -8,6 +8,7 @@ mod chat;
 mod chat_bubbles;
 mod claim_ui;
 mod craft_ui;
+mod deeds_ui;
 mod farming_ui;
 mod foliage;
 mod hints;
@@ -176,6 +177,7 @@ fn main() {
         world_select::WorldSelectPlugin,
         chat_bubbles::ChatBubblesPlugin,
         avatar_menu::AvatarMenuPlugin,
+        deeds_ui::DeedsUiPlugin,
     ));
     // After `NetPlugin` (voice is online only) and `HudPlugin` (its panel uses the HUD's).
     #[cfg(feature = "voice")]

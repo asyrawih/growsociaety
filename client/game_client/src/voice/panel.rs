@@ -8,13 +8,13 @@ use game_shared::physics::HITBOX_HEIGHT;
 use game_shared::rules::PlayerId;
 
 use super::{Link, VoiceState};
-use crate::hud::{HUD_MARGIN, OpenPanel, PANEL_COLOR, SLOT_GAP, ink, label, tab_node};
+use crate::hud::{
+    BottomRightHud, HUD_MARGIN, OpenPanel, PANEL_COLOR, SLOT_GAP, ink, label, tab_node,
+};
 use crate::net::Net;
 use crate::settings::{Field, OpenDropdown, Settings, SettingsTab, TabBody};
 use crate::state::Game;
 
-/// Below the gem counter, top-left.
-const STATUS_TOP: f32 = 48.0;
 /// Overhead icon: its centre this far above the hitbox top (clear of the nameplate), world px.
 const ICON_ABOVE: f32 = 52.0;
 const ICON_Z: f32 = 30.0;
@@ -67,10 +67,12 @@ pub(super) fn spawn_panel(
             ));
         });
     }
+    // Bottom-right, level with the hotbar (docs/knowledge/ux/bottom-hud.md); `hud` keeps it above
+    // the bag when the open bag would cover it.
     let status = Node {
         position_type: PositionType::Absolute,
-        left: px(HUD_MARGIN),
-        top: px(STATUS_TOP),
+        right: px(HUD_MARGIN),
+        bottom: px(HUD_MARGIN),
         padding: UiRect::all(px(SLOT_GAP)),
         column_gap: px(SLOT_GAP),
         align_items: AlignItems::Center,
@@ -78,7 +80,12 @@ pub(super) fn spawn_panel(
         ..default()
     };
     commands
-        .spawn((status, BackgroundColor(PANEL_COLOR), MicStatus))
+        .spawn((
+            status,
+            BackgroundColor(PANEL_COLOR),
+            MicStatus,
+            BottomRightHud,
+        ))
         .with_children(|s| {
             s.spawn(icon(&assets, MIC_ON, HUD_ICON));
             s.spawn(label(""));

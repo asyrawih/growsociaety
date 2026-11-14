@@ -84,6 +84,7 @@ symbols after another session built, `cargo clean -p <crate>` and rebuild.
 | `docs/knowledge/ux/**` (UX specs) | UI/UX session (growsociaety-64) |
 | `crates/game_shared/**` (rules, items, world, farming, claims, …) | Scripting subagent of the research/QC session. The optional `serde` feature and its derives: coding session |
 | `client/game_client/src/{world_view,hud,interact,screenshot}.rs` | Scripting subagent of the research/QC session |
+| `client/game_client/src/almanac.rs`, `hints.rs` | Client-UI/docs session (growsociaety-8e) and its subagents, since 2026-11-14 (were growsociaety-f0's) |
 | `client/game_client/src/player.rs`, `player/rig.rs`, `camera.rs` | Coding session (rig, equipment, zoom) |
 | `client/game_client/src/{main,state}.rs` | Coding session for network wiring (`mod net;`, routing actions to the server); scripting subagent for everything else, after asking |
 | `client/game_client/src/net.rs`, `chat.rs`, `crates/game_protocol/**`, `server/**`, root `Cargo.toml` | Coding session (multiplayer, M7, chat) |

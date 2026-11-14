@@ -2,6 +2,11 @@
 //! changes when a `GameEvent` or `ActionResult` arrives or the player opens/selects something,
 //! never by polling the state every frame. The HUD decides nothing: buying, equipping and toggling
 //! send an `Action`. Panels use the wood-and-parchment kit in assets/ui/ (assets/README.md, "UI").
+//!
+//! The bottom of the screen (docs/knowledge/ux/bottom-hud.md): the hotbar, a pull tab on its top
+//! edge and the selection strip above that. The bag (Inventory / Wardrobe / Craft tabs) slides up
+//! from behind the hotbar; its grid is 8 wide, so the hotbar is its bottom row. `BottomHudInset`
+//! tells the chat and the hints how high the bottom stack reaches.
 
 use bevy::input::touch::Touches;
 use bevy::picking::Pickable;
@@ -30,7 +35,7 @@ use crate::state::{ActionMsg, ActionResult, Game, GameEvent, Phase};
 use crate::wardrobe::{PREVIEW_BELOW_FEET, PREVIEW_SIZE, WardrobePreview};
 use crate::world_view::item_icon;
 
-const HOTBAR_SLOTS: usize = 8;
+pub(crate) const HOTBAR_SLOTS: usize = 8;
 const SELECT_KEYS: [KeyCode; HOTBAR_SLOTS] = [
     KeyCode::Digit1,
     KeyCode::Digit2,
@@ -47,9 +52,14 @@ const CLOSE_KEY: KeyCode = KeyCode::Escape;
 /// chat.rs opens the chat line on Enter and has no constant of its own; named here for the
 /// top bar's label only.
 const CHAT_KEY: KeyCode = KeyCode::Enter;
-/// Opens and closes the craft panel from anywhere (docs/knowledge/ux/workbench.md); Y on a gamepad.
+/// Opens the bag on its Craft tab, or closes it there (docs/knowledge/ux/workbench.md).
 pub(crate) const CRAFT_PANEL_KEY: KeyCode = KeyCode::KeyC;
-const CRAFT_PANEL_PAD: GamepadButton = GamepadButton::North;
+/// Gamepad: Y toggles the bag on its last tab (bottom-hud.md; replaces workbench.md's Y = craft,
+/// LB / RB reach the Craft tab), B closes it, the d-pad moves the selection in the grid and A picks
+/// an item up and puts it down on another cell.
+const BAG_PAD: GamepadButton = GamepadButton::North;
+const BAG_CLOSE_PAD: GamepadButton = GamepadButton::East;
+const BAG_PICK_PAD: GamepadButton = GamepadButton::South;
 
 // The UI kit (assets/ui/). Sizes and insets are in the art's own pixels; it is drawn at
 // `KIT_SCALE` logical px per art px.
@@ -107,12 +117,46 @@ const MIN_THUMB_LENGTH: f32 = 24.0;
 const STORE_WIDTH: f32 = grid_width(STORE_COLUMNS) + SCROLLBAR_SPACE + 2.0 * PANEL_PADDING;
 /// Roughly one line of `TEXT_FONT_SIZE` text.
 const LINE_HEIGHT: f32 = 20.0;
-/// Px kept free at the bottom of the window for the hotbar column (message line, item name,
-/// hotbar) and a margin: a centre panel ends above it.
 /// Top edge of the fitted centre panels: below the top bar, close button included, since a wide
 /// panel reaches under it.
 pub(crate) const FIT_PANEL_TOP: f32 = HUD_MARGIN + TOPBAR_HEIGHT + CLOSE_OVERHANG + HUD_MARGIN;
-const HOTBAR_RESERVE: f32 = HUD_MARGIN + SLOT_SIZE + 2.0 * (LINE_HEIGHT + SLOT_GAP) + HUD_MARGIN;
+/// Px kept free at the bottom of the window for the closed bottom stack (hotbar, pull tab, strip),
+/// the toast line above it and a margin: a centre panel ends above it.
+const HOTBAR_RESERVE: f32 = CLOSED_STACK + SLOT_GAP + LINE_HEIGHT + HUD_MARGIN;
+
+// The bottom HUD (docs/knowledge/ux/bottom-hud.md). Heights are px up from the window's bottom.
+/// The hotbar's top edge: the bag slides up from here.
+const HOTBAR_TOP: f32 = HUD_MARGIN + SLOT_SIZE;
+/// `ui/pull_tab*.png` (32x16 art) at `KIT_SCALE`: the spec's 64x32 hit area, centred on the
+/// hotbar's top edge. A touch tap counts `TOUCH_MIN` px tall.
+const PULL_TAB_SIZE: Vec2 = Vec2::new(32.0 * KIT_SCALE, 16.0 * KIT_SCALE);
+const PULL_TAB_IMAGE: &str = "ui/pull_tab.png";
+const PULL_TAB_HOVER_IMAGE: &str = "ui/pull_tab_hover.png";
+const PULL_TAB_OPEN_IMAGE: &str = "ui/pull_tab_open.png";
+const PULL_TAB_OPEN_HOVER_IMAGE: &str = "ui/pull_tab_open_hover.png";
+/// The selection strip, just above the pull tab; tall enough for its Drop / Trash buttons.
+const STRIP_HEIGHT: f32 = TAB_HEIGHT;
+/// The top of the closed bottom stack (the strip's top edge).
+const CLOSED_STACK: f32 = HOTBAR_TOP + PULL_TAB_SIZE.y + STRIP_HEIGHT;
+/// The bag's grid: exactly the hotbar's 8 columns, plus its scrollbar.
+const BAG_GRID_WIDTH: f32 = grid_width(HOTBAR_SLOTS as f32) + SCROLLBAR_SPACE;
+/// Inside the bag's panel art, clear of its rim (tighter than a centre panel's `PANEL_PADDING`).
+const BAG_PADDING: f32 = PANEL_INSET;
+/// Below the bag's content: the strip and the pull tab sit there, drawn over the panel.
+const BAG_BOTTOM_PADDING: f32 = PULL_TAB_SIZE.y + STRIP_HEIGHT + SLOT_GAP;
+const BAG_OPEN_SECS: f32 = 0.18;
+const BAG_CLOSE_SECS: f32 = 0.15;
+/// The open bag (pull tab included, hotbar not) takes at most this much of the window height.
+const BAG_MAX_FRACTION: f32 = 0.6;
+/// The Wardrobe tab grows the bag to fit its preview, up to this much of the window height.
+const WARDROBE_MAX_FRACTION: f32 = 0.85;
+/// Grid rows on show: 3, fewer on a short window, never fewer than 2.
+const BAG_ROWS: (usize, usize) = (2, 3);
+/// The chips/search header's height until its layout is known: two 44 px rows.
+const BAG_HEADER_GUESS: f32 = 2.0 * 44.0 + SLOT_GAP;
+/// A finger may wander this far and still tap; a swipe goes at least `SWIPE_MIN`.
+const TAP_SLOP: f32 = 12.0;
+const SWIPE_MIN: f32 = 40.0;
 /// A panel never gets shorter than this, however small the window.
 const MIN_PANEL_HEIGHT: f32 = 200.0;
 /// Wardrobe filter buttons: touch targets.
@@ -130,11 +174,7 @@ const WARDROBE_GAP: f32 = 4.0;
 /// Between the preview (with its slot columns) and the equipment grid on its right.
 const WARDROBE_SPLIT: f32 = 16.0;
 const WARDROBE_LEFT: f32 = 2.0 * SLOT_SIZE + 2.0 * WARDROBE_GAP + FRAME_SIZE.x;
-/// The inventory and wardrobe grids take as many columns as the window has room for.
-const INVENTORY_GRID: GridPanel = GridPanel {
-    beside: 0.0,
-    columns: (6, 10),
-};
+/// The wardrobe grid takes as many columns as the window has room for.
 const WARDROBE_GRID: GridPanel = GridPanel {
     beside: WARDROBE_LEFT + WARDROBE_SPLIT,
     columns: (3, 10),
@@ -177,7 +217,7 @@ const XP_BAR_FILL: Color = Color::srgb(0.45, 0.85, 1.0);
 pub(crate) const PANEL_COLOR: Color = Color::srgba(0.08, 0.08, 0.1, 0.7);
 /// Text on the parchment of a panel.
 pub(crate) const INK_COLOR: Color = Color::srgb(0.29, 0.17, 0.08);
-const DISABLED_TEXT_COLOR: Color = Color::srgb(0.55, 0.5, 0.45);
+pub(crate) const DISABLED_TEXT_COLOR: Color = Color::srgb(0.55, 0.5, 0.45);
 /// Multiplied into a tab that is not the one on show.
 pub(crate) const INACTIVE_TAB_COLOR: Color = Color::srgb(0.5, 0.5, 0.5);
 /// Marks a worn item that is also selected (its slot shows the selection rim instead of the badge).
@@ -241,7 +281,8 @@ const BUY_SHORT_TEXT: &str = "Buy?";
 const STRIP_ARMED_TEXT: &str = "Click again to buy for";
 /// Between the parts of the selection strip.
 const STRIP_SEP: &str = "·";
-/// Store focus: arrows / d-pad move it, Enter / South clicks, East disarms then closes.
+/// Store focus (and the bag grid's selection): arrows / d-pad move it, Enter / South clicks, East
+/// disarms then closes.
 const STORE_NAV_KEYS: [KeyCode; 4] = [
     KeyCode::ArrowLeft,
     KeyCode::ArrowRight,
@@ -249,6 +290,8 @@ const STORE_NAV_KEYS: [KeyCode; 4] = [
     KeyCode::ArrowDown,
 ];
 const STORE_ACTIVATE_KEY: KeyCode = KeyCode::Enter;
+/// Steps the focus over the deed list (Shift: back).
+const DEED_FOCUS_KEY: KeyCode = KeyCode::Tab;
 /// Previous / next tab in a tabbed panel (store categories, Inventory / Wardrobe / Craft),
 /// wrapping around; LB / RB on a gamepad. Their hints sit at the ends of each tab bar.
 const PREV_TAB_KEY: KeyCode = KeyCode::BracketLeft;
@@ -293,6 +336,10 @@ pub struct TextFocus(pub bool);
 /// stack shown, if any (count as in the cell).
 #[derive(Component, Clone, Copy, PartialEq, Default)]
 pub(crate) struct ItemTip(pub Option<(ItemId, u16)>);
+
+/// A node with a plain-text tooltip in the same box (a World Deed row, `deeds_ui.rs`).
+#[derive(Component, Clone, PartialEq)]
+pub(crate) struct TextTip(pub String);
 
 /// The store entry armed by a first click on an expensive item, and when it disarms.
 #[derive(Resource, Default, PartialEq)]
@@ -384,6 +431,110 @@ pub enum OpenPanel {
     /// The menu beside a clicked player (`avatar_menu.rs`).
     AvatarMenu,
 }
+
+impl OpenPanel {
+    /// The bag's tabs: open means the bag is (sliding) up on that tab.
+    pub fn is_bag(self) -> bool {
+        matches!(
+            self,
+            OpenPanel::Inventory | OpenPanel::Wardrobe | OpenPanel::Craft
+        )
+    }
+}
+
+/// How high the bottom stack reaches, for whatever must stay clear of it. Written every frame the
+/// bag slides (`slide_bag`), otherwise only when it changes.
+#[derive(Resource, Clone, Copy, PartialEq, Debug)]
+pub struct BottomHudInset {
+    /// Px from the window's bottom edge to the top of the bottom stack: the selection strip's top
+    /// while the bag is closed, the bag's top edge while it is open (in between while it slides).
+    /// The chat log's bottom edge goes 8 px above this.
+    pub bottom_px: f32,
+    /// The bag is open or opening: the chat log shows at most 4 lines.
+    pub bag_open: bool,
+    /// Px from the bottom edge for the first-run hint box: above the stack and the toast line.
+    pub hint_bottom_px: f32,
+}
+
+impl Default for BottomHudInset {
+    fn default() -> Self {
+        Self {
+            bottom_px: CLOSED_STACK,
+            bag_open: false,
+            hint_bottom_px: hint_bottom(CLOSED_STACK),
+        }
+    }
+}
+
+/// The bag's slide.
+#[derive(Resource)]
+struct BagSlide {
+    /// The visible part of the open height, 0..=1, already eased (`slide_step`).
+    shown: f32,
+    /// The tab on show while open or sliding; Y reopens the bag on it.
+    tab: OpenPanel,
+    /// A mouse press on the pull tab: cursor y then, `shown` then, and whether it became a drag.
+    drag: Option<(f32, f32, bool)>,
+    /// The open height in px now: eased from `grow_from` to `target` when the tab or the window
+    /// changes it (`tab_open_height`).
+    height: f32,
+    target: f32,
+    grow_from: f32,
+    /// How far `height` has eased from `grow_from` to `target`, 0..=1.
+    grow: f32,
+    /// The chips/search header's laid-out height.
+    header: f32,
+}
+
+/// The item picked up with A in the bag grid (an index into `Inventory::slots`), waiting for A on
+/// another cell.
+#[derive(Resource, Default, PartialEq)]
+struct BagHeld(Option<usize>);
+
+/// Bag keys, read before the player's movement sees them.
+#[derive(Resource, Default)]
+struct BagKeys {
+    step: Option<(i32, i32)>,
+    pick: bool,
+    back: bool,
+}
+
+/// The bag's cells top to bottom, rows of 8: the grid (padded to whole rows), then the hotbar.
+/// Each is a filled place in `carried_slots`, or `None` (an empty cell or padding).
+#[derive(Resource, Default)]
+struct BagOrder(Vec<Option<usize>>);
+
+/// The bag's clip box: its height is the visible part of the panel.
+#[derive(Component)]
+struct BagClip;
+/// The bag's panel art, open height tall, hung from the top of the clip box.
+#[derive(Component)]
+struct BagPanel;
+/// Where the tab bodies go.
+#[derive(Component)]
+struct BagContent;
+/// A bag tab's body: shown while its tab is the bag's. Spawned anywhere; `adopt_bag_bodies` puts
+/// it into the bag.
+#[derive(Component)]
+pub(crate) struct BagBody(pub OpenPanel);
+/// The Inventory tab's chips/search header, measured for the open height.
+#[derive(Component)]
+struct BagHeader;
+#[derive(Component)]
+struct BagTabRow;
+#[derive(Component)]
+struct PullTab;
+/// The selection strip's row (its backing shows only when it says something).
+#[derive(Component)]
+struct StripLine;
+/// The toast line's row, kept above the bottom stack.
+#[derive(Component)]
+struct ToastRow;
+/// A bottom-right indicator (voice): level with the hotbar, or above the bag's right edge when the
+/// open bag would cover it.
+#[derive(Component)]
+#[cfg_attr(not(feature = "voice"), allow(dead_code))] // spawned by voice/panel.rs only
+pub(crate) struct BottomRightHud;
 
 /// The item Q (drop) and X (trash) act on: the one selected in the wardrobe grid while the
 /// wardrobe is open, else the selected inventory item.
@@ -560,11 +711,30 @@ impl Plugin for HudPlugin {
             .init_resource::<StoreFocus>()
             .init_resource::<StoreKeys>()
             .init_resource::<TabKeys>()
+            .init_resource::<BottomHudInset>()
+            .init_resource::<BagHeld>()
+            .init_resource::<BagKeys>()
+            .init_resource::<BagOrder>()
+            // A screenshot run that asks for a bag tab sees it fully open.
+            .insert_resource(BagSlide {
+                shown: if open.is_bag() { 1.0 } else { 0.0 },
+                tab: if open.is_bag() {
+                    open
+                } else {
+                    OpenPanel::Inventory
+                },
+                drag: None,
+                height: 0.0,
+                target: 0.0,
+                grow_from: 0.0,
+                grow: 1.0,
+                header: BAG_HEADER_GUESS,
+            })
             // After `PreUpdate` (the chat line clears keys there), before the player's
             // `FixedUpdate` would walk on the arrows.
             .add_systems(
                 RunFixedMainLoop,
-                (take_store_keys, take_tab_keys)
+                (take_store_keys, take_tab_keys, take_bag_keys)
                     .in_set(RunFixedMainLoopSystems::BeforeFixedMainLoop),
             )
             .insert_resource(open)
@@ -579,6 +749,8 @@ impl Plugin for HudPlugin {
                     use_tab_keys,
                     use_store_keys,
                     drag_items,
+                    pull_tab_input,
+                    use_bag_keys,
                 )
                     .chain()
                     .in_set(Phase::Input),
@@ -588,6 +760,14 @@ impl Plugin for HudPlugin {
                 (
                     show_panels,
                     fit_panels,
+                    (
+                        adopt_bag_bodies,
+                        slide_bag,
+                        show_bag_bodies,
+                        skin_bag_tabs,
+                        place_bottom_right,
+                    )
+                        .chain(),
                     (follow_moved_selection, refresh_slots).chain(),
                     refresh_item_info,
                     refresh_wardrobe,
@@ -848,14 +1028,15 @@ pub(crate) fn spawn_centre_panel(
         .id()
 }
 
-/// The Inventory / Wardrobe tab row at the top of both panels.
-pub(crate) fn bag_tabs(parent: &mut ChildSpawnerCommands, assets: &AssetServer, active: OpenPanel) {
+/// The bag's Inventory / Wardrobe / Craft tab row (`skin_bag_tabs` brightens the one on show).
+fn bag_tabs(parent: &mut ChildSpawnerCommands, assets: &AssetServer, active: OpenPanel) {
     let bar = Node {
         align_items: AlignItems::Center,
+        flex_shrink: 0.0,
         ..row(SLOT_GAP)
     };
     parent
-        .spawn((bar, Hovered::default()))
+        .spawn((bar, BagTabRow, Hovered::default()))
         .with_children(|tabs| {
             tabs.spawn((ink(PREV_TAB_HINT), Hovered::default()));
             for (panel, name) in BAG_TABS {
@@ -922,7 +1103,91 @@ fn spawn_hud(
                 ));
         });
 
-    // Bottom edge, centred: message, selected item's name, hotbar. Full width, so it survives any window size.
+    // The bag (bottom-hud.md), spawned before the bottom column so the strip, the pull tab and the
+    // hotbar draw over its art. A clip box on the hotbar's top edge, as tall as the visible part;
+    // the panel hangs from its top, so it slides up from behind the hotbar (`slide_bag`).
+    let clip = Node {
+        position_type: PositionType::Absolute,
+        left: percent(50),
+        bottom: px(HOTBAR_TOP),
+        width: px(BAG_GRID_WIDTH + 2.0 * BAG_PADDING),
+        margin: UiRect::left(px(-(BAG_GRID_WIDTH + 2.0 * BAG_PADDING) / 2.0)),
+        height: px(0),
+        overflow: Overflow::clip(),
+        display: Display::None,
+        ..default()
+    };
+    let panel = Node {
+        position_type: PositionType::Absolute,
+        left: px(0),
+        right: px(0),
+        top: px(0),
+        padding: UiRect {
+            left: px(BAG_PADDING),
+            right: px(BAG_PADDING),
+            top: px(BAG_PADDING),
+            bottom: px(BAG_BOTTOM_PADDING),
+        },
+        flex_direction: FlexDirection::Column,
+        row_gap: px(HUD_MARGIN),
+        ..default()
+    };
+    let body = |tab| {
+        let node = Node {
+            flex_grow: 1.0,
+            min_height: px(0),
+            flex_direction: FlexDirection::Column,
+            row_gap: px(HUD_MARGIN),
+            display: Display::None,
+            ..default()
+        };
+        (node, BagBody(tab), Hovered::default())
+    };
+    commands
+        .spawn((clip, BagClip, Hovered::default()))
+        .with_children(|clip| {
+            clip.spawn((
+                panel,
+                BagPanel,
+                sliced(&assets, PANEL_IMAGE, PANEL_INSET),
+                Hovered::default(),
+            ))
+            .with_children(|panel| {
+                bag_tabs(panel, &assets, OpenPanel::Inventory);
+                let content = Node {
+                    flex_grow: 1.0,
+                    min_height: px(0),
+                    flex_direction: FlexDirection::Column,
+                    ..default()
+                };
+                panel
+                    .spawn((content, BagContent, Hovered::default()))
+                    .with_children(|content| {
+                        // Inventory: chips/search over the grid rows; the hotbar is the bottom row.
+                        content
+                            .spawn(body(OpenPanel::Inventory))
+                            .with_children(|tab| {
+                                let header = Node {
+                                    flex_direction: FlexDirection::Column,
+                                    row_gap: px(SLOT_GAP),
+                                    flex_shrink: 0.0,
+                                    ..default()
+                                };
+                                tab.spawn((header, BagHeader, Hovered::default()))
+                                    .with_children(|header| {
+                                        crate::inventory_filter::spawn_filter_bar(header, &assets);
+                                    });
+                                scroll_grid(tab, InventoryGrid);
+                            });
+                        content
+                            .spawn(body(OpenPanel::Wardrobe))
+                            .with_children(|tab| spawn_wardrobe(tab, &assets, &preview_image));
+                    });
+            });
+        });
+
+    // Bottom edge, centred: selection strip, pull tab, hotbar. Full width so it survives any
+    // window size, and invisible to picking so the bag behind its gaps stays the hovered one.
     let column = Node {
         position_type: PositionType::Absolute,
         left: px(0),
@@ -930,114 +1195,51 @@ fn spawn_hud(
         bottom: px(HUD_MARGIN),
         flex_direction: FlexDirection::Column,
         align_items: AlignItems::Center,
-        row_gap: px(SLOT_GAP),
         ..default()
     };
-    commands.spawn(column).with_children(|column| {
-        column.spawn((label(""), Toast::default()));
-        column
-            .spawn(Node {
+    commands
+        .spawn((column, Pickable::IGNORE, GlobalZIndex(1)))
+        .with_children(|column| {
+            let strip = Node {
+                height: px(STRIP_HEIGHT),
+                padding: UiRect::horizontal(px(HUD_MARGIN)),
                 column_gap: px(HUD_MARGIN),
                 align_items: AlignItems::Center,
                 ..default()
-            })
-            .with_children(|line| {
-                line.spawn((label(""), SelectedName));
-                line.spawn((row(HUD_MARGIN), ModLine));
-                crate::inventory_filter::spawn_strip_buttons(line, &assets);
-            });
-        column.spawn((row(SLOT_GAP), HotbarRow));
-    });
-
-    // Inventory and wardrobe: width from the window, height capped above the hotbar; only the
-    // grids scroll (`fit_panels`, `scroll_grid`).
-    let inventory = spawn_centre_panel(
-        &mut commands,
-        &assets,
-        OpenPanel::Inventory,
-        INVENTORY_GRID.width_for(0.0),
-        |panel| {
-            bag_tabs(panel, &assets, OpenPanel::Inventory);
-            crate::inventory_filter::spawn_filter_bar(panel, &assets);
-            scroll_grid(panel, InventoryGrid);
-        },
-    );
-    let wardrobe = spawn_centre_panel(
-        &mut commands,
-        &assets,
-        OpenPanel::Wardrobe,
-        WARDROBE_GRID.width_for(0.0),
-        |panel| {
-            bag_tabs(panel, &assets, OpenPanel::Wardrobe);
-            // Preview and slot columns on the left, the owned equipment on the right, so the
-            // grid keeps a useful height in a 720 px window.
-            let body = Node {
-                column_gap: px(WARDROBE_SPLIT),
-                min_height: px(0),
-                ..default()
             };
-            let preview = Node {
-                column_gap: px(WARDROBE_GAP),
-                align_items: AlignItems::Center,
-                align_self: AlignSelf::FlexStart,
-                flex_shrink: 0.0,
-                ..default()
-            };
-            let column = |index| {
-                let node = Node {
-                    flex_direction: FlexDirection::Column,
-                    row_gap: px(SLOT_GAP),
+            column
+                .spawn((strip, StripLine, BackgroundColor(Color::NONE)))
+                .with_children(|line| {
+                    line.spawn((label(""), SelectedName));
+                    line.spawn((row(HUD_MARGIN), ModLine));
+                    crate::inventory_filter::spawn_strip_buttons(line, &assets);
+                });
+            column.spawn((
+                Node {
+                    width: px(PULL_TAB_SIZE.x),
+                    height: px(PULL_TAB_SIZE.y),
                     ..default()
-                };
-                (node, WornColumn(index))
-            };
-            let frame = Node {
-                width: px(FRAME_SIZE.x),
-                height: px(FRAME_SIZE.y),
-                flex_shrink: 0.0,
-                ..default()
-            };
-            let rig_size = PREVIEW_SIZE.as_vec2() * PREVIEW_SCALE;
-            let rig = Node {
-                position_type: PositionType::Absolute,
-                left: px((FRAME_SIZE.x - rig_size.x) / 2.0),
-                bottom: px((FRAME_BORDER + FEET_ABOVE_FRAME) * KIT_SCALE
-                    - PREVIEW_BELOW_FEET as f32 * PREVIEW_SCALE),
-                width: px(rig_size.x),
-                height: px(rig_size.y),
-                ..default()
-            };
-            let owned = Node {
-                flex_direction: FlexDirection::Column,
-                row_gap: px(HUD_MARGIN),
-                flex_grow: 1.0,
-                min_height: px(0),
-                ..default()
-            };
-            panel.spawn(body).with_children(|body| {
-                body.spawn(preview).with_children(|preview| {
-                    preview.spawn(column(0));
-                    preview
-                        .spawn((frame, sliced(&assets, FRAME_IMAGE, FRAME_INSET)))
-                        .with_children(|frame| {
-                            frame.spawn((rig, ImageNode::new(preview_image.clone())));
-                        });
-                    preview.spawn(column(1));
-                });
-                body.spawn(owned).with_children(|owned| {
-                    owned.spawn(ink("Your equipment: click to wear"));
-                    owned.spawn((wrapping_grid(), FilterRow));
-                    scroll_grid(owned, WardrobeGrid);
-                });
-            });
-        },
-    );
+                },
+                ImageNode::new(assets.load(PULL_TAB_IMAGE)),
+                PullTab,
+                Hovered::default(),
+            ));
+            column.spawn((row(SLOT_GAP), HotbarRow));
+        });
+
+    // Toasts: above the strip, or above the bag while it is open (`slide_bag`).
+    let toasts = Node {
+        position_type: PositionType::Absolute,
+        left: px(0),
+        right: px(0),
+        bottom: px(toast_bottom(CLOSED_STACK)),
+        justify_content: JustifyContent::Center,
+        ..default()
+    };
     commands
-        .entity(inventory)
-        .insert((INVENTORY_GRID, FitWindow { top: FIT_PANEL_TOP }));
-    commands
-        .entity(wardrobe)
-        .insert((WARDROBE_GRID, FitWindow { top: FIT_PANEL_TOP }));
+        .spawn((toasts, ToastRow, Pickable::IGNORE))
+        .with_child((label(""), Toast::default()));
+
     let store = spawn_centre_panel(
         &mut commands,
         &assets,
@@ -1135,6 +1337,76 @@ fn spawn_hud(
     ));
 }
 
+/// The Wardrobe tab: preview and slot columns on the left (never scrolled: the bag grows to fit
+/// them, `wardrobe_open_height`), the owned equipment on the right (its grid scrolls).
+fn spawn_wardrobe(
+    parent: &mut ChildSpawnerCommands,
+    assets: &AssetServer,
+    preview: &Handle<Image>,
+) {
+    let body = Node {
+        column_gap: px(WARDROBE_SPLIT),
+        flex_grow: 1.0,
+        min_height: px(0),
+        ..default()
+    };
+    let side = Node {
+        column_gap: px(WARDROBE_GAP),
+        align_items: AlignItems::Center,
+        align_self: AlignSelf::FlexStart,
+        flex_shrink: 0.0,
+        ..default()
+    };
+    let column = |index| {
+        let node = Node {
+            flex_direction: FlexDirection::Column,
+            row_gap: px(SLOT_GAP),
+            ..default()
+        };
+        (node, WornColumn(index))
+    };
+    let frame = Node {
+        width: px(FRAME_SIZE.x),
+        height: px(FRAME_SIZE.y),
+        flex_shrink: 0.0,
+        ..default()
+    };
+    let rig_size = PREVIEW_SIZE.as_vec2() * PREVIEW_SCALE;
+    let rig = Node {
+        position_type: PositionType::Absolute,
+        left: px((FRAME_SIZE.x - rig_size.x) / 2.0),
+        bottom: px((FRAME_BORDER + FEET_ABOVE_FRAME) * KIT_SCALE
+            - PREVIEW_BELOW_FEET as f32 * PREVIEW_SCALE),
+        width: px(rig_size.x),
+        height: px(rig_size.y),
+        ..default()
+    };
+    let owned = Node {
+        flex_direction: FlexDirection::Column,
+        row_gap: px(HUD_MARGIN),
+        flex_grow: 1.0,
+        min_height: px(0),
+        ..default()
+    };
+    parent
+        .spawn((body, Hovered::default()))
+        .with_children(|body| {
+            body.spawn(side).with_children(|side| {
+                side.spawn(column(0));
+                side.spawn((frame, sliced(assets, FRAME_IMAGE, FRAME_INSET)))
+                    .with_children(|frame| {
+                        frame.spawn((rig, ImageNode::new(preview.clone())));
+                    });
+                side.spawn(column(1));
+            });
+            body.spawn(owned).with_children(|owned| {
+                owned.spawn(ink("Your equipment: click to wear"));
+                owned.spawn((wrapping_grid(), FilterRow));
+                scroll_grid(owned, WardrobeGrid);
+            });
+        });
+}
+
 /// Every node of the tooltip: never under the pointer, but counted by `pointer_over_ui` alike.
 pub(crate) fn tip_part() -> (Pickable, Hovered) {
     (Pickable::IGNORE, Hovered::default())
@@ -1150,12 +1422,34 @@ pub(crate) fn button_node() -> Node {
     }
 }
 
-/// E/I opens the inventory or closes the inventory/wardrobe window, B the store, C (gamepad Y)
-/// the craft panel; Escape closes (an armed store purchase is disarmed first). A focused text field
-/// has already taken the keys (`claim_ui::take_panel_keys`), so typing a C never toggles.
+/// A key that opens or closes the bag.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum BagKey {
+    /// E / I or gamepad Y: the last-used tab.
+    Toggle,
+    /// C: the Craft tab.
+    Craft,
+}
+
+/// The open panel after `key`: E / I and Y close the bag on any tab and otherwise open it on
+/// `last`, the tab it was last on; C closes the Craft tab and otherwise shows it. Opening the bag
+/// closes a centre panel (one panel at a time).
+fn bag_toggle(open: OpenPanel, key: BagKey, last: OpenPanel) -> OpenPanel {
+    match key {
+        BagKey::Toggle if open.is_bag() => OpenPanel::None,
+        BagKey::Toggle => last,
+        BagKey::Craft if open == OpenPanel::Craft => OpenPanel::None,
+        BagKey::Craft => OpenPanel::Craft,
+    }
+}
+
+/// E/I and gamepad Y toggle the bag, C its Craft tab, B the store; Escape closes (an armed store
+/// purchase is disarmed first; gamepad B is `use_bag_keys`'s). A focused text field has already
+/// taken the keys (`claim_ui::take_panel_keys`), so typing a C never toggles.
 fn toggle_panels(
     keys: Res<ButtonInput<KeyCode>>,
     pads: Query<&Gamepad>,
+    slide: Res<BagSlide>,
     mut open: ResMut<OpenPanel>,
     mut armed: ResMut<ArmedBuy>,
 ) {
@@ -1163,33 +1457,25 @@ fn toggle_panels(
         armed.0 = None;
         return;
     }
-    let next = if keys.any_just_pressed(INVENTORY_KEYS) {
-        match *open {
-            OpenPanel::Inventory | OpenPanel::Wardrobe => OpenPanel::None,
-            _ => OpenPanel::Inventory,
-        }
+    let bag = |key| bag_toggle(*open, key, slide.tab);
+    let next = if keys.any_just_pressed(INVENTORY_KEYS)
+        || pads.iter().any(|pad| pad.just_pressed(BAG_PAD))
+    {
+        bag(BagKey::Toggle)
     } else if keys.just_pressed(STORE_KEY) {
         if *open == OpenPanel::Store {
             OpenPanel::None
         } else {
             OpenPanel::Store
         }
-    } else if keys.just_pressed(CRAFT_PANEL_KEY)
-        || pads.iter().any(|pad| pad.just_pressed(CRAFT_PANEL_PAD))
-    {
-        if *open == OpenPanel::Craft {
-            OpenPanel::None
-        } else {
-            OpenPanel::Craft
-        }
+    } else if keys.just_pressed(CRAFT_PANEL_KEY) {
+        bag(BagKey::Craft)
     } else if keys.just_pressed(CLOSE_KEY) {
         OpenPanel::None
     } else {
         return;
     };
-    if *open != next {
-        *open = next;
-    }
+    open.set_if_neq(next);
 }
 
 fn show_panels(open: Res<OpenPanel>, mut panels: Query<(&PanelOf, &mut Node)>) {
@@ -1225,6 +1511,514 @@ fn fit_panels(
         {
             node.width = px(width);
             node.margin.left = px(-width / 2.0);
+        }
+    }
+}
+
+// --- The bottom HUD: the bag's slide, the pull tab, its keys (docs/knowledge/ux/bottom-hud.md) --
+
+/// `shown` (0..=1) after `dt` seconds of sliding: open in `BAG_OPEN_SECS` easing out, closed in
+/// `BAG_CLOSE_SECS` easing in. Both curves are inverted from `shown`, so turning round mid-slide
+/// does not jump.
+fn slide_step(shown: f32, opening: bool, dt: f32) -> f32 {
+    let shown = shown.clamp(0.0, 1.0);
+    if opening {
+        // shown = 1 - (1 - t)^2
+        let t = (1.0 - (1.0 - shown).sqrt() + dt / BAG_OPEN_SECS).min(1.0);
+        1.0 - (1.0 - t) * (1.0 - t)
+    } else {
+        // shown = 1 - t^2
+        let t = ((1.0 - shown).sqrt() + dt / BAG_CLOSE_SECS).min(1.0);
+        1.0 - t * t
+    }
+}
+
+/// `shown` while the pull tab is dragged `up` px from where it was pressed with `start` shown.
+fn dragged_shown(start: f32, up: f32, height: f32) -> f32 {
+    (start + up / height.max(1.0)).clamp(0.0, 1.0)
+}
+
+/// Px from the hotbar's top edge to the open bag's top edge, in a window `window_height` px tall
+/// with a chips/search header `header` px tall: the pull tab, the strip, the tab row, the header
+/// and 3 grid rows, fewer to stay within `BAG_MAX_FRACTION` of the window, never fewer than 2.
+fn bag_open_height(window_height: f32, header: f32) -> f32 {
+    // The panel's padding and row gaps as laid out in `spawn_hud`.
+    let fixed = BAG_BOTTOM_PADDING + BAG_PADDING + TAB_HEIGHT + 2.0 * HUD_MARGIN + header;
+    let row = SLOT_SIZE + SLOT_GAP;
+    let room = window_height * BAG_MAX_FRACTION - fixed + SLOT_GAP;
+    let rows = ((room / row).floor().max(0.0) as usize).clamp(BAG_ROWS.0, BAG_ROWS.1);
+    fixed + rows as f32 * row - SLOT_GAP
+}
+
+/// Px from the hotbar's top edge to the open bag's top edge on the Wardrobe tab: tall enough for
+/// the preview and its slot columns so they never scroll, up to `WARDROBE_MAX_FRACTION` of the
+/// window.
+fn wardrobe_open_height(window_height: f32) -> f32 {
+    let slots = WORN_COLUMNS[0].len() as f32;
+    let preview = FRAME_SIZE.y.max(slots * (SLOT_SIZE + SLOT_GAP) - SLOT_GAP);
+    let fit = BAG_BOTTOM_PADDING + BAG_PADDING + TAB_HEIGHT + HUD_MARGIN + preview;
+    fit.min(window_height * WARDROBE_MAX_FRACTION)
+}
+
+/// The open height on `tab`: the Wardrobe's own, else the grid's (`bag_open_height`).
+fn tab_open_height(tab: OpenPanel, window_height: f32, header: f32) -> f32 {
+    if tab == OpenPanel::Wardrobe {
+        wardrobe_open_height(window_height)
+    } else {
+        bag_open_height(window_height, header)
+    }
+}
+
+/// The bag's width on `tab`: the Inventory tab is exactly 8 columns (the hotbar's), the others
+/// as wide as their content.
+fn bag_width(tab: OpenPanel, window_width: f32) -> f32 {
+    let content = match tab {
+        OpenPanel::Wardrobe => WARDROBE_GRID.width_for(window_width) - 2.0 * PANEL_PADDING,
+        OpenPanel::Craft => crate::craft_ui::BODY_WIDTH,
+        _ => BAG_GRID_WIDTH,
+    };
+    content + 2.0 * BAG_PADDING
+}
+
+/// The top of the bottom stack with `visible` px of the bag showing: the strip while closed, the
+/// bag's top edge once it rises past it.
+fn stack_top(visible: f32) -> f32 {
+    CLOSED_STACK.max(HOTBAR_TOP + visible)
+}
+
+/// The toast line's bottom edge: just above the stack.
+fn toast_bottom(stack_top: f32) -> f32 {
+    stack_top + SLOT_GAP
+}
+
+/// The hint box's bottom edge: above the toast line, so it never covers a toast.
+fn hint_bottom(stack_top: f32) -> f32 {
+    toast_bottom(stack_top) + LINE_HEIGHT + SLOT_GAP
+}
+
+/// The bottom edge of a bottom-right indicator `size` px big: level with the hotbar, or above
+/// the stack when the bag's right edge (`bag_right`, while it shows) would reach under it.
+fn right_hud_bottom(size: Vec2, window_width: f32, bag_right: Option<f32>, stack_top: f32) -> f32 {
+    let covered = bag_right.is_some_and(|right| right > window_width - HUD_MARGIN - size.x);
+    if covered {
+        stack_top + SLOT_GAP
+    } else {
+        HUD_MARGIN + (SLOT_SIZE - size.y).max(0.0) / 2.0
+    }
+}
+
+/// What a finished touch does to the bag.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Gesture {
+    Toggle,
+    Open,
+    Close,
+}
+
+/// A tap on the pull tab (counted `TOUCH_MIN` tall) toggles; a swipe up that starts on the hotbar
+/// or the tab opens; a swipe down that starts on the tab or the bag's tab row closes. Window px,
+/// y down.
+fn touch_gesture(
+    start: Vec2,
+    end: Vec2,
+    pull_tab: Rect,
+    hotbar: Rect,
+    tab_row: Option<Rect>,
+) -> Option<Gesture> {
+    let tab = Rect::from_center_size(
+        pull_tab.center(),
+        Vec2::new(pull_tab.width(), pull_tab.height().max(TOUCH_MIN)),
+    );
+    let moved = end - start;
+    if moved.length() <= TAP_SLOP && tab.contains(start) {
+        Some(Gesture::Toggle)
+    } else if -moved.y >= SWIPE_MIN && (hotbar.contains(start) || tab.contains(start)) {
+        Some(Gesture::Open)
+    } else if moved.y >= SWIPE_MIN
+        && (tab.contains(start) || tab_row.is_some_and(|row| row.contains(start)))
+    {
+        Some(Gesture::Close)
+    } else {
+        None
+    }
+}
+
+/// The open panel after asking for the bag open (on `tab`) or closed.
+fn set_bag(open: OpenPanel, want_open: bool, tab: OpenPanel) -> OpenPanel {
+    match (want_open, open.is_bag()) {
+        (true, false) => tab,
+        (false, true) => OpenPanel::None,
+        _ => open,
+    }
+}
+
+/// The pull tab by mouse (click toggles; press and drag moves the bag with the pointer, released
+/// past half way it opens, else it closes) and by touch (`touch_gesture`).
+#[allow(clippy::too_many_arguments)] // a Bevy system: two input devices, three rectangles, state
+fn pull_tab_input(
+    mouse: Res<ButtonInput<MouseButton>>,
+    touches: Res<Touches>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    tab: Single<(&Hovered, &ComputedNode, &UiGlobalTransform), With<PullTab>>,
+    hotbar: Single<(&ComputedNode, &UiGlobalTransform), With<HotbarRow>>,
+    tab_row: Single<(&ComputedNode, &UiGlobalTransform), With<BagTabRow>>,
+    mut slide: ResMut<BagSlide>,
+    mut open: ResMut<OpenPanel>,
+    mut sfx: MessageWriter<Sfx>,
+) {
+    let (hovered, tab_node, tab_at) = tab.into_inner();
+    let cursor = window.cursor_position();
+    if mouse.just_pressed(MouseButton::Left)
+        && hovered.get()
+        && let Some(at) = cursor
+    {
+        slide.drag = Some((at.y, slide.shown, false));
+    }
+    if let Some((from_y, from_shown, moved)) = slide.drag {
+        let mut moved = moved;
+        if let Some(at) = cursor {
+            moved |= (at.y - from_y).abs() >= DRAG_THRESHOLD;
+            if moved {
+                let shown = dragged_shown(from_shown, from_y - at.y, slide.height);
+                if slide.shown != shown {
+                    slide.shown = shown;
+                }
+            }
+        }
+        slide.drag = Some((from_y, from_shown, moved));
+        if !mouse.pressed(MouseButton::Left) {
+            slide.drag = None;
+            let want = if moved {
+                slide.shown >= 0.5
+            } else {
+                !open.is_bag()
+            };
+            open.set_if_neq(set_bag(*open, want, slide.tab));
+            sfx.write(Sfx::UiClick);
+        }
+    }
+    let pull = logical_rect(tab_node, tab_at);
+    let bar = logical_rect(hotbar.0, hotbar.1);
+    let row = (slide.shown > 0.5).then(|| logical_rect(tab_row.0, tab_row.1));
+    for touch in touches.iter_just_released() {
+        let want = match touch_gesture(touch.start_position(), touch.position(), pull, bar, row) {
+            Some(Gesture::Toggle) => !open.is_bag(),
+            Some(Gesture::Open) => true,
+            Some(Gesture::Close) => false,
+            None => continue,
+        };
+        open.set_if_neq(set_bag(*open, want, slide.tab));
+        sfx.write(Sfx::UiClick);
+    }
+}
+
+/// Bodies spawned outside the bag (the Craft tab, `craft_ui.rs`) move into it.
+fn adopt_bag_bodies(
+    mut commands: Commands,
+    loose: Query<Entity, (With<BagBody>, Without<ChildOf>)>,
+    content: Single<Entity, With<BagContent>>,
+) {
+    for body in &loose {
+        commands.entity(*content).add_child(body);
+    }
+}
+
+/// Moves the bag: `shown` follows the open state (or the drag), the clip box and the panel take
+/// their sizes, and the toast line and `BottomHudInset` follow its top edge. Writes only on a
+/// change, so a still bag costs no layout.
+#[allow(clippy::too_many_arguments)] // a Bevy system: state, window, the moved nodes, the inset
+fn slide_bag(
+    time: Res<Time>,
+    open: Res<OpenPanel>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    header: Query<&ComputedNode, With<BagHeader>>,
+    mut slide: ResMut<BagSlide>,
+    mut clip: Single<&mut Node, (With<BagClip>, Without<BagPanel>, Without<ToastRow>)>,
+    mut panel: Single<&mut Node, (With<BagPanel>, Without<ToastRow>)>,
+    mut toasts: Single<&mut Node, With<ToastRow>>,
+    mut inset: ResMut<BottomHudInset>,
+) {
+    if open.is_bag() && slide.tab != *open {
+        slide.tab = *open;
+    }
+    // The header is laid out only while the Inventory tab shows; keep the last height.
+    if let Some(height) = header
+        .iter()
+        .map(|node| node.size().y * node.inverse_scale_factor())
+        .find(|&height| height > 0.0)
+        && slide.header != height
+    {
+        slide.header = height;
+    }
+    let size = window.size();
+    // A new height (another tab, a resize) eases in like the slide; a closed bag just takes it.
+    let target = tab_open_height(slide.tab, size.y, slide.header);
+    if slide.target != target {
+        slide.grow_from = if slide.shown > 0.0 {
+            slide.height
+        } else {
+            target
+        };
+        slide.target = target;
+        slide.grow = 0.0;
+    }
+    if slide.grow < 1.0 {
+        slide.grow = slide_step(slide.grow, true, time.delta_secs());
+    }
+    let height = slide.grow_from + (slide.target - slide.grow_from) * slide.grow;
+    if slide.height != height {
+        slide.height = height;
+    }
+    let dragging = slide.drag.is_some_and(|(_, _, moved)| moved);
+    if !dragging {
+        let shown = slide_step(slide.shown, open.is_bag(), time.delta_secs());
+        if slide.shown != shown {
+            slide.shown = shown;
+        }
+    }
+    let visible = height * slide.shown;
+    let width = bag_width(slide.tab, size.x);
+    let display = if slide.shown > 0.0 {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    if clip.display != display {
+        clip.display = display;
+    }
+    if clip.height != px(visible) {
+        clip.height = px(visible);
+    }
+    if clip.width != px(width) {
+        clip.width = px(width);
+        clip.margin.left = px(-width / 2.0);
+    }
+    if panel.height != px(height) {
+        panel.height = px(height);
+    }
+    let top = stack_top(visible);
+    if toasts.bottom != px(toast_bottom(top)) {
+        toasts.bottom = px(toast_bottom(top));
+    }
+    inset.set_if_neq(BottomHudInset {
+        bottom_px: top,
+        bag_open: open.is_bag(),
+        hint_bottom_px: hint_bottom(top),
+    });
+}
+
+/// The body of the bag's tab shows; the others hide (kept while it slides shut).
+fn show_bag_bodies(slide: Res<BagSlide>, mut bodies: Query<(&BagBody, &mut Node)>) {
+    for (body, mut node) in &mut bodies {
+        let display = if body.0 == slide.tab {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if node.display != display {
+            node.display = display;
+        }
+    }
+}
+
+/// The bag's tab on show at full brightness; the pull tab's art says which way it goes and follows
+/// the pointer.
+fn skin_bag_tabs(
+    assets: Res<AssetServer>,
+    open: Res<OpenPanel>,
+    slide: Res<BagSlide>,
+    mut tabs: Query<(&UiButton, &mut ImageNode), Without<PullTab>>,
+    pull: Single<(&Hovered, &mut ImageNode), With<PullTab>>,
+) {
+    for (button, mut image) in &mut tabs {
+        let UiButton::Show(tab) = *button else {
+            continue;
+        };
+        let tint = if tab == slide.tab {
+            Color::WHITE
+        } else {
+            INACTIVE_TAB_COLOR
+        };
+        if image.color != tint {
+            image.color = tint;
+        }
+    }
+    let (hovered, mut image) = pull.into_inner();
+    let file = match (open.is_bag(), hovered.get()) {
+        (false, false) => PULL_TAB_IMAGE,
+        (false, true) => PULL_TAB_HOVER_IMAGE,
+        (true, false) => PULL_TAB_OPEN_IMAGE,
+        (true, true) => PULL_TAB_OPEN_HOVER_IMAGE,
+    };
+    if image
+        .image
+        .path()
+        .is_none_or(|path| path.to_string() != file)
+    {
+        image.image = assets.load(file);
+    }
+}
+
+/// Bottom-right indicators (the voice line) stay level with the hotbar unless the bag would cover
+/// them.
+fn place_bottom_right(
+    window: Single<&Window, With<PrimaryWindow>>,
+    slide: Res<BagSlide>,
+    inset: Res<BottomHudInset>,
+    mut nodes: Query<(&mut Node, &ComputedNode), With<BottomRightHud>>,
+) {
+    let width = window.width();
+    let bag_right = (slide.shown > 0.0).then(|| (width + bag_width(slide.tab, width)) / 2.0);
+    for (mut node, computed) in &mut nodes {
+        let size = computed.size() * computed.inverse_scale_factor();
+        let bottom = px(right_hud_bottom(size, width, bag_right, inset.bottom_px));
+        if node.bottom != bottom {
+            node.bottom = bottom;
+        }
+    }
+}
+
+/// From `at` in `order` (rows of `columns`), one `step` on to the next filled cell; `at` when
+/// there is none that way. Left / right wrap, up / down stop at the ends (`craft_ui::step_index`).
+fn step_filled(order: &[Option<usize>], at: usize, step: (i32, i32), columns: usize) -> usize {
+    let mut index = at;
+    for _ in 0..order.len() {
+        let next = crate::craft_ui::step_index(index, order.len(), step, columns);
+        if next == index {
+            break;
+        }
+        index = next;
+        if order[index].is_some() {
+            return index;
+        }
+    }
+    at
+}
+
+/// While the Inventory or Wardrobe tab is open (and the search field is not typing): gamepad B,
+/// and on the Inventory tab the arrows / d-pad and A, taken so the player does not also walk.
+fn take_bag_keys(
+    open: Res<OpenPanel>,
+    view: Res<crate::inventory_filter::InventoryView>,
+    mut keys: ResMut<ButtonInput<KeyCode>>,
+    pads: Query<&Gamepad>,
+    mut out: ResMut<BagKeys>,
+    mut deed_keys: ResMut<crate::deeds_ui::DeedKeys>,
+) {
+    if !matches!(*open, OpenPanel::Inventory | OpenPanel::Wardrobe) || view.focused {
+        return;
+    }
+    let pad = |button| pads.iter().any(|pad| pad.just_pressed(button));
+    out.back |= pad(BAG_CLOSE_PAD);
+    if *open != OpenPanel::Inventory {
+        return;
+    }
+    let key = |code| keys.just_pressed(code);
+    // The Deeds chip: the deed list has the focus keys (Tab / arrows / d-pad, Enter / A); the
+    // grid has no cells to walk.
+    if view.chip == crate::inventory_filter::Chip::Deeds {
+        let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+        let tab = key(DEED_FOCUS_KEY);
+        deed_keys.step +=
+            i32::from(key(KeyCode::ArrowDown) || pad(GamepadButton::DPadDown) || (tab && !shift))
+                - i32::from(key(KeyCode::ArrowUp) || pad(GamepadButton::DPadUp) || (tab && shift));
+        deed_keys.activate |= key(STORE_ACTIVATE_KEY) || pad(BAG_PICK_PAD);
+        for code in STORE_NAV_KEYS
+            .into_iter()
+            .chain([DEED_FOCUS_KEY, STORE_ACTIVATE_KEY])
+        {
+            if keys.pressed(code) {
+                keys.reset(code);
+            }
+        }
+        return;
+    }
+    let dx = i32::from(key(KeyCode::ArrowRight) || pad(GamepadButton::DPadRight))
+        - i32::from(key(KeyCode::ArrowLeft) || pad(GamepadButton::DPadLeft));
+    let dy = i32::from(key(KeyCode::ArrowDown) || pad(GamepadButton::DPadDown))
+        - i32::from(key(KeyCode::ArrowUp) || pad(GamepadButton::DPadUp));
+    if dx != 0 || dy != 0 {
+        out.step = Some((dx, dy));
+    }
+    out.pick |= pad(BAG_PICK_PAD);
+    for code in STORE_NAV_KEYS {
+        if keys.pressed(code) {
+            keys.reset(code);
+        }
+    }
+}
+
+/// The bag's keys: arrows / d-pad move the selection over the filled cells (grid, then the hotbar
+/// row), A picks the selected item up and on another cell swaps it there (`MoveItem`), B puts a
+/// picked item back, else closes the bag. ponytail: only filled cells take the selection, so A
+/// swaps but never moves into an empty cell; a free cursor if pad players ask.
+#[allow(clippy::too_many_arguments)] // a Bevy system
+fn use_bag_keys(
+    mut keys: ResMut<BagKeys>,
+    game: Res<Game>,
+    order: Res<BagOrder>,
+    mut open: ResMut<OpenPanel>,
+    mut selected: ResMut<Selected>,
+    mut held: ResMut<BagHeld>,
+    mut actions: MessageWriter<ActionMsg>,
+    mut notices: MessageWriter<Notice>,
+    mut sfx: MessageWriter<Sfx>,
+) {
+    let BagKeys { step, pick, back } = std::mem::take(&mut *keys);
+    if !open.is_bag() {
+        held.set_if_neq(BagHeld(None));
+        return;
+    }
+    if back {
+        if held.0.is_some() {
+            held.0 = None;
+        } else {
+            *open = OpenPanel::None;
+        }
+        return;
+    }
+    let Some(me) = game.me() else { return };
+    let carried = carried_slots(me);
+    let place = carried.iter().position(|&index| index == selected.0);
+    if let Some(step) = step
+        && !order.0.is_empty()
+    {
+        // Not on show (filtered out): start from the hotbar's first cell.
+        let hotbar_start = order.0.len().saturating_sub(HOTBAR_SLOTS);
+        let at = place
+            .and_then(|place| order.0.iter().position(|&p| p == Some(place)))
+            .unwrap_or(hotbar_start);
+        let next = step_filled(&order.0, at, step, HOTBAR_SLOTS);
+        if let Some(Some(place)) = order.0.get(next)
+            && let Some(&index) = carried.get(*place)
+            && index != selected.0
+        {
+            selected.0 = index;
+            sfx.write(Sfx::UiClick);
+        }
+    }
+    if !pick {
+        return;
+    }
+    sfx.write(Sfx::UiClick);
+    match held.0.take() {
+        None => {
+            if let Some(&(id, _)) = me.inventory.slots().get(selected.0)
+                && place.is_some()
+            {
+                held.0 = Some(selected.0);
+                let name = title_case(item_name(id));
+                notices.write(Notice(format!("Moving {name}: pick a slot and press A")));
+            }
+        }
+        Some(from) => {
+            let len = me.inventory.slots().len();
+            if let Some(place) = place
+                && let Some(to) = move_target(&carried, len, from, place)
+                && let Ok(from) = u16::try_from(from)
+            {
+                actions.write(ActionMsg(Action::MoveItem { from, to }));
+            }
         }
     }
 }
@@ -1367,6 +2161,15 @@ fn move_target(carried: &[usize], len: usize, from: usize, position: usize) -> O
     (to != from).then(|| u16::try_from(to).ok()).flatten()
 }
 
+/// Whether a drag from raw slot `from` may drop on the world: only from the grid, never from the
+/// hotbar row (bottom-hud.md, "Drag and drop").
+fn may_drop_out(carried: &[usize], from: usize) -> bool {
+    !carried
+        .iter()
+        .take(HOTBAR_SLOTS)
+        .any(|&index| index == from)
+}
+
 /// Whether a press at `at` has moved far enough to `cursor` to be a drag.
 fn drag_moved(at: Vec2, cursor: Vec2) -> bool {
     at.distance(cursor) >= DRAG_THRESHOLD
@@ -1458,10 +2261,12 @@ fn drag_items(
             if let Some(me) = game.me() {
                 let position = hovered.map(|(cell, _, _)| cell.0);
                 let len = me.inventory.slots().len();
-                if let Some(action) = drop_action(current, position, &carried_slots(me), len) {
+                let carried = carried_slots(me);
+                if let Some(action) = drop_action(current, position, &carried, len) {
                     actions.write(ActionMsg(action));
                 } else if let ItemDrag::Dragging { from } = current
                     && *open == OpenPanel::Inventory
+                    && may_drop_out(&carried, from)
                     && crate::interact::drags_out(position.is_some(), pointer_over_ui(&ui))
                     && let Some(&(id, held)) = me.inventory.slots().get(from)
                     && crate::interact::discardable(id)
@@ -1538,8 +2343,24 @@ fn spawn_inventory_slot(
         });
 }
 
-/// Rebuilds the hotbar and the inventory grid from the player. The grid shows the chip, search and
-/// sort view (`inventory_filter.rs`); its cells keep their real place for dragging.
+/// Empty grid cells for `free` unused backpack slots when `carried` items are shown: the empty
+/// hotbar cells already stand for some of them.
+fn grid_free_cells(carried: usize, free: usize) -> usize {
+    free.saturating_sub(HOTBAR_SLOTS.saturating_sub(carried))
+}
+
+/// `BagOrder`: the grid's cells padded to whole rows of 8, then the hotbar's (`None` when empty).
+fn bag_order(grid: &[Option<usize>], carried: usize) -> Vec<Option<usize>> {
+    let rows = grid.len().div_ceil(HOTBAR_SLOTS);
+    let mut order = grid.to_vec();
+    order.resize(rows * HOTBAR_SLOTS, None);
+    order.extend((0..HOTBAR_SLOTS).map(|n| (n < carried).then_some(n)));
+    order
+}
+
+/// Rebuilds the hotbar and the bag grid from the player. The grid holds the places after the
+/// hotbar's 8 in the chip, search and sort view (`inventory_filter.rs`), never the hotbar's own;
+/// its cells keep their real place for dragging.
 #[allow(clippy::too_many_arguments)] // a Bevy system
 fn refresh_slots(
     mut commands: Commands,
@@ -1550,15 +2371,19 @@ fn refresh_slots(
     mut events: MessageReader<GameEvent>,
     hotbar: Single<Entity, With<HotbarRow>>,
     grid: Single<Entity, With<InventoryGrid>>,
+    mut order: ResMut<BagOrder>,
+    deed_view: Res<crate::deeds_ui::DeedView>,
 ) {
     let inventory_changed = events.read().any(|GameEvent(event)| match *event {
         Event::InventoryChanged { player, .. }
         | Event::BackpackUpgraded { player, .. }
-        | Event::InventoryMoved { player, .. } => player == game.1,
+        | Event::InventoryMoved { player, .. }
+        | Event::DeedsChanged { player, .. } => player == game.1,
         _ => false,
     });
     // `selected` also reads as changed on the first run, which fills the HUD once at startup.
-    if !inventory_changed && !selected.is_changed() && !view.is_changed() {
+    if !inventory_changed && !selected.is_changed() && !view.is_changed() && !deed_view.is_changed()
+    {
         return;
     }
     let Some(me) = game.me() else { return };
@@ -1571,12 +2396,30 @@ fn refresh_slots(
                 spawn_inventory_slot(row, &assets, me, n, carried.get(n).copied(), selected.0);
             }
         });
+    // The Deeds chip: the deed list takes the grid rows' place (docs/knowledge/ux/world-key.md).
+    if view.chip == crate::inventory_filter::Chip::Deeds {
+        order.0 = bag_order(&[], carried.len());
+        commands
+            .entity(*grid)
+            .despawn_children()
+            .with_children(|grid| {
+                crate::deeds_ui::spawn_deed_rows(grid, &assets, &me.deeds, &deed_view);
+            });
+        return;
+    }
     // Free backpack slots are shown empty after the items, unless a filter is on.
     let free = usize::from(me.inventory.capacity).saturating_sub(me.inventory.slots().len());
-    let (positions, show_free) = view.cells(me, &carried);
-    let free = (carried.len()..carried.len() + free).filter(|_| show_free);
-    let cells = positions.iter().map(|&p| (p, Some(carried[p])));
-    let cells = cells.chain(free.map(|p| (p, None)));
+    let (positions, show_free) = view.cells(me.inventory.slots(), &carried, HOTBAR_SLOTS);
+    let first_free = carried.len().max(HOTBAR_SLOTS);
+    let free =
+        (first_free..first_free + grid_free_cells(carried.len(), free)).filter(|_| show_free);
+    let cells: Vec<(usize, Option<usize>)> = positions
+        .iter()
+        .map(|&p| (p, Some(carried[p])))
+        .chain(free.map(|p| (p, None)))
+        .collect();
+    let grid_order: Vec<Option<usize>> = cells.iter().map(|&(p, i)| i.map(|_| p)).collect();
+    order.0 = bag_order(&grid_order, carried.len());
     commands
         .entity(*grid)
         .despawn_children()
@@ -2559,6 +3402,16 @@ fn show_tooltip(
         ),
         Without<ItemTip>,
     >,
+    texts: Query<
+        (
+            Entity,
+            &TextTip,
+            &Hovered,
+            &ComputedNode,
+            &UiGlobalTransform,
+        ),
+        Without<ItemTip>,
+    >,
     tip: Single<(Entity, &mut Node, &ComputedNode), With<Tooltip>>,
     mut since: Local<Option<(Entity, f32)>>,
     mut shown: Local<Option<TipContent>>,
@@ -2583,6 +3436,15 @@ fn show_tooltip(
                 false,
             ))
         })
+    } else if let Some((entity, TextTip(text), _, node, at)) =
+        texts.iter().find(|(_, _, hovered, ..)| hovered.get())
+    {
+        Some((
+            entity,
+            TipContent::Text(text.clone()),
+            logical_rect(node, at),
+            false,
+        ))
     } else {
         tops.iter()
             .find_map(|(entity, button, hovered, node, at)| match button {
@@ -2702,6 +3564,7 @@ fn refresh_item_info(
     cells: Query<(&ItemTip, &Hovered, Option<&UiButton>)>,
     mut name: Single<&mut Text, With<SelectedName>>,
     mods: Single<Entity, With<ModLine>>,
+    mut backing: Single<&mut BackgroundColor, With<StripLine>>,
     mut last_cell: Local<Option<(ItemId, u16)>>,
     mut shown: Local<Option<(Option<ItemInfo>, bool, Option<u32>)>>,
 ) {
@@ -2743,6 +3606,12 @@ fn refresh_item_info(
         (None, Some(info)) if *claim_row => format!("{}: {CLAIM_ROW_HINT}", info.title),
         (None, Some(info)) => info.title.clone(),
         (None, None) => String::new(),
+    };
+    // Dark behind the words, readable over the world and over the bag's parchment alike.
+    backing.0 = if name.0.is_empty() {
+        Color::NONE
+    } else {
+        PANEL_COLOR
     };
     commands
         .entity(*mods)
@@ -2843,6 +3712,9 @@ fn toast_for_reject(action: &Action, reject: Reject) -> Option<&'static str> {
         // Named by `claim_ui.rs`.
         Reject::NoPermission | Reject::NotOwner => None,
         Reject::Occupied | Reject::OutOfRange | Reject::Cooldown => None,
+        Reject::DeedOut => Some(game_protocol::DEED_OUT_TEXT),
+        // Needs the world's name: the deed ring says it (`game_protocol::deed_void_text`).
+        Reject::DeedVoid => None,
     }
 }
 
@@ -2981,9 +3853,11 @@ mod tests {
 
     #[test]
     fn a_panel_ends_above_the_hotbar_but_keeps_a_minimum_height() {
-        assert_eq!(HOTBAR_RESERVE, 138.0);
-        assert_eq!(panel_max_height(720.0, PANEL_TOP), 720.0 - 48.0 - 138.0);
-        assert_eq!(panel_max_height(1080.0, 72.0), 1080.0 - 72.0 - 138.0);
+        // Hotbar 74 + pull tab 32 + strip 46 + margins, and the toast line above.
+        assert_eq!(CLOSED_STACK, 160.0);
+        assert_eq!(HOTBAR_RESERVE, 192.0);
+        assert_eq!(panel_max_height(720.0, PANEL_TOP), 720.0 - 48.0 - 192.0);
+        assert_eq!(panel_max_height(1080.0, 72.0), 1080.0 - 72.0 - 192.0);
         assert_eq!(panel_max_height(300.0, PANEL_TOP), MIN_PANEL_HEIGHT);
     }
 
@@ -2997,14 +3871,261 @@ mod tests {
         // The panel is exactly as wide as its grid, scrollbar and padding, and fits the window.
         let width = WARDROBE_GRID.width_for(1280.0);
         assert!(width <= 1280.0 - 2.0 * HUD_MARGIN, "{width}");
+    }
+
+    #[test]
+    fn the_bag_is_the_hotbars_width_on_the_inventory_tab() {
+        // Exactly 8 columns at any window width, so the hotbar is its bottom row.
+        for window in [800.0, 1280.0, 2560.0] {
+            let width = bag_width(OpenPanel::Inventory, window);
+            assert_eq!(width, grid_width(8.0) + SCROLLBAR_SPACE + 2.0 * BAG_PADDING);
+            assert_eq!(
+                columns_for_width(width - 2.0 * BAG_PADDING - SCROLLBAR_SPACE, 1, 20),
+                HOTBAR_SLOTS
+            );
+        }
         assert_eq!(
-            INVENTORY_GRID.width_for(0.0),
-            grid_width(6.0) + SCROLLBAR_SPACE + 64.0
+            bag_width(OpenPanel::Craft, 1280.0),
+            crate::craft_ui::BODY_WIDTH + 2.0 * BAG_PADDING
+        );
+        assert!(bag_width(OpenPanel::Wardrobe, 1280.0) <= 1280.0);
+    }
+
+    #[test]
+    fn the_open_bag_shows_three_rows_within_sixty_percent_of_the_window() {
+        let header = BAG_HEADER_GUESS;
+        let row = SLOT_SIZE + SLOT_GAP;
+        // Tall windows: 3 rows, and no more.
+        assert_eq!(
+            bag_open_height(1080.0, header),
+            bag_open_height(4000.0, header)
+        );
+        assert!(bag_open_height(1080.0, header) <= 1080.0 * BAG_MAX_FRACTION);
+        // 720: 3 rows would pass 60 %, so 2.
+        let at_720 = bag_open_height(720.0, header);
+        assert!(at_720 <= 720.0 * BAG_MAX_FRACTION, "{at_720}");
+        assert_eq!(
+            bag_open_height(1080.0, header) - at_720,
+            row,
+            "one row fewer"
+        );
+        // Never fewer than 2, even past the cap.
+        assert_eq!(bag_open_height(300.0, header), at_720);
+        assert!(bag_open_height(300.0, header) > 300.0 * BAG_MAX_FRACTION);
+        // A taller header (wrapped chips) gives up a row before the cap does.
+        assert!(bag_open_height(900.0, header + 60.0) <= 900.0 * BAG_MAX_FRACTION);
+        // The open bag holds the pull tab, the strip, the tab row, the header and the rows.
+        let three = bag_open_height(1080.0, header);
+        assert_eq!(
+            three,
+            PULL_TAB_SIZE.y
+                + STRIP_HEIGHT
+                + SLOT_GAP
+                + BAG_PADDING
+                + TAB_HEIGHT
+                + 2.0 * HUD_MARGIN
+                + header
+                + 3.0 * row
+                - SLOT_GAP
+        );
+    }
+
+    #[test]
+    fn the_wardrobe_tab_grows_the_bag_to_fit_its_preview_up_to_85_percent() {
+        // The slot columns (4 slots, 308 px) are the tallest part of the preview.
+        let fit = BAG_BOTTOM_PADDING + BAG_PADDING + TAB_HEIGHT + HUD_MARGIN + 308.0;
+        assert_eq!(wardrobe_open_height(1080.0), fit);
+        assert_eq!(wardrobe_open_height(720.0), fit, "fits at 720");
+        assert!(fit <= 720.0 * WARDROBE_MAX_FRACTION);
+        assert!(
+            fit > 720.0 * BAG_MAX_FRACTION,
+            "taller than the grid tabs may be"
         );
         assert_eq!(
-            INVENTORY_GRID.width_for(1280.0),
-            grid_width(10.0) + SCROLLBAR_SPACE + 64.0
+            wardrobe_open_height(500.0),
+            500.0 * WARDROBE_MAX_FRACTION,
+            "capped"
         );
+        assert_eq!(tab_open_height(OpenPanel::Wardrobe, 720.0, 92.0), fit);
+        assert_eq!(
+            tab_open_height(OpenPanel::Craft, 720.0, 92.0),
+            bag_open_height(720.0, 92.0)
+        );
+        assert_eq!(
+            tab_open_height(OpenPanel::Inventory, 720.0, 92.0),
+            bag_open_height(720.0, 92.0)
+        );
+    }
+
+    #[test]
+    fn the_bag_opens_easing_out_and_closes_easing_in() {
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        // Open: 0.18 s, fast first.
+        assert!(near(slide_step(0.0, true, BAG_OPEN_SECS), 1.0));
+        assert!(near(slide_step(0.0, true, BAG_OPEN_SECS / 2.0), 0.75));
+        assert!(near(slide_step(0.0, true, 0.0), 0.0));
+        // Close: 0.15 s, slow first.
+        assert!(near(slide_step(1.0, false, BAG_CLOSE_SECS), 0.0));
+        assert!(near(slide_step(1.0, false, BAG_CLOSE_SECS / 2.0), 0.75));
+        // In small steps it gets there in the same time.
+        let mut shown = 0.0;
+        for _ in 0..18 {
+            shown = slide_step(shown, true, BAG_OPEN_SECS / 18.0);
+        }
+        assert!(near(shown, 1.0), "{shown}");
+        for _ in 0..15 {
+            shown = slide_step(shown, false, BAG_CLOSE_SECS / 15.0);
+        }
+        assert!(near(shown, 0.0), "{shown}");
+        // Turning round mid-slide starts from where it is.
+        let half = slide_step(0.0, true, BAG_OPEN_SECS / 2.0);
+        assert!(near(slide_step(half, false, 0.0), half));
+        assert!(near(slide_step(half, true, 0.0), half));
+        // Done stays done.
+        assert_eq!(slide_step(1.0, true, 1.0), 1.0);
+        assert_eq!(slide_step(0.0, false, 1.0), 0.0);
+        // Dragging the tab: the bag follows the pointer.
+        assert_eq!(dragged_shown(0.0, 200.0, 400.0), 0.5);
+        assert_eq!(dragged_shown(0.5, -1000.0, 400.0), 0.0);
+        assert_eq!(dragged_shown(0.5, 1000.0, 400.0), 1.0);
+    }
+
+    #[test]
+    fn the_strip_and_toasts_sit_where_the_table_says() {
+        // Closed: the strip just above the pull tab, the toasts above the strip, the hints above
+        // the toasts.
+        let strip_bottom = HOTBAR_TOP + PULL_TAB_SIZE.y;
+        assert_eq!(stack_top(0.0), strip_bottom + STRIP_HEIGHT);
+        assert_eq!(toast_bottom(stack_top(0.0)), CLOSED_STACK + SLOT_GAP);
+        assert!(hint_bottom(stack_top(0.0)) >= toast_bottom(stack_top(0.0)) + LINE_HEIGHT);
+        // Open: the strip (same place) is inside the panel, between the grid and the hotbar; the
+        // toasts and hints go above the panel's top edge.
+        let open = bag_open_height(720.0, BAG_HEADER_GUESS);
+        let panel_top = HOTBAR_TOP + open;
+        assert!(strip_bottom + STRIP_HEIGHT + SLOT_GAP <= HOTBAR_TOP + BAG_BOTTOM_PADDING);
+        assert!(HOTBAR_TOP + BAG_BOTTOM_PADDING < panel_top);
+        assert_eq!(stack_top(open), panel_top);
+        assert_eq!(toast_bottom(stack_top(open)), panel_top + SLOT_GAP);
+        assert!(hint_bottom(stack_top(open)) > panel_top + LINE_HEIGHT);
+        // Sliding: never below the closed stack.
+        assert_eq!(stack_top(10.0), CLOSED_STACK);
+        // Voice: level with the hotbar, unless the open bag reaches under it.
+        let mic = Vec2::new(200.0, 40.0);
+        assert_eq!(
+            right_hud_bottom(mic, 1280.0, None, 160.0),
+            HUD_MARGIN + 17.0
+        );
+        let wide_bag = (1280.0 + bag_width(OpenPanel::Inventory, 1280.0)) / 2.0;
+        assert_eq!(
+            right_hud_bottom(mic, 1280.0, Some(wide_bag), 500.0),
+            HUD_MARGIN + 17.0
+        );
+        let narrow = (800.0 + bag_width(OpenPanel::Inventory, 800.0)) / 2.0;
+        assert_eq!(
+            right_hud_bottom(mic, 800.0, Some(narrow), 500.0),
+            500.0 + SLOT_GAP
+        );
+    }
+
+    #[test]
+    fn e_and_gamepad_y_toggle_the_bag() {
+        use OpenPanel::*;
+        // E / I and Y: open on the last-used tab, close from any tab.
+        assert_eq!(bag_toggle(None, BagKey::Toggle, Inventory), Inventory);
+        assert_eq!(bag_toggle(None, BagKey::Toggle, Wardrobe), Wardrobe);
+        assert_eq!(bag_toggle(None, BagKey::Toggle, Craft), Craft);
+        assert_eq!(bag_toggle(Inventory, BagKey::Toggle, Inventory), None);
+        assert_eq!(bag_toggle(Wardrobe, BagKey::Toggle, Wardrobe), None);
+        assert_eq!(bag_toggle(Craft, BagKey::Toggle, Craft), None);
+        // Opening the bag closes a centre panel.
+        assert_eq!(bag_toggle(Store, BagKey::Toggle, Inventory), Inventory);
+        assert_eq!(bag_toggle(Settings, BagKey::Toggle, Craft), Craft);
+        // C: the Craft tab, or closed from it.
+        assert_eq!(bag_toggle(None, BagKey::Craft, Inventory), Craft);
+        assert_eq!(bag_toggle(Inventory, BagKey::Craft, Inventory), Craft);
+        assert_eq!(bag_toggle(Craft, BagKey::Craft, Craft), None);
+        // The pull tab / touch.
+        assert_eq!(set_bag(None, true, Wardrobe), Wardrobe);
+        assert_eq!(set_bag(Craft, true, Craft), Craft);
+        assert_eq!(set_bag(Craft, false, Craft), None);
+        assert_eq!(set_bag(Store, false, Inventory), Store);
+        assert!(Inventory.is_bag() && Wardrobe.is_bag() && Craft.is_bag());
+        assert!(!Store.is_bag() && !Settings.is_bag() && !None.is_bag());
+    }
+
+    #[test]
+    fn touch_taps_the_tab_and_swipes_the_hotbar() {
+        let tab = Rect::new(608.0, 600.0, 672.0, 632.0);
+        let hotbar = Rect::new(330.0, 632.0, 950.0, 706.0);
+        let row = Some(Rect::new(330.0, 200.0, 950.0, 246.0));
+        let tap = Vec2::new(640.0, 610.0);
+        assert_eq!(
+            touch_gesture(tap, tap, tab, hotbar, None),
+            Some(Gesture::Toggle)
+        );
+        // 44 px tall for a finger, though the art is 32.
+        let edge = Vec2::new(640.0, 597.0);
+        assert_eq!(
+            touch_gesture(edge, edge, tab, hotbar, None),
+            Some(Gesture::Toggle)
+        );
+        let on_bar = Vec2::new(400.0, 680.0);
+        assert_eq!(
+            touch_gesture(on_bar, on_bar - Vec2::Y * 60.0, tab, hotbar, None),
+            Some(Gesture::Open)
+        );
+        assert_eq!(
+            touch_gesture(on_bar, on_bar, tab, hotbar, None),
+            None,
+            "a tap on a slot"
+        );
+        let on_row = Vec2::new(400.0, 220.0);
+        assert_eq!(
+            touch_gesture(on_row, on_row + Vec2::Y * 60.0, tab, hotbar, row),
+            Some(Gesture::Close)
+        );
+        assert_eq!(
+            touch_gesture(on_row, on_row + Vec2::Y * 60.0, tab, hotbar, None),
+            None,
+            "closed: no tab row"
+        );
+    }
+
+    #[test]
+    fn the_hotbar_row_is_its_own_row_of_the_grid() {
+        // 3 carried: 5 hotbar cells stand empty for 5 of the 12 free slots.
+        assert_eq!(grid_free_cells(3, 12), 7);
+        assert_eq!(grid_free_cells(3, 4), 0);
+        assert_eq!(grid_free_cells(20, 12), 12);
+        // Order: grid padded to whole rows, then the hotbar.
+        let order = bag_order(&[Some(8), Some(9), None], 10);
+        assert_eq!(order.len(), 16);
+        assert_eq!(&order[..3], &[Some(8), Some(9), None]);
+        assert!(order[3..8].iter().all(Option::is_none));
+        assert_eq!(order[8..], (0..8).map(Some).collect::<Vec<_>>()[..]);
+        let short = bag_order(&[], 3);
+        assert_eq!(
+            short,
+            vec![Some(0), Some(1), Some(2), None, None, None, None, None]
+        );
+        // Moving skips empty cells; up from the hotbar lands in the grid row above.
+        assert_eq!(step_filled(&order, 8, (0, -1), 8), 0);
+        assert_eq!(step_filled(&order, 9, (0, -1), 8), 1);
+        assert_eq!(
+            step_filled(&order, 10, (0, -1), 8),
+            10,
+            "nothing filled above"
+        );
+        assert_eq!(
+            step_filled(&order, 1, (1, 0), 8),
+            8,
+            "past the empties, on to the hotbar"
+        );
+        // Dragging out drops from the grid, never from the hotbar row.
+        let carried: Vec<usize> = (0..12).collect();
+        assert!(!may_drop_out(&carried, 0));
+        assert!(!may_drop_out(&carried, 7));
+        assert!(may_drop_out(&carried, 8));
     }
 
     #[test]
@@ -3144,6 +4265,8 @@ mod tests {
                 Reject::Invalid => Some("That didn't work"),
                 Reject::NoPermission | Reject::NotOwner => None,
                 Reject::Occupied | Reject::OutOfRange | Reject::Cooldown => None,
+                Reject::DeedOut => Some(game_protocol::DEED_OUT_TEXT),
+                Reject::DeedVoid => None,
             }
         }
         let all = [

@@ -68,6 +68,12 @@ pub fn apply_event(state: &mut WorldState, event: &Event, now: f64) {
                 }
             }
         }
+        Event::DeedsChanged { player, deeds } => {
+            if let Some(player) = state.players.get_mut(player) {
+                player.deeds = deeds.clone();
+            }
+        }
+        &Event::DeedOut { out } => state.deed_out = out,
         &Event::GemsChanged { player, gems } => {
             if let Some(player) = state.players.get_mut(&player) {
                 player.gems = gems;

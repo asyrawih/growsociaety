@@ -64,6 +64,8 @@ pub struct Player {
     pub xp: u32,
     /// `now` of the last respawn (home or hazard), for `RESPAWN_COOLDOWN`. Not saved.
     pub last_respawn: f64,
+    /// The deed ring (docs/knowledge/ux/world-key.md). Private, like the inventory.
+    pub deeds: Vec<crate::deeds::Deed>,
 }
 
 /// Seconds after any respawn before `Action::Respawn` is accepted again (docs/knowledge/ux/respawn.md).
@@ -113,6 +115,8 @@ pub struct WorldState {
     pub trades: Vec<Trade>,
     /// The id the next trade request gets.
     pub next_trade_id: u32,
+    /// A deed for this world exists (the server's `world_deeds` says so; not in the world blob).
+    pub deed_out: bool,
 }
 
 impl WorldState {
@@ -124,6 +128,7 @@ impl WorldState {
             rng: Rng::new(seed),
             trades: Vec::new(),
             next_trade_id: 0,
+            deed_out: false,
         }
     }
 
@@ -150,6 +155,7 @@ impl WorldState {
                 level: 1,
                 xp: 0,
                 last_respawn: f64::NEG_INFINITY,
+                deeds: Vec::new(),
             }
         });
     }
@@ -237,6 +243,29 @@ pub enum Action {
     /// In review, after `TRADE_REVIEW_DELAY`.
     TradeConfirm,
     TradeCancel,
+    /// Owner only, on the world claim block at `(x, y)`: a World Deed for this world onto the ring.
+    MakeDeed {
+        x: u32,
+        y: u32,
+    },
+    /// Become the owner of `world` with its deed. The server finishes it in that world; the deed
+    /// leaves the ring here at once (locked while in flight).
+    UseDeed {
+        world: crate::deeds::WorldName,
+    },
+    /// Throw a valid deed away; its world keeps its owner.
+    TearUpDeed {
+        world: crate::deeds::WorldName,
+    },
+    /// Throw a void deed away.
+    DiscardDeed {
+        world: crate::deeds::WorldName,
+    },
+    /// Put a deed in, or take it out of, the own offer of the open trade.
+    TradeDeed {
+        world: crate::deeds::WorldName,
+        add: bool,
+    },
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -370,6 +399,15 @@ pub enum Event {
         player: PlayerId,
         level: u16,
     },
+    /// `player`'s whole deed ring, after any change. Private.
+    DeedsChanged {
+        player: PlayerId,
+        deeds: Vec<crate::deeds::Deed>,
+    },
+    /// Whether a deed for this world exists now (the claim panel's "Deed out").
+    DeedOut {
+        out: bool,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -396,6 +434,10 @@ pub enum Reject {
     InventoryFull,
     /// One world claim per world.
     WorldAlreadyClaimed,
+    /// A deed for this world exists already.
+    DeedOut,
+    /// The deed's world claim is gone.
+    DeedVoid,
     /// Someone else owns an area claim here, so the world cannot be claimed.
     ForeignClaims,
     Invalid,
@@ -489,6 +531,11 @@ pub fn apply(
         Action::TradeLock { locked } => crate::trade::lock(state, player, locked, now),
         Action::TradeConfirm => crate::trade::confirm(state, player, now),
         Action::TradeCancel => crate::trade::cancel(state, player),
+        Action::MakeDeed { x, y } => crate::deeds::make(state, player, x, y),
+        Action::UseDeed { world } => crate::deeds::begin_use(state, player, world),
+        Action::TearUpDeed { world } => crate::deeds::tear_up(state, player, world),
+        Action::DiscardDeed { world } => crate::deeds::discard(state, player, world),
+        Action::TradeDeed { world, add } => crate::trade::set_deed(state, player, world, add),
     }
 }
 

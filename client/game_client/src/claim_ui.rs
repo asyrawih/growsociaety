@@ -80,6 +80,7 @@ const DISABLED_TINT: Color = Color::srgba(1.0, 1.0, 1.0, 0.5);
 /// field or releases it; Esc releases it, or closes the panel when nothing has focus.
 const FOCUS_KEY: KeyCode = KeyCode::Tab;
 const CLOSE_KEY: KeyCode = KeyCode::Escape;
+const ACTIVATE_KEY: KeyCode = KeyCode::Enter;
 const OFFLINE_ADD: &str = "Adding players needs an online game";
 
 /// What holding a claim over the hovered tile would do.
@@ -277,7 +278,7 @@ fn add_error(claim: &Claim, id: PlayerId, name: &str) -> Option<String> {
 }
 
 /// Names for the view: the server's online, the local player's own offline.
-fn name_of(net: Option<&Net>, me: PlayerId, id: PlayerId) -> String {
+pub(crate) fn name_of(net: Option<&Net>, me: PlayerId, id: PlayerId) -> String {
     match net {
         Some(net) => display_name(net.name(id), id),
         None if id == me => offline_name(),
@@ -326,6 +327,39 @@ enum ClaimButton {
     Chip(PlayerId),
     Field,
     Add,
+    /// `Make World Deed`: arms its confirm.
+    MakeDeed,
+    DeedYes,
+    DeedNo,
+}
+
+/// The claim panel's World Deed button (docs/knowledge/ux/world-key.md).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DeedState {
+    /// `Make World Deed`.
+    Make,
+    /// `Deed out`, disabled: one deed per world at a time.
+    Out,
+}
+
+const MAKE_DEED_TEXT: &str = "Make World Deed";
+const DEED_OUT_BUTTON: &str = "Deed out";
+const MAKE_DEED_YES: &str = "Make deed";
+const MAKE_DEED_NO: &str = "Cancel";
+
+/// The button for the world claim's owner only; area claims and visitors get none.
+fn deed_state(mine: bool, world_claim: bool, deed_out: bool) -> Option<DeedState> {
+    match (mine && world_claim, deed_out) {
+        (false, _) => None,
+        (true, false) => Some(DeedState::Make),
+        (true, true) => Some(DeedState::Out),
+    }
+}
+
+fn make_deed_confirm(world: &str) -> String {
+    format!(
+        "Make a deed for {world}? Whoever uses it becomes the owner. You stay the owner until then."
+    )
 }
 
 /// The claim panel's view state.
@@ -336,6 +370,8 @@ struct PanelState {
     /// Index into the focus order; nothing when the panel opens.
     focus: Option<usize>,
     confirm_public: bool,
+    /// `Make World Deed` was pressed: its confirm is on show.
+    confirm_deed: bool,
     /// The name sent to `Net::find_player`, waiting for its answer.
     asked: Option<String>,
 }
@@ -346,8 +382,6 @@ struct PanelKeys {
     typed: Vec<Key>,
     /// Gamepad d-pad steps through the focus order.
     step: i32,
-    /// Tab: focus the name field, or release the focus.
-    toggle_field: bool,
     activate: bool,
     close: bool,
 }
@@ -804,12 +838,54 @@ fn outline_inspected(
 }
 
 /// The focusable elements of the owner's panel, in Tab order: toggle, rows, chips, field, Add.
-fn focus_order(claim: &Claim, chips: &[PlayerId]) -> Vec<ClaimButton> {
+fn focus_order(claim: &Claim, chips: &[PlayerId], confirms: &[ClaimButton]) -> Vec<ClaimButton> {
     let mut order = vec![ClaimButton::Public];
+    order.extend_from_slice(confirms);
     order.extend(claim.access.iter().map(|&id| ClaimButton::Remove(id)));
     order.extend(chips.iter().map(|&id| ClaimButton::Chip(id)));
     order.extend([ClaimButton::Field, ClaimButton::Add]);
     order
+}
+
+/// The buttons between the Public toggle and the list, as drawn: the Public confirm, then the
+/// World Deed button or its confirm.
+fn confirm_buttons(state: &PanelState, deed: Option<DeedState>) -> Vec<ClaimButton> {
+    let mut buttons = Vec::new();
+    if state.confirm_public {
+        buttons.extend([ClaimButton::ConfirmYes, ClaimButton::ConfirmNo]);
+    }
+    match deed {
+        Some(DeedState::Make) if state.confirm_deed => {
+            buttons.extend([ClaimButton::DeedYes, ClaimButton::DeedNo]);
+        }
+        Some(DeedState::Make) => buttons.push(ClaimButton::MakeDeed),
+        Some(DeedState::Out) | None => {}
+    }
+    buttons
+}
+
+/// Whether the claim block at `(x, y)` is this world's World Claim.
+fn is_world_claim(game: &Game, x: u32, y: u32) -> bool {
+    World::tile_key(x, y).is_some_and(|k| game.0.world.world_claim == Some(k))
+}
+
+fn panel_deed(game: &Game, (x, y, claim): (u32, u32, &Claim)) -> Option<DeedState> {
+    deed_state(
+        claim.owner == game.1,
+        is_world_claim(game, x, y),
+        game.0.deed_out,
+    )
+}
+
+/// The owner's panel focus order right now.
+fn order_for(
+    game: &Game,
+    state: &PanelState,
+    (x, y, claim): (u32, u32, &Claim),
+) -> Vec<ClaimButton> {
+    let chips = chips_for(game, claim);
+    let confirms = confirm_buttons(state, panel_deed(game, (x, y, claim)));
+    focus_order(claim, &chips, &confirms)
 }
 
 /// Players in the world who are neither the owner nor listed.
@@ -853,14 +929,21 @@ fn take_panel_keys(
     mut out: ResMut<PanelKeys>,
 ) {
     let typed: Vec<KeyboardInput> = typed.read().cloned().collect();
-    let Some((_, _, claim)) = open_claim(&game, &open, &inspected) else {
+    let Some((x, y, claim)) = open_claim(&game, &open, &inspected) else {
         return;
     };
     if claim.owner != game.1 {
         return; // the read-only view: Esc (hud) closes it
     }
     let pad = |button| pads.iter().any(|pad| pad.just_pressed(button));
-    out.toggle_field |= keys.just_pressed(FOCUS_KEY);
+    // Tab steps forward through the focus order, Shift+Tab back (like the d-pad).
+    if keys.just_pressed(FOCUS_KEY) {
+        out.step += if keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]) {
+            -1
+        } else {
+            1
+        };
+    }
     if pad(GamepadButton::DPadDown) {
         out.step += 1;
     }
@@ -870,9 +953,13 @@ fn take_panel_keys(
     out.close |= keys.just_pressed(CLOSE_KEY) || pad(GamepadButton::East);
     out.activate |= pad(GamepadButton::South);
     let field_focused = state.focus.is_some_and(|i| {
-        let chips = chips_for(&game, claim);
-        focus_order(claim, &chips).get(i) == Some(&ClaimButton::Field)
+        order_for(&game, &state, (x, y, claim)).get(i) == Some(&ClaimButton::Field)
     });
+    // Enter activates a focused button (on the field it adds, below).
+    if !field_focused && state.focus.is_some() && keys.just_pressed(ACTIVATE_KEY) {
+        out.activate = true;
+        keys.reset(ACTIVATE_KEY);
+    }
     if field_focused {
         for key in typed.iter().filter(|k| k.state == ButtonState::Pressed) {
             if keys.pressed(key.key_code) && key.logical_key != Key::Tab {
@@ -921,6 +1008,12 @@ fn press(
             actions.write(ActionMsg(Action::SetClaimPublic { x, y, public: true }));
         }
         ClaimButton::ConfirmNo => state.confirm_public = false,
+        ClaimButton::MakeDeed => state.confirm_deed = true,
+        ClaimButton::DeedYes => {
+            state.confirm_deed = false;
+            actions.write(ActionMsg(Action::MakeDeed { x, y }));
+        }
+        ClaimButton::DeedNo => state.confirm_deed = false,
         ClaimButton::Remove(id) => {
             actions.write(access(id, false));
         }
@@ -973,10 +1066,11 @@ fn click_panel(
     let clicked = buttons.iter().find(|(_, h)| h.get()).map(|(&b, _)| b);
     // Only a click on the name field gives focus; any other click, inside or outside the panel,
     // releases it.
-    let chips = chips_for(&game, claim);
-    let focus = clicked
-        .filter(|&b| b == ClaimButton::Field)
-        .and_then(|b| focus_order(claim, &chips).iter().position(|&o| o == b));
+    let focus = clicked.filter(|&b| b == ClaimButton::Field).and_then(|b| {
+        order_for(&game, &state, (x, y, claim))
+            .iter()
+            .position(|&o| o == b)
+    });
     if state.focus != focus {
         state.focus = focus;
     }
@@ -1010,7 +1104,6 @@ fn use_panel_keys(
     let PanelKeys {
         typed,
         step,
-        toggle_field,
         activate,
         close,
     } = std::mem::take(&mut *keys);
@@ -1027,12 +1120,7 @@ fn use_panel_keys(
         }
         return;
     }
-    let chips = chips_for(&game, &claim);
-    let order = focus_order(&claim, &chips);
-    let field = order.iter().position(|&b| b == ClaimButton::Field);
-    if toggle_field {
-        state.focus = if state.focus == field { None } else { field };
-    }
+    let order = order_for(&game, &state, (x, y, &claim));
     if step != 0 {
         let len = order.len() as i32;
         let at = state.focus.map_or(0, |i| i as i32);
@@ -1141,6 +1229,11 @@ struct PanelView {
     focus: Option<ClaimButton>,
     confirm: bool,
     can_add: bool,
+    deed: Option<DeedState>,
+    confirm_deed: bool,
+    /// `A deed for this world exists` (a world claim with a deed out).
+    deed_out: bool,
+    world_name: String,
 }
 
 #[allow(clippy::too_many_arguments)] // a Bevy system
@@ -1177,7 +1270,10 @@ fn refresh_panel(
                     | OpenPanel::Almanac
                     | OpenPanel::WorldSelect
                     | OpenPanel::AvatarMenu
-            ) || search.focused,
+            ) || search.focused
+                // The deed list keeps Enter too (it activates the focused button).
+                || (*open == OpenPanel::Inventory
+                    && search.chip == crate::inventory_filter::Chip::Deeds),
         ));
         return;
     };
@@ -1194,9 +1290,10 @@ fn refresh_panel(
         net.lookup_names(std::iter::once(claim.owner).chain(claim.access.iter().copied()));
     }
     let name = |id| name_of(net.as_deref(), me, id);
-    let order = focus_order(claim, &chips);
-    let field_focused = mine && state.focus.and_then(|i| order.get(i)) == Some(&ClaimButton::Field);
-    text_focus.set_if_neq(TextFocus(field_focused));
+    let world_claim = is_world_claim(&game, x, y);
+    let order = order_for(&game, &state, (x, y, claim));
+    // Any focus keeps Enter here (it adds or activates), not in the chat line.
+    text_focus.set_if_neq(TextFocus(mine && state.focus.is_some()));
     let view = PanelView {
         claim: Some((x, y, claim.clone())),
         mine,
@@ -1213,6 +1310,10 @@ fn refresh_panel(
         },
         confirm: state.confirm_public,
         can_add: !state.field.trim().is_empty() && claim.access.len() < MAX_CLAIM_ACCESS,
+        deed: panel_deed(&game, (x, y, claim)),
+        confirm_deed: state.confirm_deed && mine && world_claim && !game.0.deed_out,
+        deed_out: world_claim && game.0.deed_out,
+        world_name: game.0.world.name.clone(),
     };
     if *shown == view {
         return;
@@ -1279,6 +1380,9 @@ fn refresh_panel(
                     "You can't build here"
                 };
                 body.spawn(ink(text));
+                if view.deed_out {
+                    body.spawn((ink(game_protocol::DEED_OUT_TEXT), Hovered::default()));
+                }
                 return;
             }
             body.spawn((line(), Hovered::default()))
@@ -1311,9 +1415,59 @@ fn refresh_panel(
                                 button,
                                 Hovered::default(),
                             ))
-                            .with_child((label(text), TextColor(Color::WHITE)));
+                            .with_children(|b| {
+                                b.spawn((label(text), TextColor(Color::WHITE)));
+                                focus_frame(b, button);
+                            });
                         }
                     });
+            }
+            match view.deed {
+                Some(DeedState::Make) if view.confirm_deed => {
+                    body.spawn((ink(make_deed_confirm(&view.world_name)), Hovered::default()));
+                    body.spawn((line(), Hovered::default()))
+                        .with_children(|row| {
+                            for (text, button, file) in [
+                                (MAKE_DEED_YES, ClaimButton::DeedYes, BUTTON_IMAGE),
+                                (MAKE_DEED_NO, ClaimButton::DeedNo, BUTTON_SECONDARY_IMAGE),
+                            ] {
+                                row.spawn((
+                                    button_node(),
+                                    sliced(&assets, file, BUTTON_INSET),
+                                    button,
+                                    Hovered::default(),
+                                ))
+                                .with_children(|b| {
+                                    b.spawn((label(text), TextColor(Color::WHITE)));
+                                    focus_frame(b, button);
+                                });
+                            }
+                        });
+                }
+                Some(DeedState::Make) => {
+                    body.spawn((
+                        button_node(),
+                        sliced(&assets, BUTTON_SECONDARY_IMAGE, BUTTON_INSET),
+                        ClaimButton::MakeDeed,
+                        Hovered::default(),
+                    ))
+                    .with_children(|b| {
+                        b.spawn((label(MAKE_DEED_TEXT), TextColor(Color::WHITE)));
+                        focus_frame(b, ClaimButton::MakeDeed);
+                    });
+                }
+                Some(DeedState::Out) => {
+                    // Disabled: no `ClaimButton`, so it takes no click.
+                    body.spawn((
+                        button_node(),
+                        sliced(&assets, BUTTON_SECONDARY_IMAGE, BUTTON_INSET)
+                            .with_color(DISABLED_TINT),
+                        Hovered::default(),
+                    ))
+                    .with_child((label(DEED_OUT_BUTTON), TextColor(Color::WHITE)));
+                    body.spawn((ink(game_protocol::DEED_OUT_TEXT), Hovered::default()));
+                }
+                None => {}
             }
             body.spawn((
                 Node {
@@ -1656,10 +1810,56 @@ mod tests {
     }
 
     #[test]
+    fn only_the_world_claims_owner_may_make_a_deed_and_one_at_a_time() {
+        assert_eq!(deed_state(true, true, false), Some(DeedState::Make));
+        assert_eq!(deed_state(true, true, true), Some(DeedState::Out));
+        assert_eq!(deed_state(true, false, false), None, "area claims: none");
+        assert_eq!(deed_state(false, true, false), None, "visitors: none");
+        assert_eq!(deed_state(false, true, true), None);
+        assert_eq!(MAKE_DEED_TEXT, "Make World Deed");
+        assert_eq!(DEED_OUT_BUTTON, "Deed out");
+        assert_eq!(
+            make_deed_confirm("MYFARM"),
+            "Make a deed for MYFARM? Whoever uses it becomes the owner. You stay the owner until then."
+        );
+    }
+
+    #[test]
+    fn confirms_and_the_deed_button_join_the_focus_order_as_drawn() {
+        let mut state = PanelState::default();
+        assert_eq!(confirm_buttons(&state, None), []);
+        assert_eq!(
+            confirm_buttons(&state, Some(DeedState::Make)),
+            [ClaimButton::MakeDeed]
+        );
+        assert_eq!(
+            confirm_buttons(&state, Some(DeedState::Out)),
+            [],
+            "disabled"
+        );
+        state.confirm_public = true;
+        state.confirm_deed = true;
+        let confirms = confirm_buttons(&state, Some(DeedState::Make));
+        assert_eq!(
+            confirms,
+            [
+                ClaimButton::ConfirmYes,
+                ClaimButton::ConfirmNo,
+                ClaimButton::DeedYes,
+                ClaimButton::DeedNo
+            ]
+        );
+        let order = focus_order(&claim(ME, vec![]), &[], &confirms);
+        assert_eq!(order[0], ClaimButton::Public);
+        assert_eq!(&order[1..5], &confirms[..]);
+        assert_eq!(&order[5..], [ClaimButton::Field, ClaimButton::Add]);
+    }
+
+    #[test]
     fn tab_goes_toggle_rows_chips_field_add() {
         let mut c = claim(ME, vec![1]);
         c.access.push(ANA);
-        let order = focus_order(&c, &[PlayerId(7)]);
+        let order = focus_order(&c, &[PlayerId(7)], &[]);
         assert_eq!(
             order,
             vec![

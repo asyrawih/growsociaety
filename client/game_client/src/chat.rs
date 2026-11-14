@@ -25,14 +25,23 @@ use crate::state::{AdminMsg, Game, Phase, SystemLine};
 
 /// Lines kept for the open chat view.
 const HISTORY: usize = 50;
-/// Lines shown while the chat line is closed, and for how long after they arrive.
+/// Lines shown while the chat line is closed (fewer while the bag is open, or when the pushed-up
+/// log would reach the top bar), and for how long after they arrive (docs/knowledge/ux/bottom-hud.md §2).
 const RECENT: usize = 6;
+const RECENT_BAG_OPEN: usize = 4;
+const RECENT_CRAMPED: usize = 2;
 const RECENT_SECS: f32 = 10.0;
 const FONT_SIZE: f32 = 14.0;
 const MARGIN: f32 = 8.0;
-/// Above the hotbar.
-const BOTTOM: f32 = 72.0;
+/// Px between the top of the bottom stack (`hud::BottomHudInset`) and the log's bottom edge.
+const ABOVE_STACK: f32 = 8.0;
+/// Where the log sits before the HUD reports its stack (the closed stack is 160 px).
+const DEFAULT_STACK: f32 = 160.0;
+/// The log is at most this wide, and at most `WIDTH_SHARE` of the window.
 const WIDTH: f32 = 420.0;
+const WIDTH_SHARE: f32 = 0.4;
+/// Px per chat line, for deciding how many fit.
+const LINE_HEIGHT: f32 = FONT_SIZE * 1.3;
 const BACKGROUND: Color = Color::srgba(0.0, 0.0, 0.0, 0.45);
 const SYSTEM_COLOR: Color = Color::srgb(1.0, 0.85, 0.4);
 const PRIVATE_COLOR: Color = Color::srgb(0.75, 0.6, 1.0);
@@ -101,24 +110,31 @@ impl Plugin for ChatPlugin {
             .add_systems(PreUpdate, type_chat.after(InputSystems))
             .add_systems(
                 Update,
-                (receive_chat, draw_chat, draw_input)
+                (receive_chat, place_chat, draw_chat, draw_input)
                     .chain()
                     .after(Phase::Apply),
             );
     }
 }
 
+/// The chat's root node: placed above the bottom stack by `place_chat`.
+#[derive(Component)]
+struct ChatRoot;
+
 fn spawn_chat(mut commands: Commands) {
     commands
-        .spawn(Node {
-            position_type: PositionType::Absolute,
-            left: px(MARGIN),
-            bottom: px(BOTTOM),
-            width: px(WIDTH),
-            flex_direction: FlexDirection::Column,
-            row_gap: px(2.0),
-            ..default()
-        })
+        .spawn((
+            ChatRoot,
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(MARGIN),
+                bottom: px(DEFAULT_STACK + ABOVE_STACK),
+                width: px(WIDTH),
+                flex_direction: FlexDirection::Column,
+                row_gap: px(2.0),
+                ..default()
+            },
+        ))
         .with_children(|chat| {
             chat.spawn((
                 ChatLog,
@@ -557,17 +573,54 @@ fn receive_chat(
             let text = text.clone();
             said.write(crate::chat_bubbles::SaidInWorld { from, text });
         }
-        // The answer to a report from the avatar menu is a toast too.
-        if kind == ChatKind::System && game_protocol::REPORT_ANSWERS.contains(&text.as_str()) {
+        // The answer to a report (avatar menu) or a deed use (deed ring) is a toast too.
+        let answer = game_protocol::REPORT_ANSWERS.contains(&text.as_str())
+            || game_protocol::is_deed_answer(&text);
+        if kind == ChatKind::System && answer {
             notices.write(crate::hud::Notice(text.clone()));
         }
         chat.push(line, kind, now);
     }
 }
 
+/// How many recent lines the closed log shows: 4 while the bag is open, else 6; only 2 when that
+/// many would not fit in `room` px (between the stack and the top bar).
+fn recent_limit(bag_open: bool, room: f32) -> usize {
+    let wanted = if bag_open { RECENT_BAG_OPEN } else { RECENT };
+    if room < wanted as f32 * LINE_HEIGHT {
+        RECENT_CRAMPED
+    } else {
+        wanted
+    }
+}
+
+/// Where the log's bottom edge goes, px from the window bottom.
+fn chat_bottom(inset: Option<&crate::hud::BottomHudInset>) -> f32 {
+    inset.map_or(DEFAULT_STACK, |inset| inset.bottom_px) + ABOVE_STACK
+}
+
+/// Keeps the log just above the bottom stack (it moves with the bag) and no wider than its share
+/// of the window. Writes only on a change.
+fn place_chat(
+    inset: Option<Res<crate::hud::BottomHudInset>>,
+    window: Single<&Window, With<bevy::window::PrimaryWindow>>,
+    mut root: Single<&mut Node, With<ChatRoot>>,
+) {
+    let bottom = px(chat_bottom(inset.as_deref()));
+    if root.bottom != bottom {
+        root.bottom = bottom;
+    }
+    let width = px(WIDTH.min(window.width() * WIDTH_SHARE));
+    if root.width != width {
+        root.width = width;
+    }
+}
+
 fn draw_chat(
     time: Res<Time>,
     chat: Res<Chat>,
+    inset: Option<Res<crate::hud::BottomHudInset>>,
+    window: Single<&Window, With<bevy::window::PrimaryWindow>>,
     mut drawn: Local<Vec<(String, ChatKind)>>,
     log: Single<Entity, With<ChatLog>>,
     mut commands: Commands,
@@ -585,7 +638,10 @@ fn draw_chat(
             .filter(|l| now - l.at < RECENT_SECS)
             .map(|l| (l.text.clone(), l.kind))
             .collect();
-        recent[recent.len().saturating_sub(RECENT)..].to_vec()
+        let inset = inset.as_deref();
+        let room = window.height() - chat_bottom(inset) - crate::hud::FIT_PANEL_TOP;
+        let limit = recent_limit(inset.is_some_and(|inset| inset.bag_open), room);
+        recent[recent.len().saturating_sub(limit)..].to_vec()
     };
     // Rebuilt only when what is visible changes (a new line, one fading out, opening).
     if *drawn != shown {
@@ -767,6 +823,19 @@ mod tests {
             ))
         );
         assert_eq!(client_help("/help give"), None, "the server's");
+    }
+
+    #[test]
+    fn the_closed_log_shows_fewer_lines_with_the_bag_open_or_when_cramped() {
+        let roomy = 1000.0;
+        assert_eq!(recent_limit(false, roomy), RECENT);
+        assert_eq!(recent_limit(true, roomy), RECENT_BAG_OPEN);
+        assert_eq!(
+            recent_limit(true, 3.0 * LINE_HEIGHT),
+            RECENT_CRAMPED,
+            "would reach the top bar"
+        );
+        assert_eq!(chat_bottom(None), DEFAULT_STACK + ABOVE_STACK);
     }
 
     #[test]

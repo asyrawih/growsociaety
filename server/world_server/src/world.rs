@@ -91,6 +91,21 @@ pub enum ToWorld {
         note: Option<String>,
         reply: oneshot::Sender<Option<String>>,
     },
+    /// Someone uses a World Deed for THIS world (`deed.rs`): answered once the owner change is
+    /// stored, or with the refusal text.
+    UseDeed {
+        user: PlayerId,
+        user_name: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// The answer to a `UseDeed` this world sent for one of its members.
+    DeedUseResult {
+        user: PlayerId,
+        deed: game_shared::deeds::Deed,
+        outcome: Result<(), String>,
+    },
+    /// The deed for this world was torn up elsewhere: no deed is out any more.
+    DeedCleared,
 }
 
 /// Chat lines kept per member for reports: the last ones they received.
@@ -122,19 +137,51 @@ impl Clock {
 /// Sends `msg` to the world `name`, loading it first if needed. The registry lock is held across
 /// the send, and a world only unloads under that lock with an empty queue, so a join is never lost.
 pub fn send_to(server: &Server, name: &str, msg: ToWorld) -> bool {
-    let Ok(mut worlds) = server.registry.lock() else {
-        return false;
+    let link = WorldLink {
+        registry: server.registry.clone(),
+        clock: server.clock,
+        store: server.accounts.clone(),
+        me: server.identity.clone(),
     };
-    let loaded = worlds.entry(name.to_owned()).or_insert_with(|| {
-        spawn_world(
-            server.registry.clone(),
-            server.clock,
-            server.accounts.clone(),
-            server.identity.clone(),
-            name.to_owned(),
-        )
-    });
-    loaded.tx.try_send(msg).is_ok()
+    link.send(name, msg)
+}
+
+/// What a world task needs to reach other worlds (a World Deed is used from anywhere).
+#[derive(Clone)]
+pub struct WorldLink {
+    pub registry: Registry,
+    pub clock: Clock,
+    pub store: Arc<Accounts>,
+    pub me: Identity,
+}
+
+impl WorldLink {
+    /// `send_to`, from inside a world task: loads the world first if needed.
+    pub fn send(&self, name: &str, msg: ToWorld) -> bool {
+        let Ok(mut worlds) = self.registry.lock() else {
+            return false;
+        };
+        let loaded = worlds.entry(name.to_owned()).or_insert_with(|| {
+            spawn_world(
+                self.registry.clone(),
+                self.clock,
+                self.store.clone(),
+                self.me.clone(),
+                name.to_owned(),
+            )
+        });
+        loaded.tx.try_send(msg).is_ok()
+    }
+
+    /// Sends only if the world is loaded now (nothing to tell an unloaded one).
+    pub fn send_if_loaded(&self, name: &str, msg: ToWorld) -> bool {
+        let Ok(worlds) = self.registry.lock() else {
+            return false;
+        };
+        worlds
+            .get(name)
+            .is_some_and(|loaded| loaded.tx.try_send(msg).is_ok())
+    }
 }
 
 fn spawn_world(
@@ -183,6 +230,7 @@ fn spawn_world(
             }
         };
         let mut room = Room::new(state);
+        room.state.deed_out = store.world_deed_out(&name).await;
         room.population = population;
         room.fresh = fresh;
         run_world(registry, clock, store, me, name, room, rx).await;
@@ -198,7 +246,8 @@ fn is_private(event: &Event) -> Option<PlayerId> {
         | Event::BackpackUpgraded { player, .. }
         | Event::InventoryMoved { player, .. }
         | Event::Crafted { player, .. }
-        | Event::XpChanged { player, .. } => Some(player),
+        | Event::XpChanged { player, .. }
+        | Event::DeedsChanged { player, .. } => Some(player),
         _ => None,
     }
 }
@@ -265,6 +314,13 @@ pub struct Room {
     pub(crate) opener: Option<PlayerId>,
     /// The last `HEARD_LINES` World/Private lines each member received: (speaker, text, time).
     pub(crate) heard: HashMap<PlayerId, VecDeque<(PlayerId, String, f64)>>,
+    /// World Deed changes for the next save's transaction (`deed.rs`).
+    pub(crate) deed_ops: Vec<crate::store::DeedOp>,
+    /// Members' deed uses to send to their worlds, and uses of this world's deed to carry out.
+    pub(crate) outgoing_uses: Vec<(PlayerId, game_shared::deeds::WorldName)>,
+    pub(crate) incoming_uses: Vec<crate::deed::IncomingUse>,
+    /// Other worlds whose deed was torn up here (they clear their "deed out" if loaded).
+    pub(crate) cleared_elsewhere: Vec<game_shared::deeds::WorldName>,
 }
 
 impl Room {
@@ -288,6 +344,10 @@ impl Room {
             touched: false,
             opener: None,
             heard: HashMap::new(),
+            deed_ops: Vec::new(),
+            outgoing_uses: Vec::new(),
+            incoming_uses: Vec::new(),
+            cleared_elsewhere: Vec::new(),
             acks: Vec::new(),
             leavers: Vec::new(),
             trade_parties: HashMap::new(),
@@ -435,6 +495,26 @@ impl Room {
                 let found = self.report(id, target, reason, note.as_deref(), now);
                 let _ = reply.send(found);
             }
+            ToWorld::UseDeed {
+                user,
+                user_name,
+                reply,
+            } => self.incoming_uses.push(crate::deed::IncomingUse {
+                user,
+                user_name,
+                reply,
+            }),
+            ToWorld::DeedUseResult {
+                user,
+                deed,
+                outcome,
+            } => self.deed_use_result(user, deed, outcome),
+            ToWorld::DeedCleared => {
+                if self.state.deed_out {
+                    self.state.deed_out = false;
+                    self.broadcast(&[Event::DeedOut { out: false }], None);
+                }
+            }
             ToWorld::VoiceMute { id, player, muted } => {
                 if self.members.contains_key(&id) {
                     self.voice_mute(id, player, muted);
@@ -475,7 +555,9 @@ impl Room {
                     return;
                 }
                 self.send_swing(id, action);
+                let before = self.deed_context(id);
                 let result = apply(&mut self.state, id, action, now);
+                let deed_events = self.after_deed_action(id, action, &result, before, now);
                 self.touched |= result.is_ok();
                 let traded = result.as_ref().is_ok_and(|events| {
                     events
@@ -491,6 +573,7 @@ impl Room {
                     self.broadcast(events, Some(id));
                 }
                 self.send(id, Out::Reliable(ServerMsg::Acted { seq, result }));
+                self.broadcast(&deed_events, None);
                 if left {
                     // ponytail: leaving through the door ends the visit; world travel comes with a world menu.
                     self.remove(id);
@@ -688,6 +771,7 @@ async fn save(room: &mut Room, store: &Accounts, name: &str) {
     let extras = SaveExtras {
         backup: room.backup.as_deref(),
         returned: &room.returned,
+        deed_ops: &room.deed_ops,
         created_by: room.opener.filter(|_| room.fresh && world.is_some()),
     };
     match store.save(name, world.as_deref(), &players, extras).await {
@@ -696,6 +780,7 @@ async fn save(room: &mut Room, store: &Accounts, name: &str) {
             room.fresh &= world.is_none();
             room.backup = None;
             room.returned.clear();
+            room.deed_ops.clear();
         }
         Err(error) => eprintln!("world {name}: save failed, the last save stays current: {error}"),
     }
@@ -735,6 +820,13 @@ async fn run_world(
             _ = saves.tick() => room.save_due = !room.is_empty(),
             _ = voice_tokens.tick() => room.refresh_voice_tokens(),
         }
+        let link = WorldLink {
+            registry: registry.clone(),
+            clock,
+            store: store.clone(),
+            me: me.clone(),
+        };
+        crate::deed::process(&mut room, &link, &name, clock.now()).await;
         if room.save_due {
             save(&mut room, &store, &name).await;
         }

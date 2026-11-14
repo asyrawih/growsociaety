@@ -66,6 +66,9 @@ Use nearest-neighbour sampling. 9-slice insets (px, every side unless noted) kee
 | `tooltip.png` | 48×32 | 6 | Item tooltip frame: slim dark-wood border on parchment, no ornate corners. Stays readable stretched to ~280×90 with 16 px dark-brown text (spec: docs/knowledge/ux/item-tooltip.md) |
 | `bubble.png` | 32×24 | 6 | Chat speech bubble (spec: docs/knowledge/ux/chat-bubbles.md). Parchment fill, dark 1 px outline, rounder corners than the tooltip so it reads as speech, soft bottom shade |
 | `bubble_tail.png` | 10×6 | – | Tail pointing down, centred under the bubble. Its top row is fill, so draw it **1 px up** (overlapping the bubble's bottom outline row) and the tail opens into the box with no seam |
+| `pull_tab.png`, `pull_tab_hover.png`, `pull_tab_open.png`, `pull_tab_open_hover.png` | 32×16 | – | Bag pull tab centred on the hotbar's top edge (spec: docs/knowledge/ux/bottom-hud.md). Wood grip in the `tab.png` palette, rounded top corners, flat open bottom (no outline) that sits on the hotbar frame. Closed = UP arrow (opens the bag), `_open` = DOWN arrow (closes it), `_hover` = slightly lighter. The arrow has a dark outline, so it reads at 2× |
+| `deed.png` | 32×32 | – | World Deed item (spec: docs/knowledge/ux/world-key.md): a rolled parchment scroll with a cord and a red wax seal; looks nothing like the claim padlocks or a key. PixelLab object `249904b7-dd31-4d23-bdb6-40fefc15cef0` frame 4 |
+| `deed_small.png` | 16×16 | – | Simplified deed for the trade row and deed ring (PixelLab `e084e360-5195-401e-b5d9-918e94483c17` frame 1). A void deed is greyed in code; there's no extra file |
 | `hotbar.png` | 138×47 | – | Has 5 cells baked in, so don't stretch it. Prefer a row of `slot.png` |
 
 Wardrobe layout (see mockup): left column hair, hat, face, shirt; right column pants, shoes, back, hand; character

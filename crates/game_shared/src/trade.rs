@@ -6,6 +6,7 @@
 //! ```
 //! A decline, a cancel, a player leaving or a failed commit removes the trade.
 
+use crate::deeds::{Deed, MAX_DEEDS, WorldName};
 use crate::inventory::MAX_STACK;
 use crate::items::{ItemId, PERMANENT, UNTRADEABLE, item, slot_of};
 use crate::rules::{Event, PlayerId, Reject, WorldState};
@@ -54,6 +55,8 @@ pub struct Trade {
     pub stage: TradeStage,
     /// Index 0 is `a`'s offer, 1 is `b`'s.
     pub offers: [Offer; 2],
+    /// World Deeds offered, indexed like `offers` (docs/knowledge/ux/world-key.md).
+    pub deeds: [Vec<WorldName>; 2],
     pub locked: [bool; 2],
     pub confirmed: [bool; 2],
 }
@@ -67,6 +70,7 @@ impl Trade {
             b,
             stage: TradeStage::Requested,
             offers: [[None; TRADE_SLOTS]; 2],
+            deeds: [Vec::new(), Vec::new()],
             locked: [false; 2],
             confirmed: [false; 2],
         }
@@ -219,6 +223,39 @@ pub(crate) fn set_offer(
     Ok(updated(trade))
 }
 
+/// Puts a valid deed from the ring in the own offer, or takes it out. Like an item, any change
+/// takes back both locks and confirms.
+pub(crate) fn set_deed(
+    state: &mut WorldState,
+    player: PlayerId,
+    world: WorldName,
+    add: bool,
+) -> Result<Vec<Event>, Reject> {
+    let holds = state
+        .players
+        .get(&player)
+        .ok_or(Reject::Invalid)?
+        .deeds
+        .contains(&Deed { world, void: false });
+    let index = open_trade(state, player).ok_or(Reject::Invalid)?;
+    let trade = state.trades.get_mut(index).ok_or(Reject::Invalid)?;
+    let side = trade.side(player).ok_or(Reject::Invalid)?;
+    if trade.stage != TradeStage::Editing {
+        return Err(Reject::Invalid);
+    }
+    let offered = trade.deeds.get_mut(side).ok_or(Reject::Invalid)?;
+    match (add, offered.contains(&world)) {
+        (true, true) | (false, false) => return Ok(Vec::new()),
+        (true, false) if !holds => return Err(Reject::NoItem),
+        (true, false) if offered.len() >= MAX_DEEDS => return Err(Reject::Invalid),
+        (true, false) => offered.push(world),
+        (false, true) => offered.retain(|&w| w != world),
+    }
+    trade.locked = [false; 2];
+    trade.confirmed = [false; 2];
+    Ok(updated(trade))
+}
+
 pub(crate) fn lock(
     state: &mut WorldState,
     player: PlayerId,
@@ -294,8 +331,20 @@ pub fn end_trades_of(state: &mut WorldState, player: PlayerId) -> Vec<Event> {
 /// simulation is written. A failure moves nothing and reports why the trade ended.
 fn commit(state: &mut WorldState, trade: &Trade) -> Vec<Event> {
     match simulate(state, trade) {
-        Ok(after) => {
+        Ok((after, rings)) => {
             let mut events = vec![Event::TradeCompleted { trade: trade.id }];
+            // Deeds change hands with the items: both rings at once.
+            if trade.deeds.iter().any(|d| !d.is_empty()) {
+                for (who, ring) in [trade.a, trade.b].into_iter().zip(rings) {
+                    if let Some(player) = state.players.get_mut(&who) {
+                        player.deeds = ring.clone();
+                    }
+                    events.push(Event::DeedsChanged {
+                        player: who,
+                        deeds: ring,
+                    });
+                }
+            }
             for (who, inventory) in [trade.a, trade.b].into_iter().zip(after) {
                 let Some(player) = state.players.get_mut(&who) else {
                     continue;
@@ -337,11 +386,13 @@ fn commit(state: &mut WorldState, trade: &Trade) -> Vec<Event> {
     }
 }
 
-/// Both inventories as they would be after the swap, or why the trade cannot complete.
+/// Both inventories and deed rings as they would be after the swap, or why the trade cannot
+/// complete.
+#[allow(clippy::type_complexity)]
 fn simulate(
     state: &WorldState,
     trade: &Trade,
-) -> Result<[crate::inventory::Inventory; 2], TradeEnd> {
+) -> Result<([crate::inventory::Inventory; 2], [Vec<Deed>; 2]), TradeEnd> {
     let both = [trade.a, trade.b].map(|who| state.players.get(&who));
     let [Some(a), Some(b)] = both else {
         return Err(TradeEnd::Left);
@@ -372,7 +423,25 @@ fn simulate(
             }
         }
     }
-    Ok(after)
+    // Deeds: each offered one must still be a valid deed on the giver's ring.
+    let mut rings = [a.deeds.clone(), b.deeds.clone()];
+    for (ring, offered) in rings.iter_mut().zip(&trade.deeds) {
+        for &world in offered {
+            let held = ring.iter().position(|d| *d == Deed { world, void: false });
+            let Some(index) = held else {
+                return Err(TradeEnd::Invalid);
+            };
+            ring.remove(index);
+        }
+    }
+    let [deeds_to_a, deeds_to_b] = &trade.deeds;
+    for (ring, incoming) in rings.iter_mut().zip([deeds_to_b, deeds_to_a]) {
+        ring.extend(incoming.iter().map(|&world| Deed { world, void: false }));
+        if ring.len() > MAX_DEEDS {
+            return Err(TradeEnd::CarryingTooMuch);
+        }
+    }
+    Ok((after, rings))
 }
 
 #[cfg(test)]

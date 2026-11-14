@@ -365,7 +365,7 @@ pub(crate) const BINDINGS: [(&str, &str); 16] = [
     ("Trash one", "X twice"),
     ("Trash stack", "Shift+X twice"),
     ("Search inventory", "Ctrl+F"),
-    ("Inventory / wardrobe", "E or I"),
+    ("Bag (inventory, wardrobe, craft)", "E or I, C for craft"),
     ("Store", "B"),
     ("Voice settings", "N"),
     ("Push-to-talk", "Hold V"),

@@ -4,6 +4,7 @@
 //! recovery is therefore "everything as of the last save", never an item in two places.
 //! Without a database (development) nothing is saved and worlds are generated fresh.
 
+use game_shared::deeds::{Deed, WorldName};
 use game_shared::inventory::Inventory;
 use game_shared::items::{ItemId, SLOT_COUNT};
 use game_shared::rng::Rng;
@@ -72,6 +73,45 @@ pub struct PlayerSave {
     pub notices: Vec<String>,
     /// Who this player has muted with `/ignore`, in every world.
     pub ignores: Vec<PlayerId>,
+    /// The deed ring as stored (`world_deeds` rows held). Read on load only: deeds are written
+    /// through `DeedOp`s, never from a save.
+    pub deeds: Vec<Deed>,
+}
+
+/// One World Deed change, written in a world's save transaction (`deed.rs`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum DeedOp {
+    Make {
+        world: WorldName,
+        holder: PlayerId,
+    },
+    TearUp {
+        world: WorldName,
+        holder: PlayerId,
+    },
+    Discard {
+        world: WorldName,
+        holder: PlayerId,
+    },
+    Move {
+        world: WorldName,
+        from: PlayerId,
+        to: PlayerId,
+    },
+    Void {
+        world: WorldName,
+    },
+}
+
+/// How a deed use went in the database.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DeedUse {
+    /// The row was deleted and the world stored with its new owner.
+    Used,
+    /// The user's deed for that world is void.
+    Void,
+    /// The user holds no deed for that world (any more).
+    NotHeld,
 }
 
 /// One claim returned by `/resetworld` to an owner who was not in that world (`returned_claim`).
@@ -102,6 +142,8 @@ pub struct SaveExtras<'a> {
     pub backup: Option<&'a [u8]>,
     /// New `returned_claim` rows.
     pub returned: &'a [Returned],
+    /// World Deed changes, in order.
+    pub deed_ops: &'a [DeedOp],
     /// The world is stored for the first time: count it towards this account's creation limit.
     pub created_by: Option<PlayerId>,
 }
@@ -118,6 +160,7 @@ impl PlayerSave {
             xp: player.xp,
             notices: Vec::new(),
             ignores: Vec::new(),
+            deeds: player.deeds.clone(),
         }
     }
 
@@ -139,6 +182,7 @@ impl PlayerSave {
             .map(|worn| worn.filter(|&item| player.inventory.count(item) > 0));
         player.level = self.level.max(1);
         player.xp = self.xp;
+        player.deeds = self.deeds.clone();
     }
 }
 
@@ -163,6 +207,100 @@ impl Accounts {
             eprintln!("world {name}: unreadable save, generating a new one");
         }
         state
+    }
+
+    /// Whether a valid deed for `name` exists (the world's "deed out").
+    pub async fn world_deed_out(&self, name: &str) -> bool {
+        let Accounts::Postgres(pool) = self else {
+            return false;
+        };
+        sqlx::query_scalar::<_, i32>("SELECT 1 FROM world_deeds WHERE world = $1 AND NOT void")
+            .bind(name)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| eprintln!("deed out {name}: {e}"))
+            .is_ok_and(|row| row.is_some())
+    }
+
+    /// Uses `user`'s deed for world `name`, in ONE transaction: the deed row is deleted only if
+    /// `user` holds a valid one, and the world is stored as `world` (its new owner already set).
+    /// Without a database the ring is the only truth, so it always succeeds.
+    pub async fn use_deed(
+        &self,
+        name: &str,
+        user: PlayerId,
+        world: &[u8],
+    ) -> Result<DeedUse, String> {
+        let Accounts::Postgres(pool) = self else {
+            return Ok(DeedUse::Used);
+        };
+        let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+        let used: Option<(i64,)> = sqlx::query_as(
+            "DELETE FROM world_deeds WHERE id = (
+                SELECT id FROM world_deeds WHERE world = $1 AND holder_id = $2 AND NOT void LIMIT 1
+             ) RETURNING id",
+        )
+        .bind(name)
+        .bind(i64::from(user.0))
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        if used.is_none() {
+            tx.rollback().await.map_err(|e| e.to_string())?;
+            let void: Option<(i64,)> = sqlx::query_as(
+                "SELECT id FROM world_deeds WHERE world = $1 AND holder_id = $2 AND void LIMIT 1",
+            )
+            .bind(name)
+            .bind(i64::from(user.0))
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            return Ok(if void.is_some() {
+                DeedUse::Void
+            } else {
+                DeedUse::NotHeld
+            });
+        }
+        sqlx::query(
+            "INSERT INTO world (name, data, saved_at) VALUES ($1, $2, now())
+             ON CONFLICT (name) DO UPDATE SET data = $2, saved_at = now()",
+        )
+        .bind(name)
+        .bind(world)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        tx.commit().await.map_err(|e| e.to_string())?;
+        Ok(DeedUse::Used)
+    }
+
+    /// A private line for `player` at their next login.
+    pub async fn add_notice(&self, player: PlayerId, notice: &str) -> Result<(), String> {
+        let Accounts::Postgres(pool) = self else {
+            return Ok(());
+        };
+        if !persistent(player) {
+            return Ok(());
+        }
+        sqlx::query("INSERT INTO player_notices (player_id, notice) VALUES ($1, $2)")
+            .bind(i64::from(player.0))
+            .bind(notice)
+            .execute(pool)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// The stored notices for `player`, deleted as they are read.
+    async fn take_notices(&self, pool: &sqlx::PgPool, player: PlayerId) -> Vec<String> {
+        sqlx::query_scalar::<_, String>(
+            "DELETE FROM player_notices WHERE player_id = $1 RETURNING notice",
+        )
+        .bind(i64::from(player.0))
+        .fetch_all(pool)
+        .await
+        .map_err(|e| eprintln!("notices {}: {e}", player.0))
+        .unwrap_or_default()
     }
 
     /// Stores a report. `chat` is the JSON array of context lines.
@@ -267,6 +405,22 @@ impl Accounts {
             .into_iter()
             .filter_map(|(n,)| u32::try_from(n).ok().map(PlayerId))
             .collect();
+        let deeds: Vec<(String, bool)> =
+            sqlx::query_as("SELECT world, void FROM world_deeds WHERE holder_id = $1 ORDER BY id")
+                .bind(i64::from(id.0))
+                .fetch_all(pool)
+                .await
+                .map_err(|e| eprintln!("load deeds {}: {e}", id.0))
+                .unwrap_or_default();
+        let deeds = deeds
+            .into_iter()
+            .filter_map(|(world, void)| {
+                Some(Deed {
+                    world: WorldName::new(&world)?,
+                    void,
+                })
+            })
+            .collect();
         let (gems, capacity, worn, level, xp) = state;
         let item = |n: i32| u16::try_from(n).ok().filter(|&n| n > 0).map(ItemId);
         let mut equipped = [None; SLOT_COUNT];
@@ -286,8 +440,11 @@ impl Accounts {
             xp: u32::try_from(xp).unwrap_or(0),
             notices: Vec::new(),
             ignores,
+            deeds,
         };
-        Some(self.pay_returned(pool, save).await)
+        let mut save = self.pay_returned(pool, save).await;
+        save.notices.extend(self.take_notices(pool, id).await);
+        Some(save)
     }
 
     /// Pays the claims a reset returned to this player, in one transaction: the rows are deleted
@@ -365,6 +522,9 @@ impl Accounts {
             .await
             .map_err(|e| e.to_string())?;
         }
+        for op in extras.deed_ops {
+            write_deed_op(&mut tx, op).await?;
+        }
         for row in extras.returned.iter().filter(|r| persistent(r.player)) {
             sqlx::query(
                 "INSERT INTO returned_claim (player_id, item_id, price, notice) VALUES ($1, $2, $3, $4)",
@@ -403,6 +563,52 @@ impl Accounts {
         }
         tx.commit().await.map_err(|e| e.to_string())
     }
+}
+
+/// One World Deed change inside a save's transaction. Each statement names the holder it expects,
+/// so a stale ring can never move, use or delete someone else's deed.
+async fn write_deed_op(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    op: &DeedOp,
+) -> Result<(), String> {
+    let id = |p: &PlayerId| i64::from(p.0);
+    let query = match op {
+        DeedOp::Make { world, holder } if persistent(*holder) => sqlx::query(
+            "INSERT INTO world_deeds (world, holder_id, made_by) VALUES ($1, $2, $2)
+             ON CONFLICT (world) WHERE NOT void DO NOTHING",
+        )
+        .bind(world.as_str())
+        .bind(id(holder)),
+        DeedOp::TearUp { world, holder } => sqlx::query(
+            "DELETE FROM world_deeds WHERE world = $1 AND holder_id = $2 AND NOT void",
+        )
+        .bind(world.as_str())
+        .bind(id(holder)),
+        DeedOp::Discard { world, holder } => sqlx::query(
+            "DELETE FROM world_deeds WHERE id = (
+                SELECT id FROM world_deeds WHERE world = $1 AND holder_id = $2 AND void LIMIT 1
+             )",
+        )
+        .bind(world.as_str())
+        .bind(id(holder)),
+        DeedOp::Move { world, from, to } if persistent(*to) => sqlx::query(
+            "UPDATE world_deeds SET holder_id = $3 WHERE world = $1 AND holder_id = $2 AND NOT void",
+        )
+        .bind(world.as_str())
+        .bind(id(from))
+        .bind(id(to)),
+        DeedOp::Void { world } => {
+            sqlx::query("UPDATE world_deeds SET void = true WHERE world = $1 AND NOT void")
+                .bind(world.as_str())
+        }
+        // Development players have no rows.
+        DeedOp::Make { .. } | DeedOp::Move { .. } => return Ok(()),
+    };
+    query
+        .execute(&mut **tx)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// One player's gems, equipment, level and inventory rows, inside a save's transaction.
@@ -563,6 +769,7 @@ mod tests {
             xp: 0,
             notices: vec![],
             ignores: vec![],
+            deeds: vec![],
         };
         let before = save.items.clone();
         credit(&mut save, &[row(SMALL_CLAIM)]);
@@ -627,6 +834,158 @@ mod tests {
         };
         db.store_report(&report).await.expect("stored");
         assert_eq!(db.reports_last_hour(account.id).await, 1);
+    }
+
+    /// Against a real PostgreSQL: World Deeds are money. A trade with deeds both ways whose save
+    /// fails moves nothing (no dupe, no loss) and the retry swaps them; right after a trade, before
+    /// its save, nobody can use the deed; a void deed is refused; one valid deed per world.
+    #[tokio::test]
+    #[ignore]
+    async fn postgres_deeds_never_dupe() {
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
+        let db = Accounts::open(Some(url))
+            .await
+            .expect("connects and migrates");
+        let pid = std::process::id();
+        let a = db
+            .register(&format!("da{pid}"), "password1")
+            .await
+            .expect("a")
+            .id;
+        let b = db
+            .register(&format!("db{pid}"), "password1")
+            .await
+            .expect("b")
+            .id;
+        let (wa, wb) = (
+            WorldName::new(&format!("DA{pid}")).unwrap(),
+            WorldName::new(&format!("DB{pid}")).unwrap(),
+        );
+        let mut state = WorldState::new(generate("DEEDS"), 1);
+        state.join(a);
+        state.join(b);
+        let save_of = |id| PlayerSave::of(&state.players[&id]);
+        let save = |players: Vec<PlayerSave>, ops: Vec<DeedOp>| {
+            let db = &db;
+            async move {
+                let extras = SaveExtras {
+                    deed_ops: &ops,
+                    ..SaveExtras::default()
+                };
+                db.save("DEEDS", None, &players, extras).await
+            }
+        };
+        let rings = |id| {
+            let db = &db;
+            async move {
+                let mut w: Vec<String> = db
+                    .load_player(id)
+                    .await
+                    .expect("loads")
+                    .deeds
+                    .iter()
+                    .map(|d| d.world.as_str().to_owned())
+                    .collect();
+                w.sort();
+                w
+            }
+        };
+        // A makes a deed for world DA, B one for DB; a second deed for DA is refused.
+        save(
+            vec![save_of(a), save_of(b)],
+            vec![
+                DeedOp::Make {
+                    world: wa,
+                    holder: a,
+                },
+                DeedOp::Make {
+                    world: wb,
+                    holder: b,
+                },
+                DeedOp::Make {
+                    world: wa,
+                    holder: b,
+                },
+            ],
+        )
+        .await
+        .expect("made");
+        assert_eq!(rings(a).await, [wa.as_str()]);
+        assert_eq!(
+            rings(b).await,
+            [wb.as_str()],
+            "the second deed for DA was not made"
+        );
+
+        // The trade swaps them, but the save fails (an inventory the database refuses).
+        let moves = vec![
+            DeedOp::Move {
+                world: wa,
+                from: a,
+                to: b,
+            },
+            DeedOp::Move {
+                world: wb,
+                from: b,
+                to: a,
+            },
+        ];
+        let mut bad = save_of(a);
+        bad.items.push((ItemId(2), 201));
+        assert!(save(vec![bad, save_of(b)], moves.clone()).await.is_err());
+        assert_eq!(rings(a).await, [wa.as_str()], "rolled back: nothing moved");
+        assert_eq!(rings(b).await, [wb.as_str()]);
+        // Before the trade is saved, the new holder cannot use the deed, and that changes nothing.
+        let blob = encode_world(&state);
+        assert_eq!(
+            db.use_deed(wa.as_str(), b, &blob).await,
+            Ok(DeedUse::NotHeld)
+        );
+        assert_eq!(
+            rings(a).await,
+            [wa.as_str()],
+            "a refused use leaves everything intact"
+        );
+        // The retry swaps both; the deeds are on the right rings when the players load again.
+        save(vec![save_of(a), save_of(b)], moves)
+            .await
+            .expect("retry");
+        assert_eq!(rings(a).await, [wb.as_str()]);
+        assert_eq!(rings(b).await, [wa.as_str()]);
+        // The old holder cannot use what they gave away; the new holder uses it once.
+        assert_eq!(
+            db.use_deed(wa.as_str(), a, &blob).await,
+            Ok(DeedUse::NotHeld)
+        );
+        assert_eq!(db.use_deed(wa.as_str(), b, &blob).await, Ok(DeedUse::Used));
+        assert_eq!(
+            db.use_deed(wa.as_str(), b, &blob).await,
+            Ok(DeedUse::NotHeld),
+            "used once"
+        );
+        assert!(rings(b).await.is_empty());
+        assert!(
+            !db.world_deed_out(wa.as_str()).await,
+            "a new deed may be made for DA now"
+        );
+
+        // A void deed is refused and stays until discarded.
+        save(vec![], vec![DeedOp::Void { world: wb }])
+            .await
+            .expect("voided");
+        assert_eq!(db.use_deed(wb.as_str(), a, &blob).await, Ok(DeedUse::Void));
+        let loaded = db.load_player(a).await.expect("loads");
+        assert!(loaded.deeds.iter().all(|d| d.void));
+        save(
+            vec![],
+            vec![DeedOp::Discard {
+                world: wb,
+                holder: a,
+            }],
+        )
+        .await
+        .expect("discarded");
+        assert!(rings(a).await.is_empty());
     }
 
     /// Against a real PostgreSQL: a returned claim is paid once. The first load deletes the row

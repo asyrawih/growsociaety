@@ -4,14 +4,16 @@
 
 use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
+use game_shared::deeds::WorldName;
 use game_shared::items::{ItemId, PERMANENT, UNTRADEABLE, item};
 use game_shared::rules::{Action, Event, PlayerId};
 use game_shared::trade::{TRADE_REVIEW_DELAY, Trade, TradeStage};
 
 use crate::audio::Sfx;
+use crate::deeds_ui::{DEED_ICON_SIZE, DEED_SMALL_IMAGE, deed_tip};
 use crate::hud::{
-    FitWindow, HUD_MARGIN, ItemTip, KIT_SCALE, SCROLLBAR_SPACE, SLOT_GAP, ink, label,
-    panel_max_height, scroll_grid, sliced, tab_node,
+    FitWindow, HUD_MARGIN, HudText, INK_COLOR, ItemTip, KIT_SCALE, SCROLLBAR_SPACE, SLOT_GAP,
+    TextTip, icon_node, ink, label, panel_max_height, scroll_grid, sliced, tab_node,
 };
 use crate::net::Net;
 use crate::screenshot;
@@ -27,6 +29,16 @@ const ICON_SIZE: f32 = 48.0;
 const PANEL_TOP: f32 = 72.0;
 const PANEL_PADDING: f32 = 32.0;
 const PICKER_COLUMNS: f32 = 6.0;
+/// A deed the other side offers reads large, not as an icon (docs/knowledge/ux/world-key.md).
+const DEED_LINE_FONT_SIZE: f32 = 24.0;
+const DEED_WARNING: &str = "Check the world name. Deeds can't be undone.";
+const DEEDS_ROW_TITLE: &str = "Deeds";
+
+/// `World Deed: MYFARM`.
+fn deed_line(world: WorldName) -> String {
+    format!("World Deed: {world}")
+}
+
 const PANEL_WIDTH: f32 = PICKER_COLUMNS * SLOT_SIZE
     + (PICKER_COLUMNS - 1.0) * SLOT_GAP
     + SCROLLBAR_SPACE
@@ -56,6 +68,8 @@ enum TradeButton {
     Lock(bool),
     Confirm,
     Cancel,
+    /// Put this deed in the own offer (`true`) or take it out.
+    Deed(WorldName, bool),
 }
 
 pub struct TradeUiPlugin;
@@ -112,6 +126,7 @@ fn click_trade(
         TradeButton::Lock(locked) => Some(Action::TradeLock { locked }),
         TradeButton::Confirm => Some(Action::TradeConfirm),
         TradeButton::Cancel => Some(Action::TradeCancel),
+        TradeButton::Deed(world, add) => Some(Action::TradeDeed { world, add }),
     };
     if let Some(action) = action {
         actions.write(ActionMsg(action));
@@ -139,7 +154,9 @@ fn refresh_trade(
         | Event::TradeUpdated { .. }
         | Event::TradeCompleted { .. }
         | Event::TradeCancelled { .. } => true,
-        Event::InventoryChanged { player, .. } => *player == me,
+        Event::InventoryChanged { player, .. } | Event::DeedsChanged { player, .. } => {
+            *player == me
+        }
         _ => false,
     });
     let trade = my_trade(&game);
@@ -245,6 +262,16 @@ fn refresh_trade(
                 });
             }
         });
+        for &world in &trade.deeds[side] {
+            panel
+                .spawn((row(), Hovered::default()))
+                .with_children(|line| {
+                    line.spawn((ink(deed_line(world)), Hovered::default()));
+                    if editing {
+                        small_button(line, &assets, "x", TradeButton::Deed(world, false));
+                    }
+                });
+        }
         panel.spawn(ink(format!(
             "You get ({})",
             state(trade.locked[1 - side], trade.confirmed[1 - side])
@@ -254,6 +281,19 @@ fn refresh_trade(
                 slot_cell(slots, &assets, *stack, None);
             }
         });
+        let their_deeds = &trade.deeds[1 - side];
+        for &world in their_deeds {
+            panel.spawn((
+                Text::new(deed_line(world)),
+                TextFont::from_font_size(DEED_LINE_FONT_SIZE),
+                HudText,
+                TextColor(INK_COLOR),
+                Hovered::default(),
+            ));
+        }
+        if !their_deeds.is_empty() {
+            panel.spawn((ink(DEED_WARNING), Hovered::default()));
+        }
         if editing {
             panel.spawn(ink("Your items"));
             let offered = |id: ItemId| mine.iter().flatten().any(|&(o, _)| o == id);
@@ -279,6 +319,45 @@ fn refresh_trade(
                     );
                 }
             });
+            // The Deeds row under the grid: valid deeds on the ring not offered yet.
+            let ring: Vec<_> = game.me().map_or(Vec::new(), |me| {
+                me.deeds
+                    .iter()
+                    .copied()
+                    .filter(|d| !d.void && !trade.deeds[side].contains(&d.world))
+                    .collect()
+            });
+            if !ring.is_empty() {
+                panel.spawn((ink(DEEDS_ROW_TITLE), Hovered::default()));
+                let wrap = Node {
+                    flex_wrap: FlexWrap::Wrap,
+                    ..row()
+                };
+                panel
+                    .spawn((wrap, Hovered::default()))
+                    .with_children(|deeds| {
+                        for deed in ring {
+                            let (mut node, image) = tab_node(&assets, true);
+                            node.column_gap = px(SLOT_GAP);
+                            deeds
+                                .spawn((
+                                    node,
+                                    image,
+                                    TradeButton::Deed(deed.world, true),
+                                    TextTip(deed_tip(deed)),
+                                    Hovered::default(),
+                                ))
+                                .with_children(|b| {
+                                    b.spawn((
+                                        ImageNode::new(assets.load(DEED_SMALL_IMAGE)),
+                                        icon_node(DEED_ICON_SIZE),
+                                        Hovered::default(),
+                                    ));
+                                    b.spawn((label(deed.world.as_str()), Hovered::default()));
+                                });
+                        }
+                    });
+            }
         } else {
             panel.spawn(ink("Check both offers, then confirm"));
         }
@@ -428,5 +507,17 @@ fn screenshot_trade(mut game: ResMut<Game>, net: Option<Res<Net>>) {
         if let Err(reject) = apply(state, who, action, 0.0) {
             warn!("screenshot trade: {action:?} rejected: {reject:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_receiver_reads_the_world_name_and_the_warning() {
+        let world = WorldName::new("MYFARM").unwrap();
+        assert_eq!(deed_line(world), "World Deed: MYFARM");
+        assert_eq!(DEED_WARNING, "Check the world name. Deeds can't be undone.");
     }
 }

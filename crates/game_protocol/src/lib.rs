@@ -11,7 +11,7 @@ use game_shared::world::World;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change; a mismatch is refused at `Hello`.
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 13;
 pub const DEFAULT_PORT: u16 = 7777;
 /// The name the dev certificate is issued for and the client connects to.
 pub const SERVER_NAME: &str = "localhost";
@@ -123,6 +123,30 @@ pub const REPORT_LIMIT: &str = "You can send 5 reports an hour. Try again later"
 pub const REPORT_FAILED: &str = "The report could not be sent. Try again";
 pub const REPORT_NOBODY: &str = "No such player in this world";
 pub const REPORT_ANSWERS: [&str; 4] = [REPORT_SENT, REPORT_LIMIT, REPORT_FAILED, REPORT_NOBODY];
+
+/// World Deed texts (docs/knowledge/ux/world-key.md), exact. `UseDeed` is answered by a System
+/// line (the client toasts it); the refusals are toasts for `Reject::DeedOut` / `DeedVoid`.
+pub const DEED_USED_PREFIX: &str = "You now own ";
+pub const DEED_FAILED: &str = "The deed could not be used. Try again";
+pub const DEED_VOID_PREFIX: &str = "Void: ";
+pub const DEED_OUT_TEXT: &str = "A deed for this world exists";
+
+/// "You now own MYFARM".
+pub fn deed_used_text(world: &str) -> String {
+    format!("{DEED_USED_PREFIX}{world}")
+}
+
+/// "Void: MYFARM's World Claim is gone".
+pub fn deed_void_text(world: &str) -> String {
+    format!("{DEED_VOID_PREFIX}{world}'s World Claim is gone")
+}
+
+/// Whether a System line is a `UseDeed` answer (to toast it).
+pub fn is_deed_answer(line: &str) -> bool {
+    line.starts_with(DEED_USED_PREFIX)
+        || line == DEED_FAILED
+        || (line.starts_with(DEED_VOID_PREFIX) && line.ends_with("'s World Claim is gone"))
+}
 
 /// Bytes of a report's note.
 pub const MAX_REPORT_NOTE: usize = 120;
@@ -312,6 +336,8 @@ pub struct WorldSnapshot {
     /// Everyone's role (for the avatar menu: staff cannot be muted or kicked); set by the server
     /// after `of`. Missing = `Role::Player`.
     pub roles: Vec<(PlayerId, game_shared::commands::Role)>,
+    /// A World Deed for this world exists (the claim panel's "Deed out").
+    pub deed_out: bool,
 }
 
 impl WorldSnapshot {
@@ -333,6 +359,7 @@ impl WorldSnapshot {
             names: names.iter().map(|(&id, name)| (id, name.clone())).collect(),
             countries: Vec::new(),
             roles: Vec::new(),
+            deed_out: state.deed_out,
         })
     }
 
@@ -342,6 +369,7 @@ impl WorldSnapshot {
         (world.claim_of, world.world_claim) = world.claim_index_from_extras();
         let mut state = WorldState::new(world, 0);
         state.damage = self.damage;
+        state.deed_out = self.deed_out;
         for (id, body, equipped, level) in self.others {
             state.join(id);
             if let Some(player) = state.players.get_mut(&id) {

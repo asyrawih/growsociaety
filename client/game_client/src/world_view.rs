@@ -440,6 +440,8 @@ fn on_game_events(
             | Event::ClaimRemoved { .. }
             | Event::ClaimUpdated { .. }
             | Event::LeftWorld { .. }
+            | Event::DeedsChanged { .. }
+            | Event::DeedOut { .. }
             | Event::Equipped { .. }
             | Event::TradeRequested { .. }
             | Event::TradeUpdated { .. }

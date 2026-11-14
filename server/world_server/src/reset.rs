@@ -115,6 +115,9 @@ impl Room {
             },
             Reset::Confirm => match self.reset_pending.take() {
                 Some(pending) if pending.by == id && now <= pending.until => {
+                    // Its World Deed (if any) is void: the world claim goes with the reset.
+                    let voided = self.void_deed(id, now);
+                    self.broadcast(&voided, None);
                     Ok(self.reset_world(pending.seed))
                 }
                 // Someone else's pending reset stays; a late one is dropped.

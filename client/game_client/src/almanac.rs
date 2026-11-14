@@ -547,8 +547,17 @@ fn basics() -> Vec<(&'static str, String, Option<(&'static str, Page)>)> {
             ),
             Some(("All recipes", Page::Crafting)),
         ),
+        (
+            WORLD_DEEDS_TITLE,
+            WORLD_DEEDS_TEXT.to_string(),
+            Some(("World Claim", Page::Item(game_shared::items::WORLD_CLAIM))),
+        ),
     ]
 }
+
+/// Basics page "World Deeds" (docs/knowledge/ux/world-key.md): make, trade, use, tear up, void.
+const WORLD_DEEDS_TITLE: &str = "World Deeds";
+const WORLD_DEEDS_TEXT: &str = "A World Deed hands over your world. Use the wrench on your World Claim and press Make World Deed; you stay the owner until someone uses it, and there is one deed per world at a time. Deeds sit on their own Deeds chip in your bag. Trade one like an item, but check the world name: deeds can't be undone. Use a deed to become the owner of its world (from anywhere); its friends list is cleared. Tear up your deed to cancel it. If the world is reset or its World Claim breaks, its deed turns void and can only be discarded.";
 
 fn title(text: &str) -> Line {
     vec![Piece::Text(text.to_string())]

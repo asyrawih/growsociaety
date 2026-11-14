@@ -1,5 +1,5 @@
-//! The craft panel (docs/knowledge/18, "Client"). Opens from a wrench click on a Workbench in
-//! reach (`interact.rs`) or the inventory's Craft tab. Every recipe is listed, the ones the player
+//! The craft panel (docs/knowledge/18, "Client"): the bag's Craft tab (docs/knowledge/ux/bottom-hud.md).
+//! Opens from a wrench click on a Workbench in reach (`interact.rs`), C, or the bag's tab row. Every recipe is listed, the ones the player
 //! can craft right now first, the rest greyed. It decides nothing: the Craft button sends
 //! `Action::Craft` and the rules answer; the greyed button and the red counts are only a hint.
 //! The panel's entities are spawned once; a change (inventory, selection, Workbench in reach)
@@ -16,10 +16,10 @@ use game_shared::world_to_tile;
 
 use crate::audio::Sfx;
 use crate::hud::{
-    CRAFT_PANEL_KEY, FIT_PANEL_TOP, FitWindow, HUD_MARGIN, ICON_SIZE, INK_COLOR, ItemTip,
-    KIT_SCALE, Notice, OpenPanel, PANEL_PADDING, SCROLLBAR_SPACE, SEP, SLOT_GAP, SLOT_IMAGE,
-    SLOT_SELECTED_IMAGE, SLOT_SIZE, bag_tabs, count_label, grid_width, icon_node, ink, key_name,
-    label, scroll_grid, sliced, slot_cell, spawn_centre_panel, spawn_mods,
+    BagBody, CRAFT_PANEL_KEY, HUD_MARGIN, ICON_SIZE, INK_COLOR, ItemTip, KIT_SCALE, Notice,
+    OpenPanel, SCROLLBAR_SPACE, SEP, SLOT_GAP, SLOT_IMAGE, SLOT_SELECTED_IMAGE, SLOT_SIZE,
+    count_label, grid_width, icon_node, ink, key_name, label, scroll_grid, sliced, slot_cell,
+    spawn_mods,
 };
 use crate::settings::Settings;
 use crate::state::{ActionMsg, Game, GameEvent, Phase};
@@ -42,7 +42,8 @@ const LIST_WIDTH: f32 = grid_width(LIST_COLUMNS as f32) + SCROLLBAR_SPACE;
 const MAX_INPUTS: usize = 4;
 const DETAIL_WIDTH: f32 = (MAX_INPUTS as f32 + 1.0) * (SLOT_SIZE + SLOT_GAP) + ARROW_SIZE;
 const SPLIT: f32 = 8.0 * KIT_SCALE;
-const PANEL_WIDTH: f32 = 2.0 * PANEL_PADDING + LIST_WIDTH + SPLIT + DETAIL_WIDTH;
+/// The tab's content width; the bag adds its padding (`hud::bag_width`).
+pub(crate) const BODY_WIDTH: f32 = LIST_WIDTH + SPLIT + DETAIL_WIDTH;
 /// An input count the player is short of, on parchment.
 const SHORT_COLOR: Color = Color::srgb(0.7, 0.1, 0.08);
 /// Multiplied into the icon of a recipe the player cannot craft right now.
@@ -213,128 +214,114 @@ pub(crate) fn step_index(index: usize, len: usize, (dx, dy): (i32, i32), columns
 fn spawn_panel(mut commands: Commands, assets: Res<AssetServer>) {
     let slot = || (slot_cell(&assets, SLOT_IMAGE), ItemTip(None));
     let icon = || (ImageNode::default(), icon_node(ICON_SIZE));
-    let panel = spawn_centre_panel(
-        &mut commands,
-        &assets,
-        OpenPanel::Craft,
-        PANEL_WIDTH,
-        |panel| {
-            bag_tabs(panel, &assets, OpenPanel::Craft);
-            let body = Node {
-                column_gap: px(SPLIT),
-                flex_grow: 1.0,
-                min_height: px(0),
-                ..default()
-            };
-            let list = Node {
-                width: px(LIST_WIDTH),
-                flex_shrink: 0.0,
-                flex_direction: FlexDirection::Column,
-                min_height: px(0),
-                ..default()
-            };
-            let detail = Node {
-                width: px(DETAIL_WIDTH),
-                flex_shrink: 0.0,
-                flex_direction: FlexDirection::Column,
-                row_gap: px(HUD_MARGIN),
-                ..default()
-            };
-            panel
-                .spawn((body, Hovered::default()))
-                .with_children(|body| {
-                    body.spawn((list, Hovered::default()))
-                        .with_children(|list| {
-                            let grid = scroll_grid(list, ());
-                            list.commands().entity(grid).with_children(|grid| {
-                                for n in 0..RECIPES.len() {
-                                    grid.spawn((slot(), ListCell(n), CraftButton::Recipe(0)))
-                                        .with_children(|cell| {
-                                            cell.spawn((icon(), ListIcon(n)));
-                                            cell.spawn((count_label(), ListCount(n)));
-                                        });
-                                }
-                            });
-                        });
-                    body.spawn((detail, Hovered::default()))
-                        .with_children(|detail| {
-                            detail.spawn((ink(""), DetailName));
-                            let mods = Node {
-                                column_gap: px(HUD_MARGIN),
-                                flex_wrap: FlexWrap::Wrap,
-                                ..default()
-                            };
-                            detail.spawn((mods, DetailMods));
-                            detail.spawn((
-                                label(NO_STATION_TEXT),
-                                TextColor(SHORT_COLOR),
-                                StationLine,
-                            ));
-                            let recipe_row = Node {
-                                column_gap: px(SLOT_GAP),
-                                align_items: AlignItems::FlexStart,
-                                ..default()
-                            };
-                            detail.spawn(recipe_row).with_children(|row| {
-                                for i in 0..MAX_INPUTS {
-                                    let column = Node {
-                                        width: px(SLOT_SIZE),
-                                        flex_direction: FlexDirection::Column,
-                                        align_items: AlignItems::Center,
-                                        ..default()
-                                    };
-                                    row.spawn((column, InputColumn(i))).with_children(|column| {
-                                        column.spawn(slot()).with_children(|cell| {
-                                            cell.spawn((icon(), InputIcon(i)));
-                                        });
-                                        column.spawn((ink(""), InputCount(i)));
-                                    });
-                                }
-                                let arrow = Node {
-                                    height: px(SLOT_SIZE),
-                                    align_items: AlignItems::Center,
-                                    ..default()
-                                };
-                                row.spawn(arrow).with_child((
-                                    ImageNode::new(assets.load(ARROW_IMAGE)),
-                                    icon_node(ARROW_SIZE),
-                                ));
-                                row.spawn((slot(), OutputSlot, Pulse::default()))
-                                    .with_children(|cell| {
-                                        cell.spawn((icon(), OutputIcon));
-                                        cell.spawn((count_label(), OutputCount));
-                                    });
-                            });
-                            let node = Node {
-                                min_width: px(BUTTON_SIZE.x),
-                                height: px(BUTTON_SIZE.y),
-                                padding: UiRect::horizontal(px(2.0 * BUTTON_INSET)),
-                                align_self: AlignSelf::FlexStart,
-                                justify_content: JustifyContent::Center,
+    // The tab's body, spawned loose: `hud::adopt_bag_bodies` puts it into the bag.
+    let body = Node {
+        column_gap: px(SPLIT),
+        flex_grow: 1.0,
+        min_height: px(0),
+        display: Display::None,
+        ..default()
+    };
+    let list = Node {
+        width: px(LIST_WIDTH),
+        flex_shrink: 0.0,
+        flex_direction: FlexDirection::Column,
+        min_height: px(0),
+        ..default()
+    };
+    let detail = Node {
+        width: px(DETAIL_WIDTH),
+        flex_shrink: 0.0,
+        flex_direction: FlexDirection::Column,
+        row_gap: px(HUD_MARGIN),
+        ..default()
+    };
+    commands
+        .spawn((body, BagBody(OpenPanel::Craft), Hovered::default()))
+        .with_children(|body| {
+            body.spawn((list, Hovered::default()))
+                .with_children(|list| {
+                    let grid = scroll_grid(list, ());
+                    list.commands().entity(grid).with_children(|grid| {
+                        for n in 0..RECIPES.len() {
+                            grid.spawn((slot(), ListCell(n), CraftButton::Recipe(0)))
+                                .with_children(|cell| {
+                                    cell.spawn((icon(), ListIcon(n)));
+                                    cell.spawn((count_label(), ListCount(n)));
+                                });
+                        }
+                    });
+                });
+            body.spawn((detail, Hovered::default()))
+                .with_children(|detail| {
+                    detail.spawn((ink(""), DetailName));
+                    let mods = Node {
+                        column_gap: px(HUD_MARGIN),
+                        flex_wrap: FlexWrap::Wrap,
+                        ..default()
+                    };
+                    detail.spawn((mods, DetailMods));
+                    detail.spawn((label(NO_STATION_TEXT), TextColor(SHORT_COLOR), StationLine));
+                    let recipe_row = Node {
+                        column_gap: px(SLOT_GAP),
+                        align_items: AlignItems::FlexStart,
+                        ..default()
+                    };
+                    detail.spawn(recipe_row).with_children(|row| {
+                        for i in 0..MAX_INPUTS {
+                            let column = Node {
+                                width: px(SLOT_SIZE),
+                                flex_direction: FlexDirection::Column,
                                 align_items: AlignItems::Center,
                                 ..default()
                             };
-                            detail
-                                .spawn((
-                                    node,
-                                    sliced(&assets, BUTTON_DISABLED_IMAGE, BUTTON_INSET),
-                                    CraftButton::Craft,
-                                    CraftEnabled(false),
-                                    Hovered::default(),
-                                ))
-                                .with_child((
-                                    label(craft_label()),
-                                    TextColor(Color::WHITE),
-                                    TextShadow::default(),
-                                    ButtonLabel,
-                                ));
-                        });
+                            row.spawn((column, InputColumn(i))).with_children(|column| {
+                                column.spawn(slot()).with_children(|cell| {
+                                    cell.spawn((icon(), InputIcon(i)));
+                                });
+                                column.spawn((ink(""), InputCount(i)));
+                            });
+                        }
+                        let arrow = Node {
+                            height: px(SLOT_SIZE),
+                            align_items: AlignItems::Center,
+                            ..default()
+                        };
+                        row.spawn(arrow).with_child((
+                            ImageNode::new(assets.load(ARROW_IMAGE)),
+                            icon_node(ARROW_SIZE),
+                        ));
+                        row.spawn((slot(), OutputSlot, Pulse::default()))
+                            .with_children(|cell| {
+                                cell.spawn((icon(), OutputIcon));
+                                cell.spawn((count_label(), OutputCount));
+                            });
+                    });
+                    let node = Node {
+                        min_width: px(BUTTON_SIZE.x),
+                        height: px(BUTTON_SIZE.y),
+                        padding: UiRect::horizontal(px(2.0 * BUTTON_INSET)),
+                        align_self: AlignSelf::FlexStart,
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    };
+                    detail
+                        .spawn((
+                            node,
+                            sliced(&assets, BUTTON_DISABLED_IMAGE, BUTTON_INSET),
+                            CraftButton::Craft,
+                            CraftEnabled(false),
+                            Hovered::default(),
+                        ))
+                        .with_child((
+                            label(craft_label()),
+                            TextColor(Color::WHITE),
+                            TextShadow::default(),
+                            ButtonLabel,
+                        ));
                 });
-        },
-    );
-    commands
-        .entity(panel)
-        .insert(FitWindow { top: FIT_PANEL_TOP });
+        });
 }
 
 /// "Workbench nearby · press C to craft".

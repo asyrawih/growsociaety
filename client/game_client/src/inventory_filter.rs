@@ -1,11 +1,13 @@
 //! The Inventory tab's category chips, live search and sort (docs/knowledge/ux/inventory-categories.md),
 //! plus the selection strip's Drop / Trash buttons. A view only: the server's slot order, the
-//! hotbar and trading never change. `hud::refresh_slots` asks `InventoryView::cells` what to show.
+//! hotbar and trading never change. `hud::refresh_slots` asks `InventoryView::cells` what to show;
+//! they filter the bag's grid rows only, never the hotbar row (docs/knowledge/ux/bottom-hud.md).
 
 use bevy::input::ButtonState;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
+use bevy::ui_widgets::ScrollArea;
 use game_shared::items::{ItemId, ItemKind, item};
 use game_shared::rules::Player;
 
@@ -69,10 +71,13 @@ pub enum Chip {
     Tools,
     Claims,
     Misc,
+    /// The World Deed ring (docs/knowledge/ux/world-key.md): last, shown only while the player
+    /// holds a deed. Its list replaces the grid rows (`deeds_ui::spawn_deed_rows`).
+    Deeds,
 }
 
 impl Chip {
-    const ALL: [Chip; 8] = [
+    const ALL: [Chip; 9] = [
         Chip::All,
         Chip::Blocks,
         Chip::Backgrounds,
@@ -81,6 +86,7 @@ impl Chip {
         Chip::Tools,
         Chip::Claims,
         Chip::Misc,
+        Chip::Deeds,
     ];
 
     fn label(self) -> &'static str {
@@ -93,6 +99,7 @@ impl Chip {
             Chip::Tools => "Tools",
             Chip::Claims => "Claims",
             Chip::Misc => "Misc",
+            Chip::Deeds => "Deeds",
         }
     }
 
@@ -168,6 +175,24 @@ impl Sort {
     }
 }
 
+/// Whether a chip is in the row: the Deeds chip only while the player holds at least one deed.
+fn chip_shown(chip: Chip, deeds: usize) -> bool {
+    chip != Chip::Deeds || deeds > 0
+}
+
+/// A chip's text: `Deeds (N)` counts the ring.
+fn chip_text(chip: Chip, deeds: usize) -> String {
+    match chip {
+        Chip::Deeds => format!("{} ({deeds})", chip.label()),
+        _ => chip.label().to_string(),
+    }
+}
+
+/// Search and Sort show for the item chips only: the deed list has nothing to search or sort.
+fn search_shown(chip: Chip) -> bool {
+    chip != Chip::Deeds
+}
+
 /// Case-insensitive substring of the display name; an empty query matches everything.
 fn search_matches(name: &str, query: &str) -> bool {
     name.to_lowercase().contains(&query.trim().to_lowercase())
@@ -214,12 +239,19 @@ impl InventoryView {
             .is_some_and(|def| self.chip.shows(def.kind) && search_matches(def.name, &self.query))
     }
 
-    /// The `carried` places to show, in order, and whether the free slots follow (only unfiltered).
-    pub fn cells(&self, me: &Player, carried: &[usize]) -> (Vec<usize>, bool) {
-        let slots = me.inventory.slots();
+    /// The `carried` places to show in the grid, in order, and whether the free slots follow (only
+    /// unfiltered). The first `hotbar` places are the hotbar row: never shown here, so never
+    /// filtered or sorted.
+    pub fn cells(
+        &self,
+        slots: &[(ItemId, u16)],
+        carried: &[usize],
+        hotbar: usize,
+    ) -> (Vec<usize>, bool) {
         let mut entries: Vec<Entry> = carried
             .iter()
             .enumerate()
+            .skip(hotbar)
             .filter_map(|(place, &index)| slots.get(index).map(|&(id, n)| (place, id, n)))
             .filter(|&(_, id, _)| self.shows(id))
             .collect();
@@ -296,6 +328,7 @@ fn chip_node(assets: &AssetServer, active: bool) -> (Node, ImageNode) {
         Node {
             height: px(CHIP_HEIGHT),
             padding: UiRect::horizontal(px(CHIP_PADDING)),
+            flex_shrink: 0.0,
             justify_content: JustifyContent::Center,
             align_items: AlignItems::Center,
             ..default()
@@ -306,16 +339,16 @@ fn chip_node(assets: &AssetServer, active: bool) -> (Node, ImageNode) {
 
 /// The chip row and the search / sort / count row, under the bag tabs.
 pub(crate) fn spawn_filter_bar(panel: &mut ChildSpawnerCommands, assets: &AssetServer) {
-    // ponytail: the chips wrap to a second row on a narrow window instead of scrolling sideways;
-    // they keep their order either way.
+    // One row, so the bag keeps its rows on a 720 px window: chips past the bag's 8-column width
+    // scroll sideways (trackpad / horizontal wheel) and are always reachable by Shift+[ ] / LT RT.
     let chips = Node {
-        flex_wrap: FlexWrap::Wrap,
         column_gap: px(SLOT_GAP),
-        row_gap: px(SLOT_GAP),
+        flex_shrink: 0.0,
+        overflow: Overflow::scroll_x(),
         ..default()
     };
     panel
-        .spawn((chips, Hovered::default()))
+        .spawn((chips, ScrollArea, Hovered::default()))
         .with_children(|row| {
             for chip in Chip::ALL {
                 row.spawn((
@@ -333,6 +366,7 @@ pub(crate) fn spawn_filter_bar(panel: &mut ChildSpawnerCommands, assets: &AssetS
     let bar = Node {
         align_items: AlignItems::Center,
         column_gap: px(HUD_MARGIN),
+        flex_shrink: 0.0,
         ..default()
     };
     panel.spawn((bar, Hovered::default())).with_children(|bar| {
@@ -399,7 +433,7 @@ fn step_chip(chip: Chip, step: i32, has_items: impl Fn(Chip) -> bool) -> Chip {
     Chip::ALL[at as usize]
 }
 
-/// Which chips have something in `me`'s bag.
+/// Which chips have something in `me`'s bag (the Deeds chip: on the ring).
 fn chips_with_items(me: &Player) -> impl Fn(Chip) -> bool {
     let kinds: Vec<ItemKind> = me
         .inventory
@@ -407,7 +441,11 @@ fn chips_with_items(me: &Player) -> impl Fn(Chip) -> bool {
         .iter()
         .filter_map(|&(id, _)| item(id).map(|def| def.kind))
         .collect();
-    move |chip| kinds.iter().any(|&kind| chip.shows(kind))
+    let deeds = !me.deeds.is_empty();
+    move |chip| match chip {
+        Chip::Deeds => deeds,
+        _ => kinds.iter().any(|&kind| chip.shows(kind)),
+    }
 }
 
 /// In an empty grid: `No items match "<text>"` with a `Clear` link, or `No <chip> in your bag`.
@@ -545,6 +583,10 @@ fn click_filter(
         view.focused = true;
         return;
     }
+    // The last deed left the ring: its chip is gone, back to All.
+    if view.chip == Chip::Deeds && game.me().is_some_and(|me| me.deeds.is_empty()) {
+        view.chip = Chip::All;
+    }
     if *open != OpenPanel::Inventory {
         if view.focused {
             view.focused = false;
@@ -608,16 +650,45 @@ fn refresh_filter(
     assets: Res<AssetServer>,
     game: Res<Game>,
     view: Res<InventoryView>,
-    mut chips: Query<(&ChipButton, &mut ImageNode)>,
-    mut chip_labels: Query<(&ChipLabel, &mut TextColor), Without<SearchText>>,
+    mut chips: Query<(&ChipButton, &mut ImageNode, &mut Node)>,
+    mut chip_labels: Query<
+        (&ChipLabel, &mut Text, &mut TextColor),
+        (Without<SearchText>, Without<SortLabel>, Without<CountLabel>),
+    >,
     mut search: Single<(&mut Text, &mut TextColor), With<SearchText>>,
     mut sort: Single<&mut Text, (With<SortLabel>, Without<SearchText>)>,
     mut count: Single<&mut Text, (With<CountLabel>, Without<SearchText>, Without<SortLabel>)>,
+    mut search_sort: Query<
+        &mut Node,
+        (
+            Or<(With<SearchField>, With<SortButton>)>,
+            Without<ChipButton>,
+        ),
+    >,
 ) {
     let Some(me) = game.me() else { return };
     let slots = me.inventory.slots();
     let has_items = chips_with_items(me);
-    for (&ChipButton(chip), mut image) in &mut chips {
+    let deeds = me.deeds.len();
+    let display = if search_shown(view.chip) {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    for mut node in &mut search_sort {
+        if node.display != display {
+            node.display = display;
+        }
+    }
+    for (&ChipButton(chip), mut image, mut node) in &mut chips {
+        let display = if chip_shown(chip, deeds) {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if node.display != display {
+            node.display = display;
+        }
         let file = if chip == view.chip {
             CHIP_ACTIVE_IMAGE
         } else {
@@ -636,7 +707,11 @@ fn refresh_filter(
             image.color = tint;
         }
     }
-    for (&ChipLabel(chip), mut colour) in &mut chip_labels {
+    for (&ChipLabel(chip), mut text, mut colour) in &mut chip_labels {
+        let want_text = chip_text(chip, deeds);
+        if text.0 != want_text {
+            text.0 = want_text;
+        }
         let base = if chip == view.chip {
             INK_COLOR
         } else {
@@ -719,8 +794,32 @@ mod tests {
                 "Wearables",
                 "Tools",
                 "Claims",
-                "Misc"
+                "Misc",
+                "Deeds"
             ]
+        );
+        // No item is a deed: deeds live on the ring, not in the slots.
+        assert!(ITEMS.iter().all(|def| !Chip::Deeds.shows(def.kind)));
+    }
+
+    #[test]
+    fn the_deeds_chip_shows_only_with_a_deed_and_counts_them() {
+        assert!(!chip_shown(Chip::Deeds, 0));
+        assert!(chip_shown(Chip::Deeds, 1));
+        assert!(chip_shown(Chip::Misc, 0), "item chips always show");
+        assert_eq!(chip_text(Chip::Deeds, 2), "Deeds (2)");
+        assert_eq!(chip_text(Chip::Misc, 2), "Misc");
+        assert_eq!(Chip::ALL.last(), Some(&Chip::Deeds), "the last chip");
+        assert!(
+            !search_shown(Chip::Deeds),
+            "no Search / Sort over the deed list"
+        );
+        assert!(search_shown(Chip::All) && search_shown(Chip::Misc));
+        // Stepping skips it while the ring is empty.
+        assert_eq!(step_chip(Chip::Misc, 1, |c| c == Chip::Misc), Chip::All);
+        assert_eq!(
+            step_chip(Chip::Misc, 1, |c| matches!(c, Chip::Misc | Chip::Deeds)),
+            Chip::Deeds
         );
     }
 
@@ -795,6 +894,38 @@ mod tests {
             Some("No items match \"stone\"".to_string())
         );
         assert_eq!(empty_message(Chip::All, "  "), None);
+    }
+
+    #[test]
+    fn the_hotbar_row_is_never_filtered_or_sorted() {
+        let seeds: Vec<ItemId> = ITEMS
+            .iter()
+            .filter(|d| d.kind == ItemKind::Seed)
+            .map(|d| d.id)
+            .take(2)
+            .collect();
+        let (seed, other_seed) = (seeds[0], seeds[1]);
+        // Hotbar: dirt, a seed. Grid: the fist, another seed.
+        let slots = [(DIRT, 3), (seed, 2), (FIST, 1), (other_seed, 9)];
+        let carried: Vec<usize> = (0..slots.len()).collect();
+        let hotbar = 2;
+        let mut view = InventoryView::default();
+        let (all, free) = view.cells(&slots, &carried, hotbar);
+        assert!(free, "unfiltered: the free slots follow");
+        assert!(all.iter().all(|&p| p >= hotbar), "{all:?}");
+        view.chip = Chip::Seeds;
+        let (seeds, free) = view.cells(&slots, &carried, hotbar);
+        assert!(!free);
+        assert!(seeds.iter().all(|&p| p >= hotbar), "{seeds:?}");
+        assert_eq!(seeds, vec![3], "the hotbar's seed is not in the grid");
+        view.chip = Chip::All;
+        view.sort = Sort::Count;
+        let (sorted, _) = view.cells(&slots, &carried, hotbar);
+        assert_eq!(
+            sorted,
+            vec![3, 2],
+            "most first, the hotbar's 3 dirt left out"
+        );
     }
 
     #[test]

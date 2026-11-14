@@ -8,7 +8,7 @@ use game_shared::TILE_SIZE;
 use game_shared::rules::{Action, Event};
 
 use crate::audio::Sfx;
-use crate::hud::{HUD_MARGIN, INK_COLOR, OpenPanel, SLOT_GAP, SLOT_SIZE, ink, sliced};
+use crate::hud::{BottomHudInset, INK_COLOR, OpenPanel, ink, sliced};
 use crate::settings::Settings;
 use crate::state::{ActionResult, Game, Phase};
 
@@ -34,8 +34,6 @@ const CHECK_COLOR: Color = Color::srgb(0.25, 0.55, 0.15);
 const BOX_IMAGE: &str = "ui/tooltip.png";
 const BOX_INSET: f32 = 6.0;
 const BOX_PADDING: f32 = 10.0;
-/// Above the hotbar column (hotbar, item strip, toast line), so it never covers a toast.
-const BOX_BOTTOM: f32 = HUD_MARGIN + SLOT_SIZE + 2.0 * (20.0 + SLOT_GAP) + 24.0;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Stage {
@@ -69,6 +67,9 @@ struct Hints {
 
 #[derive(Component)]
 struct HintBox;
+/// The box's full-width row, kept above the bottom stack and the toast line (`place`).
+#[derive(Component)]
+struct HintRow;
 #[derive(Component)]
 struct HintText;
 #[derive(Component)]
@@ -78,8 +79,10 @@ pub struct HintsPlugin;
 
 impl Plugin for HintsPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_box)
-            .add_systems(Update, (track, advance, show).chain().in_set(Phase::View));
+        app.add_systems(Startup, spawn_box).add_systems(
+            Update,
+            (track, advance, show, place).chain().in_set(Phase::View),
+        );
     }
 }
 
@@ -96,7 +99,7 @@ fn spawn_box(mut commands: Commands, assets: Res<AssetServer>, settings: Res<Set
         position_type: PositionType::Absolute,
         left: px(0),
         right: px(0),
-        bottom: px(BOX_BOTTOM),
+        bottom: px(BottomHudInset::default().hint_bottom_px),
         justify_content: JustifyContent::Center,
         ..default()
     };
@@ -107,7 +110,7 @@ fn spawn_box(mut commands: Commands, assets: Res<AssetServer>, settings: Res<Set
         ..default()
     };
     commands
-        .spawn((row, Pickable::IGNORE))
+        .spawn((row, HintRow, Pickable::IGNORE))
         .with_children(|row| {
             row.spawn((
                 frame,
@@ -234,7 +237,8 @@ fn show(
             (step, format!("{}/{STEPS}", step + 1), INK_COLOR)
         }
     };
-    let hidden = a <= 0.0 || step >= STEPS || *open != OpenPanel::None;
+    // Above the bag while it is open (docs/knowledge/ux/bottom-hud.md); a centre panel hides it.
+    let hidden = a <= 0.0 || step >= STEPS || !(*open == OpenPanel::None || open.is_bag());
     *frame.0 = if hidden {
         Visibility::Hidden
     } else {
@@ -250,6 +254,15 @@ fn show(
     text.1.0 = INK_COLOR.with_alpha(a);
     counter.0.0 = label;
     counter.1.0 = colour.with_alpha(a);
+}
+
+/// Above the bottom stack (the strip, or the open bag) and the toast line, so it never covers a
+/// toast; follows the bag's slide. Written only on a change.
+fn place(inset: Res<BottomHudInset>, mut row: Single<&mut Node, With<HintRow>>) {
+    let bottom = px(inset.hint_bottom_px);
+    if row.bottom != bottom {
+        row.bottom = bottom;
+    }
 }
 
 #[cfg(test)]
