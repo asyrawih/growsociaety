@@ -63,19 +63,20 @@ One rule, used by every punch and every placement:
 2. Otherwise, if the world has a **world claim**: the same test against the world claim.
 3. Otherwise the tile is free: anyone may edit.
 
-Area claims take precedence over the world claim, so a world owner can hand a plot to a friend by letting them place
-an area claim, or open one corner to the public.
+Area claims take precedence over the world claim, so a world owner can hand a plot to a friend by putting them on
+the world claim's access list and letting them place an area claim. Setting a claim public lets everyone build on it,
+not claim land inside it.
 
 Additional rules:
 
 | Rule | Detail |
 |---|---|
-| Who may place an area claim | Anyone who may edit the claim's own tile under the rule above |
+| Who may place an area claim | Anyone who may edit the claim's own tile, provided (a) that tile does not already belong to an area claim (yours included): placing a claim inside a claim is `Occupied`; and (b) inside a world claim, only the world claim's owner and its access list may place one. `public` lets everyone build there, not take land away from the owner (`NoPermission`) |
 | Who may place a world claim | Anyone, if the world has no world claim and **no area claim owned by someone else** |
 | One world claim per world | A second placement is rejected |
 | Breaking a claim | Owner only. It always drops itself (never a seed, never nothing) and gives **no gems**, or placing and breaking would mint gems. Its tiles become free. At the world drop limit the last punch is refused (`DropLimit`) so a claim is never destroyed without its item |
 | Placing where nothing is free | An area claim whose search finds no unclaimed tile at all is refused (`Occupied`) |
-| Editing access | Owner only, by using the wrench on the claim. At most `MAX_CLAIM_ACCESS = 32` players (Tuning); adding the owner or a 33rd player is `Invalid` |
+| Editing access | Owner only, by using the wrench on the claim. At most `MAX_CLAIM_ACCESS = 32` players (Tuning); adding the owner or a 33rd player is `Invalid`. Also `/access <player> on\|off` in chat: it changes the nearest claim you own within reach; use `#<id>` for someone offline |
 | Dropped items | Not protected. Anyone standing on a drop takes it, claimed tile or not (Tuning; revisit if griefing) |
 | Inactivity | A claim whose owner and access list have all been offline 180 days can be broken by anyone (Reference; Phase 7) |
 | Main door | Always usable by everyone, even in a claimed world |

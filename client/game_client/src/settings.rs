@@ -31,7 +31,7 @@ const DEFAULT_VOLUME: u8 = 80;
 const LANGUAGES: [&str; 1] = ["English"];
 const MIC_DEFAULT: &str = "System default";
 /// Opens the settings on the Voice tab (free: see the bindings in hud, interact, player, camera, chat).
-const VOICE_KEY: KeyCode = KeyCode::KeyN;
+pub(crate) const VOICE_KEY: KeyCode = KeyCode::KeyN;
 
 /// Everything the player can adjust, saved on this machine.
 #[derive(Resource, Clone, PartialEq, Debug)]
@@ -55,6 +55,10 @@ pub struct Settings {
     pub skin: usize,
     /// Index into `LANGUAGES`.
     pub language: usize,
+    /// First-run hints already finished, 0..=3; `hints.rs`.
+    pub hints: u8,
+    /// The claim tip ("hold the wrench and click your claim") was shown once; `claim_ui.rs`.
+    pub claim_tip_seen: bool,
 }
 
 impl Default for Settings {
@@ -71,6 +75,8 @@ impl Default for Settings {
             zoom: 0,
             skin: 0,
             language: 0,
+            hints: 0,
+            claim_tip_seen: false,
         }
     }
 }
@@ -106,6 +112,8 @@ impl Settings {
                 "fullscreen" => s.fullscreen = yes,
                 "zoom" => s.zoom = index(value, ZOOM_LEVELS.len()).unwrap_or(s.zoom),
                 "skin" => s.skin = index(value, SKIN_RAMPS.len()).unwrap_or(s.skin),
+                "hints" => s.hints = value.parse().unwrap_or(s.hints),
+                "claim_tip_seen" => s.claim_tip_seen = yes,
                 "language" => {
                     s.language = LANGUAGES.iter().position(|&l| l == value).unwrap_or(0);
                 }
@@ -140,7 +148,7 @@ impl Settings {
     pub fn to_text(&self) -> String {
         format!(
             "music={}\nsfx={}\nvoice_volume={}\nvoice={}\nopen_mic={}\nself_muted={}\nmic={}\n\
-             fullscreen={}\nzoom={}\nskin={}\nlanguage={}\n",
+             fullscreen={}\nzoom={}\nskin={}\nlanguage={}\nhints={}\nclaim_tip_seen={}\n",
             self.music,
             self.sfx,
             self.voice_volume,
@@ -152,6 +160,8 @@ impl Settings {
             self.zoom,
             self.skin,
             LANGUAGES[self.language.min(LANGUAGES.len() - 1)],
+            self.hints,
+            self.claim_tip_seen,
         )
     }
 
@@ -364,6 +374,9 @@ struct Knob(Field);
 struct Toggle(Field);
 #[derive(Component)]
 struct Dropdown(Field);
+/// "Show tips again" on the Keys tab: restarts the first-run hints (`hints.rs`).
+#[derive(Component)]
+struct ResetHints;
 #[derive(Component)]
 struct DropdownList;
 #[derive(Component)]
@@ -637,6 +650,8 @@ pub fn spawn_settings(mut commands: Commands, assets: Res<AssetServer>, tab: Res
                                     r.spawn(ink(keys));
                                 });
                             }
+                            p.spawn((tab_node(&assets, true), ResetHints, Hovered::default()))
+                                .with_child((label("Show tips again"), TextColor(LIGHT_TEXT)));
                         }
                         SettingsTab::Account => {
                             dropdown_row(p, &assets, "Skin tone", Field::Skin);
@@ -681,6 +696,7 @@ fn click_settings(
     dropdowns: Query<(&Dropdown, &Hovered)>,
     choices: Query<(&DropdownOption, &Hovered)>,
     sliders: Query<(&Slider, &Hovered, &ComputedNode, &UiGlobalTransform)>,
+    resets: Query<&Hovered, With<ResetHints>>,
     mut tab: ResMut<SettingsTab>,
     mut dropdown: ResMut<OpenDropdown>,
     mut settings: ResMut<Settings>,
@@ -717,6 +733,7 @@ fn click_settings(
         || hovered(&dropdowns).is_some()
         || hovered(&toggles).is_some()
         || hovered(&tabs).is_some()
+        || resets.iter().any(Hovered::get)
         || sliders.iter().any(|(_, h, ..)| h.get());
     if on_control {
         sfx.write(Sfx::UiClick);
@@ -743,6 +760,8 @@ fn click_settings(
         settings.set_toggle(field, !on);
     } else if let Some(&TabButton(choice)) = hovered(&tabs) {
         tab.set_if_neq(choice);
+    } else if resets.iter().any(Hovered::get) {
+        settings.hints = 0;
     } else if let Some((slider, ..)) = sliders.iter().find(|(_, h, ..)| h.get()) {
         *dragging = Some(slider.0);
         slide(slider.0, &mut settings);
@@ -936,6 +955,8 @@ mod tests {
             zoom: 2,
             skin: 3,
             language: 0,
+            hints: 2,
+            claim_tip_seen: true,
         };
         assert_eq!(Settings::parse(&s.to_text()), s);
         let dir = temp_dir("roundtrip");

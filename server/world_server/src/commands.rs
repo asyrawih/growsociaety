@@ -158,6 +158,58 @@ impl Room {
                 let verb = if on { "Ignoring" } else { "No longer ignoring" };
                 Ok(format!("{verb} {}", self.name(who)))
             }
+            Command::Access { who, on } => {
+                // Texts as in docs/knowledge/ux/claims.md (the panel's Add errors). A name must be
+                // someone in this world; `#<id>` reaches anyone.
+                let target = match &who {
+                    Target::Id(id) => *id,
+                    Target::Name(name) => self
+                        .resolve(&who)
+                        .ok_or_else(|| format!("No player called {name}"))?,
+                };
+                let (x, y) = self
+                    .nearest_own_claim(id)
+                    .ok_or("No claim of yours within reach")?;
+                let key = game_shared::world::World::tile_key(x, y)
+                    .ok_or("No claim of yours within reach")?;
+                let listed = self
+                    .state
+                    .world
+                    .claim(key)
+                    .map(|c| (c.access.contains(&target), c.access.len()));
+                let name = self.name(target);
+                match (on, listed) {
+                    (true, _) if target == id => return Err("You are the owner".into()),
+                    (true, Some((true, _))) => {
+                        return Err(format!("{name} can already build here"));
+                    }
+                    (true, Some((false, n))) if n >= game_shared::claims::MAX_CLAIM_ACCESS => {
+                        return Err(format!(
+                            "The list is full ({})",
+                            game_shared::claims::MAX_CLAIM_ACCESS
+                        ));
+                    }
+                    _ => {}
+                }
+                let action = game_shared::rules::Action::SetClaimAccess {
+                    x,
+                    y,
+                    player: target,
+                    allow: on,
+                };
+                match game_shared::rules::apply(&mut self.state, id, action, now) {
+                    Ok(events) => {
+                        self.broadcast(&events, None);
+                        let verb = if on {
+                            "can build here now"
+                        } else {
+                            "can no longer build here"
+                        };
+                        Ok(format!("{name} {verb}"))
+                    }
+                    Err(reject) => Err(format!("Cannot change access: {reject:?}")),
+                }
+            }
             Command::Trade { who } => {
                 let to = self.resolve(&who).ok_or_else(missing)?;
                 // The trade rules live in `apply`; the parties see its events.
@@ -261,6 +313,21 @@ impl Room {
                 if result.is_ok() { Ok(line) } else { Err(line) }
             }
         }
+    }
+
+    /// The block of the claim `id` owns that is closest to them and within their reach.
+    fn nearest_own_claim(&self, id: PlayerId) -> Option<(u32, u32)> {
+        let player = self.state.players.get(&id)?;
+        let mods = game_shared::mods::worn_mods(&player.equipped);
+        let (px, py) = game_shared::world_to_tile(player.body.pos.0, player.body.pos.1)?;
+        self.state
+            .world
+            .extras
+            .iter()
+            .filter(|(_, extra)| matches!(extra, game_shared::world::TileExtra::Claim(c) if c.owner == id))
+            .filter_map(|(&key, _)| game_shared::world::World::tile_xy(key))
+            .filter(|&(x, y)| game_shared::rules::in_reach_with(&player.body, x, y, mods))
+            .min_by_key(|&(x, y)| x.abs_diff(px).max(y.abs_diff(py)))
     }
 
     fn target_ok(&self, actor: PlayerId, target: PlayerId) -> Result<(), String> {
@@ -607,6 +674,62 @@ mod tests {
         };
         assert!(cancelled(&b.drain()));
         assert!(!cancelled(&c.drain()));
+    }
+
+    #[test]
+    fn access_on_and_off_for_the_nearest_own_claim() {
+        let mut room = room();
+        let mut a = join(&mut room, 1, "Ana", Role::Player);
+        let mut b = join(&mut room, 2, "Budi", Role::Player);
+        say(&mut room, &a, "/access Budi on");
+        assert_eq!(a.replies(), ["No claim of yours within reach"]);
+        let (dx, dy) = room.state.world.door;
+        room.state
+            .players
+            .get_mut(&a.id)
+            .expect("joined")
+            .inventory
+            .add(game_shared::items::SMALL_CLAIM, 1);
+        let place = game_shared::rules::Action::Place {
+            x: dx + 1,
+            y: dy,
+            item: game_shared::items::SMALL_CLAIM,
+        };
+        room.handle(
+            ToWorld::Act {
+                id: a.id,
+                seq: 1,
+                action: place,
+            },
+            1.0,
+        );
+        a.drain();
+        b.drain();
+        say(&mut room, &a, "/access budi on");
+        assert_eq!(a.replies(), ["Budi can build here now"]);
+        say(&mut room, &a, "/access Budi on");
+        assert_eq!(a.replies(), ["Budi can already build here"]);
+        say(&mut room, &a, "/access Ana on");
+        assert_eq!(a.replies(), ["You are the owner"]);
+        say(&mut room, &a, "/access Zed on");
+        assert_eq!(a.replies(), ["No player called Zed"]);
+        let key = game_shared::world::World::tile_key(dx + 1, dy).expect("in world");
+        assert!(
+            room.state
+                .world
+                .claim(key)
+                .is_some_and(|c| c.access == [b.id])
+        );
+        say(&mut room, &a, "/access #2 off");
+        assert!(
+            room.state
+                .world
+                .claim(key)
+                .is_some_and(|c| c.access.is_empty())
+        );
+        // Only an owner: Budi has no claim here.
+        say(&mut room, &b, "/access Ana on");
+        assert_eq!(b.replies(), ["No claim of yours within reach"]);
     }
 
     #[test]

@@ -63,6 +63,7 @@ Use nearest-neighbour sampling. 9-slice insets (px, every side unless noted) kee
 | `preview_frame.png` | 94×97 | 20 | Wardrobe character preview. Stretch it to **at least 136×150** for the rig at 2× (96 px plus room for wings and big hair), centre the rig and put its feet ~10 px above the inner bottom edge |
 | `tab.png` | 51×23 | 8 | Tab button (e.g. Inventory / Wardrobe, store categories) |
 | `close.png` | 27×27 | – | Close button, top-right corner of a panel |
+| `tooltip.png` | 48×32 | 6 | Item tooltip frame: slim dark-wood border on parchment, no ornate corners. Stays readable stretched to ~280×90 with 16 px dark-brown text (spec: docs/knowledge/ux/item-tooltip.md) |
 | `hotbar.png` | 138×47 | – | Has 5 cells baked in, so don't stretch it. Prefer a row of `slot.png` |
 
 Wardrobe layout (see mockup): left column hair, hat, face, shirt; right column pants, shoes, back, hand; character
@@ -79,9 +80,10 @@ Every equipment item has `items/<name>/icon.png` (32×32) for slots. Pickaxe ico
 
 `growsociaety_pixel.ttf`: a pixel font made in PixelLab (job `397c882a-b5f9-4d47-9864-88def5302ace`). Glyphs are drawn
 on a 16 px grid, so use font sizes that are multiples of 16 (16, 32) to keep pixels crisp; other sizes blur.
-Preview: `fonts/_preview.png`. It covers A-Z a-z 0-9, space and `. , ! ? : ; ' " - + ( ) / % * = _ $`.
-**Missing:** `@ # & < > [ ] { } | ~ ^ \` and backtick, plus accented letters. Text containing those (mostly chat)
-needs the default font, or input limited to the covered set.
+Preview: `fonts/_preview.png`. It covers A-Z a-z 0-9, space and `. , ! ? : ; ' " - + ( ) / % * = _ $`, plus
+hand-drawn `# · | @ [ ] < > & ×` added on the same grid by `docs/art/font_add_glyphs.py`. PixelLab's original is
+kept untouched in `fonts/source/`, and the script rebuilds the game font from it.
+**Still missing:** `{ } ~ ^ \` and backtick, plus accented letters. To add more, draw them in that script.
 
 ### Voice chat icons (`ui/voice_*.png`, `ui/settings_gear.png`), 32×32
 
@@ -154,3 +156,25 @@ A grass block with a sprout (PixelLab `dba1d15a-f247-47fe-b7eb-0d76d2838d7e`, ca
 - `icon_{16,32,48,64,128,256,512}.png`. 128 and up are whole-number nearest upscales; 16–64 are smooth downscales.
 - `icon.ico` (Windows exe and window icon) and `icon.icns` (macOS .app bundle).
 - Bevy window icon: load `icon_64.png` (or 32) into a winit `Icon` on the primary window at startup.
+
+## Crafting and mods
+
+PixelLab object `3603a442-5b78-4601-902b-07c57f56cd41` (frames 0, 3, 4, 6–11); sound from ElevenLabs.
+- `blocks/67_workbench.png` (32×32): the Workbench crafting station as a world tile, also used as its item icon. The
+  larger `objects/workbench.png` (64×64) stays as decoration.
+- `ui/icon_craft.png` (32×32): hammer and saw, for a "Craft" tab or button.
+- Craft panel: recipe slots reuse `ui/slot.png` / `ui/slot_selected.png`. `ui/craft/arrow.png` (32×32, orange →)
+  goes between the ingredients and the result. The Craft button is `ui/lobby/button_primary.png` (+ `_hover`,
+  `_pressed`), with `ui/craft/button_craft_disabled.png` (151×45, grey) when ingredients are missing. 9-slice 10
+  for all of them.
+- Mod icons for tooltips, `ui/mods/mod_<name>.png` (32×32): `extra_jump`, `glide`, `run_boost`, `reach`,
+  `dig_boost`, `gem_finder`.
+- `audio/sfx/craft.ogg` (0.8 s): item crafted, a wood knock and metal clink.
+
+### One-way platforms (`blocks/68_wood_platform.png`, `blocks/69_stone_platform.png`)
+
+32×32. Only the top 8 px are drawn: a plank (palette of `12_planks`) or a stone slab (palette of `14_stone_bricks`),
+with a 1 px lighter highlight on the walkable top edge. Two small brackets hang under the left and right ends, and
+everything else is transparent, so they never read as solid blocks. Adjacent tiles join into one continuous ledge.
+Made from the existing block pixels (no generation). Spec: docs/knowledge/ux/platforms.md. Item ids:
+`WOOD_PLATFORM` = 68, `STONE_PLATFORM` = 69.

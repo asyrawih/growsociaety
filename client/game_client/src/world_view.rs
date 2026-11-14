@@ -8,6 +8,7 @@ use bevy::prelude::*;
 use bevy::time::common_conditions::on_timer;
 use game_shared::farming::{GROWN_STAGE, SAPLING_HITS, growth_stage};
 use game_shared::items::{Collision, ItemId, Sprite as ItemSprite, item};
+use game_shared::mods::DAMAGE_PER_HIT;
 use game_shared::rules::{DAMAGE_RESET, Event, Layer, drop_position};
 use game_shared::world::{Tile, World};
 use game_shared::{TILE_SIZE, WORLD_HEIGHT, WORLD_WIDTH, tile_to_world};
@@ -329,6 +330,13 @@ fn with_neighbours(x: u32, y: u32) -> impl Iterator<Item = (u32, u32)> {
         .filter(|&(x, y)| x < WORLD_WIDTH && y < WORLD_HEIGHT)
 }
 
+/// How broken a tile looks, 0..=1: `damage` is in points (`DAMAGE_PER_HIT` per hit), the tile
+/// takes `hits` hits.
+fn crack_fraction(damage: u8, hits: u8) -> f32 {
+    let health = u16::from(hits.max(1)) * DAMAGE_PER_HIT;
+    (f32::from(damage) / f32::from(health)).min(1.0)
+}
+
 #[allow(clippy::too_many_arguments)] // one system keeps the events in their original order
 fn on_game_events(
     mut commands: Commands,
@@ -382,8 +390,7 @@ fn on_game_events(
                     Some(def) => def.hits,
                     None => 1,
                 };
-                let progress = f32::from(damage) / f32::from(hits.max(1));
-                let alpha = CRACK_MAX_ALPHA * progress.min(1.0);
+                let alpha = CRACK_MAX_ALPHA * crack_fraction(damage, hits);
                 let (cx, cy) = tile_to_world(x, y);
                 commands.spawn((
                     Sprite::from_color(Color::srgba(0.0, 0.0, 0.0, alpha), Vec2::splat(TILE_SIZE)),
@@ -417,6 +424,7 @@ fn on_game_events(
             Event::InventoryChanged { .. }
             | Event::GemsChanged { .. }
             | Event::BackpackUpgraded { .. }
+            | Event::InventoryMoved { .. }
             | Event::ClaimPlaced { .. }
             | Event::ClaimRemoved { .. }
             | Event::ClaimUpdated { .. }
@@ -427,7 +435,8 @@ fn on_game_events(
             | Event::TradeCompleted { .. }
             | Event::TradeCancelled { .. }
             | Event::XpChanged { .. }
-            | Event::LevelUp { .. } => {}
+            | Event::LevelUp { .. }
+            | Event::Crafted { .. } => {}
         }
     }
 }
@@ -550,5 +559,16 @@ mod tests {
         assert_eq!(corner, vec![(0, 0), (0, 1), (1, 0)]);
         let far = with_neighbours(WORLD_WIDTH - 1, WORLD_HEIGHT - 1);
         assert_eq!(far.count(), 3);
+    }
+
+    #[test]
+    fn the_crack_counts_quarter_points_against_hits() {
+        // Stone: 6 hits = 24 points. A fist punch (4) is a sixth, a tier-2 pickaxe (5) a bit more.
+        assert_eq!(crack_fraction(4, 6), 4.0 / 24.0);
+        assert_eq!(crack_fraction(5, 6), 5.0 / 24.0);
+        assert_eq!(crack_fraction(24, 6), 1.0);
+        assert_eq!(crack_fraction(30, 6), 1.0, "clamped");
+        assert_eq!(crack_fraction(4, SAPLING_HITS), 4.0 / 12.0);
+        assert_eq!(crack_fraction(2, 0), 0.5, "no hits counts as one");
     }
 }

@@ -3,22 +3,28 @@
 //! never by polling the state every frame. The HUD decides nothing: buying, equipping and toggling
 //! send an `Action`. Panels use the wood-and-parchment kit in assets/ui/ (assets/README.md, "UI").
 
+use bevy::input::touch::Touches;
+use bevy::picking::Pickable;
 use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
-use bevy::ui::VisualBox;
+use bevy::ui::{UiGlobalTransform, VisualBox};
 use bevy::ui_widgets::{ControlOrientation, ScrollArea, Scrollbar, ScrollbarThumb};
-use game_shared::claims::CLAIMS;
+use bevy::window::PrimaryWindow;
+use game_shared::claims::{CLAIMS, claim_kind};
+use game_shared::crafting::recipe;
+use game_shared::farming::grow_seconds;
 use game_shared::inventory::{MAX_UPGRADES, SLOTS_PER_UPGRADE, upgrade_cost};
-use game_shared::items::{ITEMS, ItemId, ItemKind, Slot, equip_price, item, slot_of};
+use game_shared::items::{
+    FIST, ITEMS, ItemDef, ItemId, ItemKind, Slot, WORKBENCH, WRENCH, equip_price, item, slot_of,
+};
 use game_shared::levels::{MAX_LEVEL, xp_to_next};
+use game_shared::mods::{FIST_DAMAGE, Mod, mods_of};
 use game_shared::rules::{Action, Event, Player, Reject};
-use game_shared::world::World;
 
 use crate::audio::Sfx;
 use crate::chat::OpenChat;
-use crate::interact::InspectedClaim;
 use crate::screenshot;
-use crate::settings::{Settings, SettingsTab};
+use crate::settings::{Settings, SettingsTab, VOICE_KEY};
 use crate::state::{ActionMsg, ActionResult, Game, GameEvent, Phase};
 use crate::wardrobe::{PREVIEW_BELOW_FEET, PREVIEW_SIZE, WardrobePreview};
 use crate::world_view::item_icon;
@@ -37,14 +43,17 @@ const SELECT_KEYS: [KeyCode; HOTBAR_SLOTS] = [
 const INVENTORY_KEYS: [KeyCode; 2] = [KeyCode::KeyE, KeyCode::KeyI];
 const STORE_KEY: KeyCode = KeyCode::KeyB;
 const CLOSE_KEY: KeyCode = KeyCode::Escape;
+/// chat.rs opens the chat line on Enter and has no constant of its own; named here for the
+/// top bar's label only.
+const CHAT_KEY: KeyCode = KeyCode::Enter;
 
 // The UI kit (assets/ui/). Sizes and insets are in the art's own pixels; it is drawn at
 // `KIT_SCALE` logical px per art px.
 pub(crate) const KIT_SCALE: f32 = 2.0;
-const PANEL_IMAGE: &str = "ui/panel.png";
-const PANEL_INSET: f32 = 18.0;
-const SLOT_IMAGE: &str = "ui/slot.png";
-const SLOT_SELECTED_IMAGE: &str = "ui/slot_selected.png";
+pub(crate) const PANEL_IMAGE: &str = "ui/panel.png";
+pub(crate) const PANEL_INSET: f32 = 18.0;
+pub(crate) const SLOT_IMAGE: &str = "ui/slot.png";
+pub(crate) const SLOT_SELECTED_IMAGE: &str = "ui/slot_selected.png";
 const SLOT_WORN_IMAGE: &str = "ui/slot_worn.png";
 const SLOT_EMPTY_IMAGE: &str = "ui/slot_equip_empty.png";
 const SLOT_INSET: f32 = 8.0;
@@ -52,17 +61,17 @@ const TAB_IMAGE: &str = "ui/tab.png";
 const TAB_INSET: f32 = 8.0;
 const FRAME_IMAGE: &str = "ui/preview_frame.png";
 const FRAME_INSET: f32 = 20.0;
-const CLOSE_IMAGE: &str = "ui/close.png";
+pub(crate) const CLOSE_IMAGE: &str = "ui/close.png";
 /// `ui/slot_icon_<name>.png`, in `Slot::ALL` order.
 const SLOT_ICON_NAMES: [&str; 8] = [
     "hair", "hat", "face", "shirt", "pants", "shoes", "back", "hand",
 ];
 
 // Px (logical). Slots are touch targets: at least 44.
-const SLOT_SIZE: f32 = 37.0 * KIT_SCALE;
+pub(crate) const SLOT_SIZE: f32 = 37.0 * KIT_SCALE;
 const _: () = assert!(SLOT_SIZE >= 44.0);
 pub(crate) const SLOT_GAP: f32 = 4.0;
-const ICON_SIZE: f32 = 48.0;
+pub(crate) const ICON_SIZE: f32 = 48.0;
 /// Item count, inset from the slot's bottom-right corner so it sits inside the rim.
 const COUNT_INSET: f32 = 6.0;
 const TAB_HEIGHT: f32 = 23.0 * KIT_SCALE;
@@ -78,10 +87,10 @@ const ROW_MIN_HEIGHT: f32 = ROW_ICON_SIZE + 2.0 * HUD_MARGIN;
 const _: () = assert!(ROW_MIN_HEIGHT >= 44.0);
 /// Inside a 9-sliced slot stretched into a row: clear of its rim.
 const ROW_PADDING: f32 = SLOT_INSET * KIT_SCALE;
-const PANEL_PADDING: f32 = 32.0;
+pub(crate) const PANEL_PADDING: f32 = 32.0;
 const PANEL_TOP: f32 = 48.0;
 const STORE_COLUMNS: f32 = 8.0;
-const fn grid_width(columns: f32) -> f32 {
+pub(crate) const fn grid_width(columns: f32) -> f32 {
     columns * (SLOT_SIZE + SLOT_GAP) - SLOT_GAP
 }
 /// A scrolling grid's scrollbar, right of the grid (`scroll_grid`).
@@ -98,7 +107,7 @@ const LINE_HEIGHT: f32 = 20.0;
 /// hotbar) and a margin: a centre panel ends above it.
 /// Top edge of the fitted centre panels: below the top bar, close button included, since a wide
 /// panel reaches under it.
-const FIT_PANEL_TOP: f32 = HUD_MARGIN + TOPBAR_HEIGHT + CLOSE_OVERHANG + HUD_MARGIN;
+pub(crate) const FIT_PANEL_TOP: f32 = HUD_MARGIN + TOPBAR_HEIGHT + CLOSE_OVERHANG + HUD_MARGIN;
 const HOTBAR_RESERVE: f32 = HUD_MARGIN + SLOT_SIZE + 2.0 * (LINE_HEIGHT + SLOT_GAP) + HUD_MARGIN;
 /// A panel never gets shorter than this, however small the window.
 const MIN_PANEL_HEIGHT: f32 = 200.0;
@@ -139,7 +148,7 @@ const TOP_BUTTON_IMAGE: &str = "ui/settings/icon_button.png";
 const TOP_BUTTON_ART: f32 = 41.0;
 const TOP_BUTTON_SIZE: f32 = 44.0;
 const TOP_ICON_SIZE: f32 = 32.0;
-const TOPBAR_HEIGHT: f32 = TOP_BUTTON_SIZE + 2.0 * TOPBAR_PADDING;
+pub(crate) const TOPBAR_HEIGHT: f32 = TOP_BUTTON_SIZE + 2.0 * TOPBAR_PADDING;
 const MIC_ON_ICON: &str = "ui/voice_mic_on.png";
 const MIC_MUTED_ICON: &str = "ui/voice_mic_muted.png";
 /// Top-bar buttons, left to right, with their icons.
@@ -158,8 +167,6 @@ const XP_BAR_BACK: Color = Color::srgb(0.2, 0.2, 0.24);
 const XP_BAR_FILL: Color = Color::srgb(0.45, 0.85, 1.0);
 
 pub(crate) const PANEL_COLOR: Color = Color::srgba(0.08, 0.08, 0.1, 0.7);
-const WINDOW_COLOR: Color = Color::srgba(0.12, 0.12, 0.16, 0.95);
-pub(crate) const BUTTON_COLOR: Color = Color::srgb(0.22, 0.24, 0.32);
 /// Text on the parchment of a panel.
 pub(crate) const INK_COLOR: Color = Color::srgb(0.29, 0.17, 0.08);
 const DISABLED_TEXT_COLOR: Color = Color::srgb(0.55, 0.5, 0.45);
@@ -183,18 +190,78 @@ const STORE_TABS: [(StoreTab, &str); 9] = [
     (StoreTab::Equip(Slot::Hand), "Pickaxes"),
 ];
 /// The inventory/wardrobe tabs.
-const BAG_TABS: [(OpenPanel, &str); 2] = [
+const BAG_TABS: [(OpenPanel, &str); 3] = [
     (OpenPanel::Inventory, "Inventory"),
     (OpenPanel::Wardrobe, "Wardrobe"),
+    (OpenPanel::Craft, "Craft"),
 ];
+/// On the Craft tab, before its label.
+const CRAFT_ICON: &str = "ui/icon_craft.png";
+const TAB_ICON_SIZE: f32 = 32.0;
+/// Mod icons beside an item's name: the 32 px art at half size, one text line high.
+const MOD_ICON_SIZE: f32 = 16.0;
 /// Wardrobe slot columns, left and right of the preview.
 const WORN_COLUMNS: [[Slot; 4]; 2] = [
     [Slot::Hair, Slot::Hat, Slot::Face, Slot::Shirt],
     [Slot::Pants, Slot::Shoes, Slot::Back, Slot::Hand],
 ];
 
+/// Px the pointer must move with the button held on an inventory slot before the press becomes a
+/// drag; less is a click (select).
+const DRAG_THRESHOLD: f32 = 6.0;
+/// Alpha of the dragged item's icon under the pointer.
+const DRAG_GHOST_ALPHA: f32 = 0.6;
+
 /// Seconds a message stays on screen.
 const TOAST_SECS: f32 = 3.0;
+/// The same refusal text is not shown again within this many seconds (holding the mouse on
+/// bedrock must not flicker).
+const REJECT_REPEAT_SECS: f32 = 2.0;
+/// Rejects that stay silent on purpose (docs/knowledge/ux/refusals-and-big-buys.md, U2): the
+/// world already shows them, or they fire constantly. No toast and no tile flash.
+const SILENT_REJECTS: [Reject; 3] = [Reject::Occupied, Reject::OutOfRange, Reject::Cooldown];
+
+/// Purchases at this price or more take a second click (U7). Same idea as the trash key's
+/// press-twice (`interact::TRASH_CONFIRM_SECS`), with longer to read the price.
+const CONFIRM_PRICE: u32 = 1000;
+const CONFIRM_SECS: f32 = 3.0;
+/// The armed price of a wide claim row: "Buy for <gem> <price>?".
+const BUY_CONFIRM_TEXT: &str = "Buy for";
+/// The armed narrow equipment cell's price line; the strip above the hotbar says the rest:
+/// "Click again to buy for <gem> <price>".
+const BUY_SHORT_TEXT: &str = "Buy?";
+const STRIP_ARMED_TEXT: &str = "Click again to buy for";
+/// Between the parts of the selection strip.
+const STRIP_SEP: &str = "·";
+/// Store focus: arrows / d-pad move it, Enter / South clicks, East disarms then closes.
+const STORE_NAV_KEYS: [KeyCode; 4] = [
+    KeyCode::ArrowLeft,
+    KeyCode::ArrowRight,
+    KeyCode::ArrowUp,
+    KeyCode::ArrowDown,
+];
+const STORE_ACTIVATE_KEY: KeyCode = KeyCode::Enter;
+/// Previous / next tab in a tabbed panel (store categories, Inventory / Wardrobe / Craft),
+/// wrapping around; LB / RB on a gamepad. Their hints sit at the ends of each tab bar.
+const PREV_TAB_KEY: KeyCode = KeyCode::BracketLeft;
+const NEXT_TAB_KEY: KeyCode = KeyCode::BracketRight;
+const PREV_TAB_HINT: &str = "[";
+const NEXT_TAB_HINT: &str = "]";
+const BUY_IMAGE: &str = "ui/lobby/button_primary.png";
+const BUY_HOVER_IMAGE: &str = "ui/lobby/button_primary_hover.png";
+const BUY_INSET: f32 = 10.0;
+/// Touch targets.
+const TOUCH_MIN: f32 = 44.0;
+
+/// The item tooltip (U3): `ui/tooltip.png` 9-sliced, shown after the pointer rests on a cell.
+const TOOLTIP_IMAGE: &str = "ui/tooltip.png";
+const TOOLTIP_INSET: f32 = 6.0;
+const TOOLTIP_MAX_WIDTH: f32 = 280.0;
+const TOOLTIP_DELAY_SECS: f32 = 0.3;
+/// A store price the player cannot pay, on the tooltip's parchment.
+const SHORT_PRICE_COLOR: Color = Color::srgb(0.7, 0.1, 0.08);
+/// Between the parts of a line: "Block · 6 punches".
+const SEP: &str = " · ";
 
 /// Index of the selected inventory slot (an index into `Inventory::slots`). The hotbar and the
 /// inventory grid only offer non-equipment items; equipment is selected in the wardrobe.
@@ -209,6 +276,45 @@ impl Selected {
     }
 }
 
+/// True while a HUD text field has the keyboard (the claim panel's name field), so other keys
+/// (the chat line's Enter) leave it alone. Written by the panel that owns the field.
+#[derive(Resource, Default, PartialEq)]
+pub struct TextFocus(pub bool);
+
+/// An item cell: hovering it shows the shared tooltip, and it drives the selection strip. The
+/// stack shown, if any (count as in the cell).
+#[derive(Component, Clone, Copy, PartialEq, Default)]
+pub(crate) struct ItemTip(pub Option<(ItemId, u16)>);
+
+/// The store entry armed by a first click on an expensive item, and when it disarms.
+#[derive(Resource, Default, PartialEq)]
+struct ArmedBuy(Option<(UiButton, f32)>);
+
+/// The store entry with the keyboard / gamepad focus: an index into `store_entries`. Back to the
+/// first one when the store opens or the tab changes.
+#[derive(Resource, Default)]
+struct StoreFocus(usize);
+
+/// Tab keys: -1 previous, +1 next, taken while a tabbed panel is open.
+#[derive(Resource, Default)]
+struct TabKeys(i32);
+
+/// Store keys, read before the player's movement sees them.
+#[derive(Resource, Default)]
+struct StoreKeys {
+    step: Option<(i32, i32)>,
+    activate: bool,
+    back: bool,
+}
+
+/// The armed price cell's button art (hover swaps it).
+#[derive(Component)]
+struct ArmedArt;
+
+/// The shared tooltip box.
+#[derive(Component)]
+struct Tooltip;
+
 /// The equipment item selected in the wardrobe grid.
 #[derive(Resource, Default)]
 pub struct WardrobeSelected(pub Option<ItemId>);
@@ -216,6 +322,38 @@ pub struct WardrobeSelected(pub Option<ItemId>);
 /// The slot the wardrobe grid is narrowed to; `None` shows all equipment.
 #[derive(Resource, Default)]
 struct WardrobeFilter(Option<Slot>);
+
+/// Dragging an item between the hotbar and the inventory grid (`drag_items`). `from` is an index
+/// into `Inventory::slots`.
+#[derive(Resource, Default, Clone, Copy, PartialEq, Debug)]
+pub enum ItemDrag {
+    #[default]
+    Idle,
+    /// The button went down on a slot at `at` (window px); not yet a drag.
+    Pressed {
+        from: usize,
+        at: Vec2,
+    },
+    Dragging {
+        from: usize,
+    },
+}
+
+impl ItemDrag {
+    /// True from the press on a slot until the release: the world gets no punch or place.
+    pub fn busy(&self) -> bool {
+        *self != ItemDrag::Idle
+    }
+}
+
+/// A cell of the hotbar or the inventory grid: its place in the view of non-equipment items
+/// (`carried_slots`), filled or empty. Hotbar cell n and grid cell n are the same place.
+#[derive(Component)]
+struct CarriedCell(usize);
+
+/// The dragged item's icon, following the pointer.
+#[derive(Component)]
+struct DragGhost;
 
 /// Which centre panel is open.
 #[derive(Resource, Default, Clone, Copy, PartialEq, Eq, Debug)]
@@ -227,6 +365,10 @@ pub enum OpenPanel {
     Store,
     /// The settings window (`settings.rs`).
     Settings,
+    /// The craft panel (`craft_ui.rs`).
+    Craft,
+    /// The claim panel of the claim inspected with the wrench (`claim_ui.rs`).
+    Claim,
 }
 
 /// The item Q (drop) and X (trash) act on: the one selected in the wardrobe grid while the
@@ -272,7 +414,7 @@ pub(crate) struct HudText;
 pub struct Notice(pub String);
 
 /// What a click on a HUD element does. Every clickable element also carries `Hovered`.
-#[derive(Component, Clone, Copy)]
+#[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
 enum UiButton {
     /// An inventory slot (hotbar or inventory grid): select it.
     Slot(usize),
@@ -288,7 +430,6 @@ enum UiButton {
     Tab(StoreTab),
     Buy(ItemId),
     BuyUpgrade,
-    ToggleClaimPublic,
     Top(TopButton),
 }
 
@@ -352,15 +493,12 @@ impl GridPanel {
 /// A centre panel and the `OpenPanel` value that shows it.
 #[derive(Component)]
 struct PanelOf(OpenPanel);
-#[derive(Component)]
-struct ClaimPanel;
-#[derive(Component)]
-struct ClaimInfo;
-#[derive(Component)]
-struct ClaimPublicLabel;
 /// Name of the selected item. Seeds share one sprite, so the name is the reliable way to tell them apart.
 #[derive(Component)]
 struct SelectedName;
+/// The mods of the item named in `SelectedName`.
+#[derive(Component)]
+struct ModLine;
 #[derive(Component)]
 struct GemCount;
 #[derive(Component)]
@@ -385,6 +523,7 @@ impl Plugin for HudPlugin {
             Some("wardrobe") => OpenPanel::Wardrobe,
             Some("store") => OpenPanel::Store,
             Some("settings") => OpenPanel::Settings,
+            Some("craft") => OpenPanel::Craft,
             _ => OpenPanel::None,
         };
         let tab = STORE_TABS
@@ -396,24 +535,50 @@ impl Plugin for HudPlugin {
             .add_observer(use_hud_font)
             .init_resource::<WardrobeSelected>()
             .init_resource::<WardrobeFilter>()
+            .init_resource::<ItemDrag>()
+            .init_resource::<TextFocus>()
+            .init_resource::<ArmedBuy>()
+            .init_resource::<StoreFocus>()
+            .init_resource::<StoreKeys>()
+            .init_resource::<TabKeys>()
+            // After `PreUpdate` (the chat line clears keys there), before the player's
+            // `FixedUpdate` would walk on the arrows.
+            .add_systems(
+                RunFixedMainLoop,
+                (take_store_keys, take_tab_keys)
+                    .in_set(RunFixedMainLoopSystems::BeforeFixedMainLoop),
+            )
             .insert_resource(open)
             .insert_resource(tab)
             .add_message::<Notice>()
             .add_systems(Startup, spawn_hud)
-            .add_systems(Update, (toggle_panels, click_buttons).in_set(Phase::Input))
+            .add_systems(
+                Update,
+                (
+                    toggle_panels,
+                    click_buttons,
+                    use_tab_keys,
+                    use_store_keys,
+                    drag_items,
+                )
+                    .chain()
+                    .in_set(Phase::Input),
+            )
             .add_systems(
                 Update,
                 (
                     show_panels,
                     fit_panels,
-                    refresh_slots,
+                    (follow_moved_selection, refresh_slots).chain(),
+                    refresh_item_info,
                     refresh_wardrobe,
                     refresh_gems,
                     refresh_level,
                     refresh_store,
-                    refresh_claim_panel,
                     refresh_topbar_mic,
                     show_toasts,
+                    show_tooltip,
+                    skin_armed,
                 )
                     .in_set(Phase::View),
             );
@@ -443,7 +608,7 @@ pub(crate) fn ink(text: impl Into<String>) -> impl Bundle {
     (label(text), TextColor(INK_COLOR))
 }
 
-fn icon_node(size: f32) -> Node {
+pub(crate) fn icon_node(size: f32) -> Node {
     Node {
         width: px(size),
         height: px(size),
@@ -477,7 +642,7 @@ fn slot_node() -> Node {
 }
 
 /// An item slot drawn with one of the slot images.
-fn slot_cell(assets: &AssetServer, file: &'static str) -> impl Bundle {
+pub(crate) fn slot_cell(assets: &AssetServer, file: &'static str) -> impl Bundle {
     (
         slot_node(),
         sliced(assets, file, SLOT_INSET),
@@ -485,24 +650,28 @@ fn slot_cell(assets: &AssetServer, file: &'static str) -> impl Bundle {
     )
 }
 
-fn item_icon_node(assets: &AssetServer, id: ItemId) -> Option<impl Bundle> {
+pub(crate) fn item_icon_node(assets: &AssetServer, id: ItemId) -> Option<impl Bundle> {
     let def = item(id)?;
     Some((item_icon(assets, def.sprite).node(), icon_node(ICON_SIZE)))
 }
 
 /// The count in a slot's bottom-right corner, when there is more than one.
-fn count_text(count: u16) -> Option<impl Bundle> {
-    (count > 1).then(|| {
-        (
-            label(count.to_string()),
-            Node {
-                position_type: PositionType::Absolute,
-                right: px(COUNT_INSET),
-                bottom: px(COUNT_INSET / 2.0),
-                ..default()
-            },
-        )
-    })
+pub(crate) fn count_text(count: u16) -> Option<impl Bundle> {
+    (count > 1).then(|| (label(count.to_string()), count_node()))
+}
+
+/// An empty count text for a slot whose count is rewritten in place.
+pub(crate) fn count_label() -> impl Bundle {
+    (label(""), count_node())
+}
+
+fn count_node() -> Node {
+    Node {
+        position_type: PositionType::Absolute,
+        right: px(COUNT_INSET),
+        bottom: px(COUNT_INSET / 2.0),
+        ..default()
+    }
 }
 
 /// A tab button's node and art; the one on show is drawn at full brightness.
@@ -660,15 +829,29 @@ pub(crate) fn spawn_centre_panel(
 }
 
 /// The Inventory / Wardrobe tab row at the top of both panels.
-fn bag_tabs(parent: &mut ChildSpawnerCommands, assets: &AssetServer, active: OpenPanel) {
-    parent.spawn(row(SLOT_GAP)).with_children(|tabs| {
-        for (panel, name) in BAG_TABS {
-            tabs.spawn(tab(assets, UiButton::Show(panel), panel == active))
-                .with_children(|button| {
-                    button.spawn(label(name));
-                });
-        }
-    });
+pub(crate) fn bag_tabs(parent: &mut ChildSpawnerCommands, assets: &AssetServer, active: OpenPanel) {
+    let bar = Node {
+        align_items: AlignItems::Center,
+        ..row(SLOT_GAP)
+    };
+    parent
+        .spawn((bar, Hovered::default()))
+        .with_children(|tabs| {
+            tabs.spawn((ink(PREV_TAB_HINT), Hovered::default()));
+            for (panel, name) in BAG_TABS {
+                tabs.spawn(tab(assets, UiButton::Show(panel), panel == active))
+                    .with_children(|button| {
+                        if panel == OpenPanel::Craft {
+                            button.spawn((
+                                ImageNode::new(assets.load(CRAFT_ICON)),
+                                icon_node(TAB_ICON_SIZE),
+                            ));
+                        }
+                        button.spawn(label(name));
+                    });
+            }
+            tabs.spawn((ink(NEXT_TAB_HINT), Hovered::default()));
+        });
 }
 
 fn spawn_hud(
@@ -732,7 +915,16 @@ fn spawn_hud(
     };
     commands.spawn(column).with_children(|column| {
         column.spawn((label(""), Toast::default()));
-        column.spawn((label(""), SelectedName));
+        column
+            .spawn(Node {
+                column_gap: px(HUD_MARGIN),
+                align_items: AlignItems::Center,
+                ..default()
+            })
+            .with_children(|line| {
+                line.spawn((label(""), SelectedName));
+                line.spawn((row(HUD_MARGIN), ModLine));
+            });
         column.spawn((row(SLOT_GAP), HotbarRow));
     });
 
@@ -889,37 +1081,41 @@ fn spawn_hud(
             }
         });
 
-    // Claim panel: top-right corner under the top bar, shown while a claim is inspected with the wrench.
-    let claim = Node {
-        position_type: PositionType::Absolute,
-        right: px(HUD_MARGIN),
-        top: px(TOPBAR_HEIGHT + 2.0 * HUD_MARGIN),
-        padding: UiRect::all(px(PANEL_PADDING / 2.0)),
-        flex_direction: FlexDirection::Column,
-        row_gap: px(HUD_MARGIN),
-        display: Display::None,
-        ..default()
-    };
-    commands
-        .spawn((
-            claim,
-            ClaimPanel,
-            Hovered::default(),
-            BackgroundColor(WINDOW_COLOR),
-        ))
-        .with_children(|panel| {
-            panel.spawn((label(""), ClaimInfo));
-            panel
-                .spawn((
-                    button_node(),
-                    UiButton::ToggleClaimPublic,
-                    Hovered::default(),
-                    BackgroundColor(BUTTON_COLOR),
-                ))
-                .with_children(|button| {
-                    button.spawn((label(""), ClaimPublicLabel));
-                });
-        });
+    // Above everything and invisible to picking, so the slot under it stays the hovered one.
+    commands.spawn((
+        DragGhost,
+        Node {
+            position_type: PositionType::Absolute,
+            display: Display::None,
+            ..icon_node(ICON_SIZE)
+        },
+        ImageNode::default(),
+        GlobalZIndex(i32::MAX),
+        Pickable::IGNORE,
+    ));
+
+    // The shared tooltip: on top of the panels and invisible to picking, so the cell under the
+    // pointer stays the hovered one (`show_tooltip`).
+    commands.spawn((
+        Tooltip,
+        Node {
+            position_type: PositionType::Absolute,
+            max_width: px(TOOLTIP_MAX_WIDTH),
+            padding: UiRect::all(px(TOOLTIP_INSET * KIT_SCALE)),
+            flex_direction: FlexDirection::Column,
+            row_gap: px(SLOT_GAP),
+            display: Display::None,
+            ..default()
+        },
+        sliced(&assets, TOOLTIP_IMAGE, TOOLTIP_INSET),
+        GlobalZIndex(i32::MAX - 1),
+        tip_part(),
+    ));
+}
+
+/// Every node of the tooltip: never under the pointer, but counted by `pointer_over_ui` alike.
+fn tip_part() -> (Pickable, Hovered) {
+    (Pickable::IGNORE, Hovered::default())
 }
 
 pub(crate) fn button_node() -> Node {
@@ -932,8 +1128,17 @@ pub(crate) fn button_node() -> Node {
     }
 }
 
-/// E/I opens the inventory or closes the inventory/wardrobe window, B the store; Escape closes.
-fn toggle_panels(keys: Res<ButtonInput<KeyCode>>, mut open: ResMut<OpenPanel>) {
+/// E/I opens the inventory or closes the inventory/wardrobe window, B the store; Escape closes
+/// (an armed store purchase is disarmed first).
+fn toggle_panels(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut open: ResMut<OpenPanel>,
+    mut armed: ResMut<ArmedBuy>,
+) {
+    if keys.just_pressed(CLOSE_KEY) && armed.0.is_some() {
+        armed.0 = None;
+        return;
+    }
     let next = if keys.any_just_pressed(INVENTORY_KEYS) {
         match *open {
             OpenPanel::Inventory | OpenPanel::Wardrobe => OpenPanel::None,
@@ -1002,12 +1207,12 @@ fn carried_slots(me: &Player) -> Vec<usize> {
 
 /// A left click on a HUD element, or a number key: select, switch panels, or ask the rules for
 /// something.
-#[allow(clippy::too_many_arguments)] // two input devices, four view states, two outputs
+#[allow(clippy::too_many_arguments)] // two input devices, view states, outputs
 fn click_buttons(
+    time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
     game: Res<Game>,
-    inspected: Res<InspectedClaim>,
     buttons: Query<(&UiButton, &Hovered)>,
     mut selected: ResMut<Selected>,
     mut wardrobe: ResMut<WardrobeSelected>,
@@ -1015,10 +1220,12 @@ fn click_buttons(
     mut open: ResMut<OpenPanel>,
     mut tab: ResMut<StoreTab>,
     mut settings_tab: ResMut<SettingsTab>,
+    mut armed: ResMut<ArmedBuy>,
     mut actions: MessageWriter<ActionMsg>,
     mut chat: MessageWriter<OpenChat>,
     mut sfx: MessageWriter<Sfx>,
 ) {
+    let now = time.elapsed_secs();
     let by_key = SELECT_KEYS
         .iter()
         .position(|&key| keys.just_pressed(key))
@@ -1030,6 +1237,15 @@ fn click_buttons(
         .filter(|_| mouse.just_pressed(MouseButton::Left));
     if clicked.is_some() {
         sfx.write(Sfx::UiClick);
+    }
+    // Disarmed by time, by the store closing, or by a click anywhere but the armed entry.
+    let disarm = armed.0.is_some_and(|(button, until)| {
+        now > until
+            || *open != OpenPanel::Store
+            || (mouse.just_pressed(MouseButton::Left) && clicked != Some(button))
+    });
+    if disarm {
+        armed.0 = None;
     }
     let slot = match clicked {
         Some(UiButton::Slot(index)) => Some(index),
@@ -1066,21 +1282,9 @@ fn click_buttons(
             }
             None
         }
-        Some(UiButton::Buy(item)) => {
-            actions.write(ActionMsg(Action::Buy { item }));
-            None
-        }
-        Some(UiButton::BuyUpgrade) => {
-            actions.write(ActionMsg(Action::BuyBackpackUpgrade));
-            None
-        }
-        Some(UiButton::ToggleClaimPublic) => {
-            let claim = inspected.0.and_then(|(x, y)| {
-                let claim = game.0.world.claim(World::tile_key(x, y)?)?;
-                Some((x, y, !claim.public))
-            });
-            if let Some((x, y, public)) = claim {
-                actions.write(ActionMsg(Action::SetClaimPublic { x, y, public }));
+        Some(button @ (UiButton::Buy(_) | UiButton::BuyUpgrade)) => {
+            if let Some(me) = game.me() {
+                buy_or_arm(button, me, now, &mut armed, &mut actions);
             }
             None
         }
@@ -1113,11 +1317,151 @@ fn click_buttons(
     }
 }
 
+/// The raw slot (`Inventory::slots` index) to send as `MoveItem::to` when the item in raw slot
+/// `from` is dropped on view place `position` (hotbar or grid cell, `CarriedCell`). `carried` is
+/// `carried_slots`, `len` the number of slots. On a filled place: that item's raw slot, so the two
+/// swap (`Inventory::move_slot`) and the dragged item shows at `position`. On an empty place: `len`,
+/// past the end, which moves the item to the end of the inventory, making it the last
+/// non-equipment item shown (equipment after it is never shown). `None` when nothing would change.
+fn move_target(carried: &[usize], len: usize, from: usize, position: usize) -> Option<u16> {
+    let to = match carried.get(position) {
+        Some(&to) => to,
+        None if carried.last() == Some(&from) => return None,
+        None => len,
+    };
+    (to != from).then(|| u16::try_from(to).ok()).flatten()
+}
+
+/// Whether a press at `at` has moved far enough to `cursor` to be a drag.
+fn drag_moved(at: Vec2, cursor: Vec2) -> bool {
+    at.distance(cursor) >= DRAG_THRESHOLD
+}
+
+/// What a release does: a move only for a real drag over an inventory place (`position`); a press
+/// that never moved was a click, and a release anywhere else cancels.
+fn drop_action(
+    drag: ItemDrag,
+    position: Option<usize>,
+    carried: &[usize],
+    len: usize,
+) -> Option<Action> {
+    let ItemDrag::Dragging { from } = drag else {
+        return None;
+    };
+    let to = move_target(carried, len, from, position?)?;
+    Some(Action::MoveItem {
+        from: u16::try_from(from).ok()?,
+        to,
+    })
+}
+
+/// Where slot `index` is after `Inventory::move_slot(from, to)` on `len` slots.
+fn index_after_move(index: usize, from: usize, to: usize, len: usize) -> usize {
+    match (to < len, index) {
+        (true, i) if i == from => to,
+        (true, i) if i == to => from,
+        (false, i) if i == from => len.saturating_sub(1),
+        (false, i) if i > from => i - 1,
+        (_, i) => i,
+    }
+}
+
+/// The selection follows its item when the rules move it.
+fn follow_moved_selection(
+    game: Res<Game>,
+    mut events: MessageReader<GameEvent>,
+    mut selected: ResMut<Selected>,
+) {
+    let Some(len) = game.me().map(|me| me.inventory.slots().len()) else {
+        return;
+    };
+    for GameEvent(event) in events.read() {
+        if let Event::InventoryMoved { player, from, to } = *event
+            && player == game.1
+        {
+            let index = index_after_move(selected.0, from.into(), to.into(), len);
+            if selected.0 != index {
+                selected.0 = index;
+            }
+        }
+    }
+}
+
+/// Press on a filled hotbar or inventory cell and move: the item's icon follows the pointer;
+/// releasing it on another cell asks the rules to move it there (`MoveItem`). The slots are redrawn
+/// from the `InventoryMoved` that comes back, never here. The press itself still selects
+/// (`click_buttons`). A panel opening or closing cancels the drag.
+#[allow(clippy::too_many_arguments)] // input, cells, state, the ghost and the action output
+fn drag_items(
+    mut commands: Commands,
+    assets: Res<AssetServer>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    game: Res<Game>,
+    open: Res<OpenPanel>,
+    cells: Query<(&CarriedCell, &Hovered, Option<&UiButton>)>,
+    mut drag: ResMut<ItemDrag>,
+    ghost: Single<(Entity, &mut Node), With<DragGhost>>,
+    mut actions: MessageWriter<ActionMsg>,
+) {
+    let (ghost, mut ghost_node) = ghost.into_inner();
+    let cursor = window.cursor_position();
+    let hovered = cells.iter().find(|(_, hovered, _)| hovered.get());
+    let next = match *drag {
+        ItemDrag::Idle => match (hovered, cursor) {
+            (Some((_, _, Some(&UiButton::Slot(from)))), Some(at))
+                if mouse.just_pressed(MouseButton::Left) =>
+            {
+                ItemDrag::Pressed { from, at }
+            }
+            _ => ItemDrag::Idle,
+        },
+        _ if open.is_changed() => ItemDrag::Idle,
+        current if !mouse.pressed(MouseButton::Left) => {
+            if let Some(me) = game.me() {
+                let position = hovered.map(|(cell, _, _)| cell.0);
+                let len = me.inventory.slots().len();
+                if let Some(action) = drop_action(current, position, &carried_slots(me), len) {
+                    actions.write(ActionMsg(action));
+                }
+            }
+            ItemDrag::Idle
+        }
+        ItemDrag::Pressed { from, at } if cursor.is_some_and(|c| drag_moved(at, c)) => {
+            let sprite = game
+                .me()
+                .and_then(|me| me.inventory.slots().get(from))
+                .and_then(|&(id, _)| item(id));
+            if let Some(def) = sprite {
+                let mut icon = item_icon(&assets, def.sprite).node();
+                icon.color = icon.color.with_alpha(DRAG_GHOST_ALPHA);
+                commands.entity(ghost).insert(icon);
+            }
+            ItemDrag::Dragging { from }
+        }
+        current => current,
+    };
+    drag.set_if_neq(next);
+    let display = match (next, cursor) {
+        (ItemDrag::Dragging { .. }, Some(cursor)) => {
+            let corner = cursor - Vec2::splat(ICON_SIZE / 2.0);
+            ghost_node.left = px(corner.x);
+            ghost_node.top = px(corner.y);
+            Display::Flex
+        }
+        _ => Display::None,
+    };
+    if ghost_node.display != display {
+        ghost_node.display = display;
+    }
+}
+
 /// One inventory slot: empty, or an item with its count. `index` is into `Inventory::slots`.
 fn spawn_inventory_slot(
     parent: &mut ChildSpawnerCommands,
     assets: &AssetServer,
     me: &Player,
+    position: usize,
     index: Option<usize>,
     selected: usize,
 ) {
@@ -1126,23 +1470,23 @@ fn spawn_inventory_slot(
     } else {
         SLOT_IMAGE
     };
-    let mut cell = parent.spawn(slot_cell(assets, file));
+    let mut cell = parent.spawn((slot_cell(assets, file), CarriedCell(position)));
     let Some((index, &(id, count))) = index.and_then(|i| Some((i, me.inventory.slots().get(i)?)))
     else {
         return;
     };
-    cell.insert(UiButton::Slot(index)).with_children(|cell| {
-        if let Some(icon) = item_icon_node(assets, id) {
-            cell.spawn(icon);
-        }
-        if let Some(count) = count_text(count) {
-            cell.spawn(count);
-        }
-    });
+    cell.insert((UiButton::Slot(index), ItemTip(Some((id, count)))))
+        .with_children(|cell| {
+            if let Some(icon) = item_icon_node(assets, id) {
+                cell.spawn(icon);
+            }
+            if let Some(count) = count_text(count) {
+                cell.spawn(count);
+            }
+        });
 }
 
 /// Rebuilds the hotbar and the inventory grid from the player.
-#[allow(clippy::too_many_arguments)] // two containers and the name line
 fn refresh_slots(
     mut commands: Commands,
     assets: Res<AssetServer>,
@@ -1151,12 +1495,11 @@ fn refresh_slots(
     mut events: MessageReader<GameEvent>,
     hotbar: Single<Entity, With<HotbarRow>>,
     grid: Single<Entity, With<InventoryGrid>>,
-    mut name: Single<&mut Text, With<SelectedName>>,
 ) {
     let inventory_changed = events.read().any(|GameEvent(event)| match *event {
-        Event::InventoryChanged { player, .. } | Event::BackpackUpgraded { player, .. } => {
-            player == game.1
-        }
+        Event::InventoryChanged { player, .. }
+        | Event::BackpackUpgraded { player, .. }
+        | Event::InventoryMoved { player, .. } => player == game.1,
         _ => false,
     });
     // `selected` also reads as changed on the first run, which fills the HUD once at startup.
@@ -1164,20 +1507,13 @@ fn refresh_slots(
         return;
     }
     let Some(me) = game.me() else { return };
-    let selected_name = selected
-        .item(&game)
-        .and_then(item)
-        .map_or("", |def| def.name);
-    if name.0 != selected_name {
-        name.0 = selected_name.to_string();
-    }
     let carried = carried_slots(me);
     commands
         .entity(*hotbar)
         .despawn_children()
         .with_children(|row| {
             for n in 0..HOTBAR_SLOTS {
-                spawn_inventory_slot(row, &assets, me, carried.get(n).copied(), selected.0);
+                spawn_inventory_slot(row, &assets, me, n, carried.get(n).copied(), selected.0);
             }
         });
     // Free backpack slots are shown empty after the items.
@@ -1188,8 +1524,8 @@ fn refresh_slots(
         .entity(*grid)
         .despawn_children()
         .with_children(|grid| {
-            for index in cells {
-                spawn_inventory_slot(grid, &assets, me, index, selected.0);
+            for (position, index) in cells.enumerate() {
+                spawn_inventory_slot(grid, &assets, me, position, index, selected.0);
             }
         });
 }
@@ -1230,7 +1566,11 @@ fn refresh_wardrobe(
                     match me.worn(slot) {
                         Some(id) => {
                             column
-                                .spawn((slot_cell(&assets, SLOT_WORN_IMAGE), UiButton::Worn(slot)))
+                                .spawn((
+                                    slot_cell(&assets, SLOT_WORN_IMAGE),
+                                    UiButton::Worn(slot),
+                                    ItemTip(Some((id, 1))),
+                                ))
                                 .with_children(|cell| {
                                     if let Some(icon) = item_icon_node(&assets, id) {
                                         cell.spawn(icon);
@@ -1302,28 +1642,32 @@ fn refresh_wardrobe(
                     (false, true) => SLOT_WORN_IMAGE,
                     (false, false) => SLOT_IMAGE,
                 };
-                grid.spawn((slot_cell(&assets, file), UiButton::Equip(id)))
-                    .with_children(|cell| {
-                        if let Some(icon) = item_icon_node(&assets, id) {
-                            cell.spawn(icon);
-                        }
-                        if let Some(count) = count_text(count) {
-                            cell.spawn(count);
-                        }
-                        // The selection rim hides the worn badge: say it in words.
-                        if is_selected && worn {
-                            cell.spawn((
-                                label("worn"),
-                                TextColor(WORN_TEXT_COLOR),
-                                Node {
-                                    position_type: PositionType::Absolute,
-                                    left: px(COUNT_INSET),
-                                    top: px(COUNT_INSET / 2.0),
-                                    ..default()
-                                },
-                            ));
-                        }
-                    });
+                grid.spawn((
+                    slot_cell(&assets, file),
+                    UiButton::Equip(id),
+                    ItemTip(Some((id, count))),
+                ))
+                .with_children(|cell| {
+                    if let Some(icon) = item_icon_node(&assets, id) {
+                        cell.spawn(icon);
+                    }
+                    if let Some(count) = count_text(count) {
+                        cell.spawn(count);
+                    }
+                    // The selection rim hides the worn badge: say it in words.
+                    if is_selected && worn {
+                        cell.spawn((
+                            label("worn"),
+                            TextColor(WORN_TEXT_COLOR),
+                            Node {
+                                position_type: PositionType::Absolute,
+                                left: px(COUNT_INSET),
+                                top: px(COUNT_INSET / 2.0),
+                                ..default()
+                            },
+                        ));
+                    }
+                });
             }
         });
 }
@@ -1404,6 +1748,8 @@ fn refresh_store(
     assets: Res<AssetServer>,
     game: Res<Game>,
     tab: Res<StoreTab>,
+    armed: Res<ArmedBuy>,
+    focus: Res<StoreFocus>,
     mut events: MessageReader<GameEvent>,
     list: Single<Entity, With<StoreList>>,
     old_grid: Query<&ScrollPosition, With<StoreGrid>>,
@@ -1417,11 +1763,13 @@ fn refresh_store(
                 | Event::InventoryChanged { .. }
         )
     });
-    if !changed && !tab.is_changed() && *filled {
+    if !changed && !tab.is_changed() && !armed.is_changed() && !focus.is_changed() && *filled {
         return;
     }
     *filled = true;
     let Some(me) = game.me() else { return };
+    let armed = armed.0.map(|(button, _)| button);
+    let focused = store_entries(*tab).get(focus.0).copied();
     let scroll = old_grid
         .iter()
         .next()
@@ -1435,26 +1783,36 @@ fn refresh_store(
         ..default()
     };
     commands.entity(*list).with_children(|list| {
-        list.spawn(tabs).with_children(|tabs| {
-            for (choice, name) in STORE_TABS {
-                tabs.spawn(tab_bundle(&assets, choice, *tab))
-                    .with_children(|button| {
-                        button.spawn(label(name));
-                    });
-            }
-        });
+        // The balance, top right, in the price style; clear of the close button.
+        let balance = Node {
+            justify_content: JustifyContent::FlexEnd,
+            align_items: AlignItems::Center,
+            column_gap: px(SLOT_GAP),
+            margin: UiRect::right(px(CLOSE_SIZE - CLOSE_OVERHANG - PANEL_PADDING)),
+            ..default()
+        };
+        list.spawn((balance, Hovered::default()))
+            .with_children(|balance| {
+                balance.spawn(gem_icon(&assets));
+                balance.spawn((label(me.gems.to_string()), TextColor(INK_COLOR)));
+            });
+        list.spawn((tabs, Hovered::default()))
+            .with_children(|tabs| {
+                tabs.spawn((ink(PREV_TAB_HINT), Hovered::default()));
+                for (choice, name) in STORE_TABS {
+                    tabs.spawn(tab_bundle(&assets, choice, *tab))
+                        .with_children(|button| {
+                            button.spawn(label(name));
+                        });
+                }
+                tabs.spawn((ink(NEXT_TAB_HINT), Hovered::default()));
+            });
     });
     let StoreTab::Equip(slot) = *tab else {
-        claims_and_backpack(&mut commands, &assets, me, *list);
+        claims_and_backpack(&mut commands, &assets, me, *list, armed, focused);
         return;
     };
-    let offered = ITEMS
-        .iter()
-        .filter(|def| def.kind == ItemKind::Equip(slot))
-        .filter_map(|def| Some((def, equip_price(def.id)?)));
-    let mut offered: Vec<_> = offered.collect();
-    // Cheapest first; the table order (stable) within one price.
-    offered.sort_by_key(|&(_, price)| price);
+    let offered = store_offer(slot);
     commands.entity(*list).with_children(|list| {
         list.spawn(ink("Green badge: owned. Click to buy."));
         let grid = scroll_grid(list, (StoreGrid, ScrollPosition(scroll)));
@@ -1467,46 +1825,355 @@ fn refresh_store(
                 } else {
                     (DISABLED_TEXT_COLOR, DISABLED_ICON_COLOR)
                 };
-                let file = if owned { SLOT_WORN_IMAGE } else { SLOT_IMAGE };
+                let button = UiButton::Buy(def.id);
+                let is_armed = armed == Some(button);
+                // Armed: the frame becomes the button (the strip says the rest).
+                let (file, inset) = if is_armed {
+                    (BUY_IMAGE, BUY_INSET)
+                } else if focused == Some(button) {
+                    (SLOT_SELECTED_IMAGE, SLOT_INSET)
+                } else if owned {
+                    (SLOT_WORN_IMAGE, SLOT_INSET)
+                } else {
+                    (SLOT_IMAGE, SLOT_INSET)
+                };
                 let cell = Node {
                     width: px(SLOT_SIZE),
                     flex_direction: FlexDirection::Column,
                     align_items: AlignItems::Center,
                     ..default()
                 };
-                grid.spawn((cell, UiButton::Buy(def.id), Hovered::default()))
+                grid.spawn((cell, button, ItemTip(Some((def.id, 1))), Hovered::default()))
                     .with_children(|cell| {
-                        cell.spawn((slot_node(), sliced(&assets, file, SLOT_INSET)))
-                            .with_children(|slot| {
-                                let mut icon = item_icon(&assets, def.sprite).node();
-                                icon.color = tint;
-                                slot.spawn((icon, icon_node(ICON_SIZE)));
-                            });
-                        cell.spawn((label(price.to_string()), TextColor(text)));
+                        let mut frame = cell.spawn((
+                            slot_node(),
+                            sliced(&assets, file, inset),
+                            Hovered::default(),
+                        ));
+                        if is_armed {
+                            frame.insert(ArmedArt);
+                        }
+                        frame.with_children(|slot| {
+                            let mut icon = item_icon(&assets, def.sprite).node();
+                            icon.color = tint;
+                            slot.spawn((icon, icon_node(ICON_SIZE)));
+                        });
+                        if is_armed {
+                            cell.spawn((label(BUY_SHORT_TEXT), TextColor(INK_COLOR)));
+                        } else {
+                            let line = Node {
+                                column_gap: px(SLOT_GAP / 2.0),
+                                align_items: AlignItems::Center,
+                                ..default()
+                            };
+                            cell.spawn((line, Hovered::default()))
+                                .with_children(|line| {
+                                    line.spawn(gem_icon(&assets));
+                                    line.spawn((label(price.to_string()), TextColor(text)));
+                                });
+                        }
                     });
             }
         });
     });
 }
 
+/// The gem icon in front of a price, one text line high.
+fn gem_icon(assets: &AssetServer) -> impl Bundle {
+    (
+        ImageNode::new(assets.load(GEM_ICON)),
+        icon_node(MOD_ICON_SIZE),
+    )
+}
+
+/// The armed price of a claim row (U7): primary button art saying "Buy for <gem> <price>?", the
+/// full row height.
+fn armed_price(parent: &mut ChildSpawnerCommands, assets: &AssetServer, price: u32) {
+    let node = Node {
+        min_height: px(TOUCH_MIN),
+        padding: UiRect::axes(px(BUY_INSET), px(SLOT_GAP)),
+        column_gap: px(SLOT_GAP),
+        justify_content: JustifyContent::Center,
+        align_items: AlignItems::Center,
+        align_self: AlignSelf::Stretch,
+        flex_shrink: 0.0,
+        ..default()
+    };
+    let words = |text: String| (label(text), TextColor(Color::WHITE), TextShadow::default());
+    parent
+        .spawn((
+            node,
+            sliced(assets, BUY_IMAGE, BUY_INSET),
+            ArmedArt,
+            Hovered::default(),
+        ))
+        .with_children(|button| {
+            button.spawn(words(BUY_CONFIRM_TEXT.to_string()));
+            button
+                .spawn((row(SLOT_GAP / 2.0), Hovered::default()))
+                .with_children(|amount| {
+                    amount.spawn(gem_icon(assets));
+                    amount.spawn(words(format!("{price}?")));
+                });
+        });
+}
+
+/// The armed price cell's art follows the pointer.
+fn skin_armed(
+    assets: Res<AssetServer>,
+    mut buttons: Query<(&Hovered, &mut ImageNode), With<ArmedArt>>,
+) {
+    for (hovered, mut image) in &mut buttons {
+        let file = if hovered.get() {
+            BUY_HOVER_IMAGE
+        } else {
+            BUY_IMAGE
+        };
+        if image
+            .image
+            .path()
+            .is_none_or(|path| path.to_string() != file)
+        {
+            image.image = assets.load(file);
+        }
+    }
+}
+
+/// Whether buying at `price` with `gems` takes a second click: expensive, and affordable (an
+/// unaffordable click goes straight to the rules, which answer `Not enough gems`).
+fn needs_confirm(price: u32, gems: u32) -> bool {
+    price >= CONFIRM_PRICE && gems >= price
+}
+
+/// The store price behind a buy button; `None` when there is nothing to buy.
+fn buy_price(button: UiButton, me: &Player) -> Option<u32> {
+    match button {
+        UiButton::Buy(id) => claim_kind(id)
+            .map(|kind| kind.price)
+            .or_else(|| equip_price(id)),
+        UiButton::BuyUpgrade => {
+            let upgrades = me.inventory.upgrades();
+            (upgrades < MAX_UPGRADES).then(|| upgrade_cost(upgrades))
+        }
+        _ => None,
+    }
+}
+
+/// A click (or Enter / South on the focused entry) on a buy button: arms an expensive one, else
+/// sends the purchase. The confirm only delays sending; the rules still decide.
+fn buy_or_arm(
+    button: UiButton,
+    me: &Player,
+    now: f32,
+    armed: &mut ArmedBuy,
+    actions: &mut MessageWriter<ActionMsg>,
+) {
+    let was_armed = armed.0.map(|(b, _)| b);
+    let confirm = buy_price(button, me).is_some_and(|price| needs_confirm(price, me.gems));
+    if confirm && was_armed != Some(button) {
+        armed.0 = Some((button, now + CONFIRM_SECS));
+        return;
+    }
+    if armed.0.is_some() {
+        armed.0 = None;
+    }
+    actions.write(ActionMsg(match button {
+        UiButton::Buy(item) => Action::Buy { item },
+        _ => Action::BuyBackpackUpgrade,
+    }));
+}
+
+/// The equipment of one slot on sale, cheapest first (table order within one price).
+fn store_offer(slot: Slot) -> Vec<(&'static ItemDef, u32)> {
+    let mut offered: Vec<_> = ITEMS
+        .iter()
+        .filter(|def| def.kind == ItemKind::Equip(slot))
+        .filter_map(|def| Some((def, equip_price(def.id)?)))
+        .collect();
+    offered.sort_by_key(|&(_, price)| price);
+    offered
+}
+
+/// The store tab's entries in the order shown, for the keyboard / gamepad focus.
+fn store_entries(tab: StoreTab) -> Vec<UiButton> {
+    match tab {
+        StoreTab::Claims => CLAIMS
+            .iter()
+            .filter(|kind| item(kind.item).is_some())
+            .map(|kind| UiButton::Buy(kind.item))
+            .chain([UiButton::BuyUpgrade])
+            .collect(),
+        StoreTab::Equip(slot) => store_offer(slot)
+            .into_iter()
+            .map(|(def, _)| UiButton::Buy(def.id))
+            .collect(),
+    }
+}
+
+/// While the store is open: arrows / d-pad, Enter / South and East, taken from the keyboard so the
+/// player does not also walk.
+fn take_store_keys(
+    open: Res<OpenPanel>,
+    mut keys: ResMut<ButtonInput<KeyCode>>,
+    pads: Query<&Gamepad>,
+    mut out: ResMut<StoreKeys>,
+) {
+    if *open != OpenPanel::Store {
+        return;
+    }
+    let pad = |button| pads.iter().any(|pad| pad.just_pressed(button));
+    let key = |code| keys.just_pressed(code);
+    let dx = i32::from(key(KeyCode::ArrowRight) || pad(GamepadButton::DPadRight))
+        - i32::from(key(KeyCode::ArrowLeft) || pad(GamepadButton::DPadLeft));
+    let dy = i32::from(key(KeyCode::ArrowDown) || pad(GamepadButton::DPadDown))
+        - i32::from(key(KeyCode::ArrowUp) || pad(GamepadButton::DPadUp));
+    if dx != 0 || dy != 0 {
+        out.step = Some((dx, dy));
+    }
+    out.activate |= key(STORE_ACTIVATE_KEY) || pad(GamepadButton::South);
+    out.back |= pad(GamepadButton::East);
+    for code in STORE_NAV_KEYS.into_iter().chain([STORE_ACTIVATE_KEY]) {
+        if keys.pressed(code) {
+            keys.reset(code);
+        }
+    }
+}
+
+/// The `[` / `]` keys and LB / RB while a tabbed panel is open, kept from the game and the chat.
+fn take_tab_keys(
+    open: Res<OpenPanel>,
+    mut keys: ResMut<ButtonInput<KeyCode>>,
+    pads: Query<&Gamepad>,
+    mut out: ResMut<TabKeys>,
+) {
+    let tabbed = *open == OpenPanel::Store || BAG_TABS.iter().any(|(panel, _)| *panel == *open);
+    if !tabbed {
+        return;
+    }
+    let pad = |button| pads.iter().any(|pad| pad.just_pressed(button));
+    out.0 += i32::from(keys.just_pressed(NEXT_TAB_KEY) || pad(GamepadButton::RightTrigger))
+        - i32::from(keys.just_pressed(PREV_TAB_KEY) || pad(GamepadButton::LeftTrigger));
+    for code in [PREV_TAB_KEY, NEXT_TAB_KEY] {
+        if keys.pressed(code) {
+            keys.reset(code);
+        }
+    }
+}
+
+/// `index` moved by `step` in a list of `len`, wrapping around.
+fn cycle(index: usize, len: usize, step: i32) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    (index as i64 + i64::from(step)).rem_euclid(len as i64) as usize
+}
+
+/// Switches the tab of the open panel: the store's category, or the bag's panel. Focus goes back
+/// to the first entry (`use_store_keys`, `craft_ui::use_keys`).
+fn use_tab_keys(
+    mut keys: ResMut<TabKeys>,
+    mut open: ResMut<OpenPanel>,
+    mut tab: ResMut<StoreTab>,
+    mut sfx: MessageWriter<Sfx>,
+) {
+    let step = std::mem::take(&mut keys.0);
+    if step == 0 {
+        return;
+    }
+    if *open == OpenPanel::Store {
+        let at = STORE_TABS.iter().position(|(t, _)| *t == *tab).unwrap_or(0);
+        tab.set_if_neq(STORE_TABS[cycle(at, STORE_TABS.len(), step)].0);
+    } else if let Some(at) = BAG_TABS.iter().position(|(panel, _)| *panel == *open) {
+        open.set_if_neq(BAG_TABS[cycle(at, BAG_TABS.len(), step)].0);
+    } else {
+        return;
+    }
+    sfx.write(Sfx::UiClick);
+}
+
+/// The store's focus: moved by the arrows, a click by Enter / South (arm, then buy), East
+/// disarms first, then closes (Esc does the same in `toggle_panels`).
+#[allow(clippy::too_many_arguments)] // a Bevy system
+fn use_store_keys(
+    time: Res<Time>,
+    game: Res<Game>,
+    tab: Res<StoreTab>,
+    mut open: ResMut<OpenPanel>,
+    mut keys: ResMut<StoreKeys>,
+    mut focus: ResMut<StoreFocus>,
+    mut armed: ResMut<ArmedBuy>,
+    mut actions: MessageWriter<ActionMsg>,
+    mut sfx: MessageWriter<Sfx>,
+) {
+    let StoreKeys {
+        step,
+        activate,
+        back,
+    } = std::mem::take(&mut *keys);
+    if (open.is_changed() || tab.is_changed()) && focus.0 != 0 {
+        focus.0 = 0;
+    }
+    if *open != OpenPanel::Store {
+        return;
+    }
+    let Some(me) = game.me() else { return };
+    let entries = store_entries(*tab);
+    let columns = match *tab {
+        StoreTab::Claims => 1,
+        StoreTab::Equip(_) => STORE_COLUMNS as usize,
+    };
+    if let Some(step) = step {
+        let next = crate::craft_ui::step_index(focus.0, entries.len(), step, columns);
+        if next != focus.0 {
+            focus.0 = next;
+            sfx.write(Sfx::UiClick);
+        }
+    }
+    if activate && let Some(&button) = entries.get(focus.0) {
+        sfx.write(Sfx::UiClick);
+        buy_or_arm(button, me, time.elapsed_secs(), &mut armed, &mut actions);
+    }
+    if back {
+        if armed.0.is_some() {
+            armed.0 = None;
+        } else {
+            *open = OpenPanel::None;
+        }
+    }
+}
+
 fn tab_bundle(assets: &AssetServer, choice: StoreTab, on_show: StoreTab) -> impl Bundle {
     tab(assets, UiButton::Tab(choice), choice == on_show)
 }
 
+/// The store's line under a claim: what it covers (docs/knowledge/ux/claims.md, 6).
+fn claim_coverage(tiles: Option<u32>) -> String {
+    match tiles {
+        Some(n) => format!("Protects the {n} tiles nearest it"),
+        None => "Protects the whole world. Only if no one else has a claim here".to_string(),
+    }
+}
+
+/// Shown above the hotbar while the pointer is on a claim row of the store.
+const CLAIM_ROW_HINT: &str = "Hold it in the world to see the area first";
+
 /// The claims tab: the four claims and the backpack upgrade, one row each.
-fn claims_and_backpack(commands: &mut Commands, assets: &AssetServer, me: &Player, list: Entity) {
+fn claims_and_backpack(
+    commands: &mut Commands,
+    assets: &AssetServer,
+    me: &Player,
+    list: Entity,
+    armed: Option<UiButton>,
+    focused: Option<UiButton>,
+) {
     let upgrades = me.inventory.upgrades();
     let claims = CLAIMS.iter().filter_map(|kind| {
         let def = item(kind.item)?;
-        let size = match kind.tiles {
-            Some(tiles) => format!("{tiles} tiles"),
-            None => "all".to_string(),
-        };
-        let text = format!("{} ({size})", def.name);
         Some((
             UiButton::Buy(kind.item),
             Some(def.sprite),
-            text,
+            def.name.to_string(),
+            Some(claim_coverage(kind.tiles)),
             Some(kind.price),
         ))
     });
@@ -1517,30 +2184,39 @@ fn claims_and_backpack(commands: &mut Commands, assets: &AssetServer, me: &Playe
             "backpack +{SLOTS_PER_UPGRADE} slots (now {})",
             me.inventory.capacity
         ),
+        None,
         (upgrades < MAX_UPGRADES).then(|| upgrade_cost(upgrades)),
     );
     let entries: Vec<_> = claims.chain([upgrade]).collect();
     commands.entity(list).with_children(|list| {
-        for (button, sprite, text, price) in entries {
+        for (button, sprite, text, line, price) in entries {
             let affordable = price.is_some_and(|price| me.gems >= price);
             let colour = if affordable {
                 Color::WHITE
             } else {
                 DISABLED_TEXT_COLOR
             };
-            let price = price.map_or("sold out".to_string(), |price| format!("{price} gems"));
+            let armed_at = price.filter(|_| armed == Some(button));
+            let frame = if focused == Some(button) {
+                SLOT_SELECTED_IMAGE
+            } else {
+                SLOT_IMAGE
+            };
             let row = Node {
                 min_height: px(ROW_MIN_HEIGHT),
                 padding: UiRect::axes(px(ROW_PADDING), px(HUD_MARGIN)),
                 ..button_node()
             };
-            list.spawn((
+            let mut entry = list.spawn((
                 row,
-                sliced(assets, SLOT_IMAGE, SLOT_INSET),
+                sliced(assets, frame, SLOT_INSET),
                 button,
                 Hovered::default(),
-            ))
-            .with_children(|entry| {
+            ));
+            if let UiButton::Buy(id) = button {
+                entry.insert(ItemTip(Some((id, 1))));
+            }
+            entry.with_children(|entry| {
                 match sprite {
                     Some(sprite) => {
                         entry.spawn((item_icon(assets, sprite).node(), icon_node(ROW_ICON_SIZE)))
@@ -1549,51 +2225,457 @@ fn claims_and_backpack(commands: &mut Commands, assets: &AssetServer, me: &Playe
                 };
                 let grow = Node {
                     flex_grow: 1.0,
+                    flex_direction: FlexDirection::Column,
                     ..default()
                 };
-                entry.spawn((label(text), TextColor(colour), grow));
-                entry.spawn((label(price), TextColor(colour)));
+                entry.spawn(grow).with_children(|words| {
+                    words.spawn((label(text), TextColor(colour)));
+                    if let Some(line) = line {
+                        words.spawn((label(line), TextColor(colour)));
+                    }
+                });
+                match (armed_at, price) {
+                    (Some(at), _) => armed_price(entry, assets, at),
+                    (None, Some(price)) => {
+                        let line = Node {
+                            column_gap: px(SLOT_GAP / 2.0),
+                            align_items: AlignItems::Center,
+                            ..default()
+                        };
+                        entry
+                            .spawn((line, Hovered::default()))
+                            .with_children(|line| {
+                                line.spawn(gem_icon(assets));
+                                line.spawn((label(price.to_string()), TextColor(colour)));
+                            });
+                    }
+                    (None, None) => {
+                        entry.spawn((label("sold out"), TextColor(colour)));
+                    }
+                }
             });
         }
     });
 }
 
-/// Owner, size and the public switch of the claim inspected with the wrench.
-fn refresh_claim_panel(
-    game: Res<Game>,
-    inspected: Res<InspectedClaim>,
-    mut events: MessageReader<GameEvent>,
-    mut panel: Single<&mut Node, With<ClaimPanel>>,
-    mut info: Single<&mut Text, (With<ClaimInfo>, Without<ClaimPublicLabel>)>,
-    mut public: Single<&mut Text, (With<ClaimPublicLabel>, Without<ClaimInfo>)>,
-) {
-    let claim_changed = events.read().any(|GameEvent(event)| {
-        matches!(
-            event,
-            Event::ClaimUpdated { .. } | Event::ClaimRemoved { .. }
-        )
-    });
-    if !claim_changed && !inspected.is_changed() {
-        return;
+/// A mod in a few words, for the line beside an item's name.
+pub(crate) fn mod_label(m: Mod) -> String {
+    match m {
+        Mod::ExtraJump => "Extra jump".to_string(),
+        Mod::Glide => "Glide".to_string(),
+        Mod::RunBoost(pct) => format!("+{pct}% run"),
+        Mod::DigBoost(points) => {
+            let times = format!("{:.2}", f32::from(points) / f32::from(FIST_DAMAGE));
+            // 1.50 -> 1.5, 2.00 -> 2.0, 1.25 stays.
+            let times = times.strip_suffix('0').unwrap_or(&times);
+            format!("Dig {times}×")
+        }
+        Mod::Reach(tiles) => format!("+{tiles} reach"),
+        Mod::GemFinder(bonus) => format!("+{bonus} gems"),
     }
-    let claim = inspected
-        .0
-        .and_then(|(x, y)| game.0.world.claim(World::tile_key(x, y)?));
-    let Some(claim) = claim else {
-        panel.display = Display::None;
-        return;
-    };
-    panel.display = Display::Flex;
-    let size = if claim.tiles.is_empty() {
-        "the whole world".to_string()
-    } else {
-        format!("{} tiles", claim.tiles.len())
-    };
-    info.0 = format!("Claim of player {}\n{size}", claim.owner.0);
-    public.0 = format!("Public: {}", if claim.public { "on" } else { "off" });
 }
 
-fn item_name(id: ItemId) -> &'static str {
+pub(crate) fn mod_icon(m: Mod) -> &'static str {
+    match m {
+        Mod::ExtraJump => "ui/mods/mod_extra_jump.png",
+        Mod::Glide => "ui/mods/mod_glide.png",
+        Mod::RunBoost(_) => "ui/mods/mod_run_boost.png",
+        Mod::DigBoost(_) => "ui/mods/mod_dig_boost.png",
+        Mod::Reach(_) => "ui/mods/mod_reach.png",
+        Mod::GemFinder(_) => "ui/mods/mod_gem_finder.png",
+    }
+}
+
+/// An icon and a label per mod of `id`, into a row; nothing for an item without mods.
+pub(crate) fn spawn_mods(
+    row: &mut ChildSpawnerCommands,
+    assets: &AssetServer,
+    id: ItemId,
+    color: Color,
+) {
+    for m in mods_of(id) {
+        spawn_mod_entry(row, assets, m, color);
+    }
+}
+
+/// One mod: its icon and its label.
+fn spawn_mod_entry(row: &mut ChildSpawnerCommands, assets: &AssetServer, m: Mod, color: Color) {
+    row.spawn(Node {
+        column_gap: px(SLOT_GAP),
+        align_items: AlignItems::Center,
+        ..default()
+    })
+    .with_children(|entry| {
+        entry.spawn((
+            ImageNode::new(assets.load(mod_icon(m))),
+            icon_node(MOD_ICON_SIZE),
+        ));
+        entry.spawn((label(mod_label(m)), TextColor(color)));
+    });
+}
+
+/// What the tooltip and the selection strip say about an item (U3): lines left out when there is
+/// nothing to say.
+#[derive(Clone, PartialEq, Debug)]
+struct ItemInfo {
+    /// Name in title case, with the count when more than one.
+    title: String,
+    mods: Vec<Mod>,
+    /// What it is (`kind_line`).
+    kind: Option<String>,
+    /// Store only: the price and whether the player can pay it.
+    price: Option<(u32, bool)>,
+}
+
+fn item_info(id: ItemId, count: u16, worn: bool, price: Option<(u32, bool)>) -> Option<ItemInfo> {
+    let def = item(id)?;
+    let name = title_case(def.name);
+    Some(ItemInfo {
+        title: if count > 1 {
+            format!("{name} ×{count}")
+        } else {
+            name
+        },
+        mods: mods_of(id).collect(),
+        kind: kind_line(def, worn),
+        price,
+    })
+}
+
+/// "golden pickaxe" -> "Golden Pickaxe".
+fn title_case(name: &str) -> String {
+    let word = |w: &str| {
+        let mut chars = w.chars();
+        chars.next().map_or_else(String::new, |first| {
+            first.to_uppercase().chain(chars).collect()
+        })
+    };
+    name.split(' ').map(word).collect::<Vec<_>>().join(" ")
+}
+
+/// Seconds as "45s", "3m 20s", "1h 5m" (a zero last part is left out).
+fn duration_text(secs: u64) -> String {
+    match (secs / 3600, secs / 60 % 60, secs % 60) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, 0) => format!("{m}m"),
+        (0, m, s) => format!("{m}m {s}s"),
+        (h, 0, _) => format!("{h}h"),
+        (h, m, _) => format!("{h}h {m}m"),
+    }
+}
+
+/// Tooltip line 3: what the item is, by kind.
+fn kind_line(def: &ItemDef, worn: bool) -> Option<String> {
+    Some(match def.kind {
+        _ if def.id == WORKBENCH => format!("Block{SEP}wrench it to craft"),
+        ItemKind::Seed => format!(
+            "Plant on soil{SEP}grows in {}",
+            duration_text(grow_seconds(def.rarity))
+        ),
+        ItemKind::Block => match def.hits {
+            0 => "Block".to_string(),
+            1 => format!("Block{SEP}1 punch"),
+            hits => format!("Block{SEP}{hits} punches"),
+        },
+        ItemKind::Background => "Background".to_string(),
+        ItemKind::Claim => claim_coverage(claim_kind(def.id)?.tiles),
+        ItemKind::Tool if def.id == WRENCH => "Click your claim or a Workbench".to_string(),
+        ItemKind::Tool if def.id == FIST => "Punch blocks, harvest trees".to_string(),
+        ItemKind::Tool => return None,
+        ItemKind::Equip(slot) => {
+            let worn = if worn {
+                format!("{SEP}worn")
+            } else {
+                String::new()
+            };
+            format!("{slot:?}{worn}")
+        }
+        ItemKind::Resource => "Used in crafting".to_string(),
+    })
+}
+
+/// A key as the player reads it on a label: `KeyB` -> "B", `Enter` -> "Enter".
+pub(crate) fn key_name(key: KeyCode) -> String {
+    let name = format!("{key:?}");
+    let short = name
+        .strip_prefix("Key")
+        .or_else(|| name.strip_prefix("Digit"));
+    short.unwrap_or(&name).to_string()
+}
+
+/// The tooltip under a top-bar button (U9). Keys from the constants, never typed twice.
+fn top_label(button: TopButton) -> String {
+    match button {
+        TopButton::Store => format!("Store ({})", key_name(STORE_KEY)),
+        TopButton::Inventory => format!("Inventory ({})", key_name(INVENTORY_KEYS[0])),
+        TopButton::Wardrobe => "Wardrobe".to_string(),
+        TopButton::Chat => format!("Chat ({})", key_name(CHAT_KEY)),
+        TopButton::Voice => format!("Voice ({})", key_name(VOICE_KEY)),
+        TopButton::Settings => "Settings".to_string(),
+    }
+}
+
+/// Where the tooltip goes (logical px): right of the cell and top-aligned, left of it when the
+/// window ends first, or under it (`below`, the top bar); always fully on screen.
+fn tip_position(cell: Rect, tip: Vec2, window: Vec2, below: bool) -> Vec2 {
+    let at = if below {
+        Vec2::new(cell.max.x - tip.x, cell.max.y + SLOT_GAP)
+    } else if cell.max.x + SLOT_GAP + tip.x <= window.x {
+        Vec2::new(cell.max.x + SLOT_GAP, cell.min.y)
+    } else {
+        Vec2::new(cell.min.x - SLOT_GAP - tip.x, cell.min.y)
+    };
+    at.clamp(Vec2::ZERO, (window - tip).max(Vec2::ZERO))
+}
+
+/// What the tooltip shows.
+#[derive(Clone, PartialEq)]
+enum TipContent {
+    Item(ItemInfo),
+    Text(String),
+}
+
+/// A node's rectangle in logical px.
+fn logical_rect(node: &ComputedNode, transform: &UiGlobalTransform) -> Rect {
+    let scale = node.inverse_scale_factor();
+    Rect::from_center_size(transform.translation * scale, node.size * scale)
+}
+
+/// The shared tooltip (U3, U9): after the pointer rests `TOOLTIP_DELAY_SECS` on an item cell or a
+/// top-bar button, beside the cell. Hidden at once when the pointer leaves, while dragging, on
+/// touch, and for an empty cell; rebuilt only when what it says changes.
+#[allow(clippy::too_many_arguments)] // a Bevy system: state, input, the cells and the box
+fn show_tooltip(
+    mut commands: Commands,
+    assets: Res<AssetServer>,
+    time: Res<Time>,
+    game: Res<Game>,
+    drag: Res<ItemDrag>,
+    touches: Res<Touches>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    cells: Query<(
+        Entity,
+        &ItemTip,
+        &Hovered,
+        &ComputedNode,
+        &UiGlobalTransform,
+        Option<&UiButton>,
+    )>,
+    tops: Query<
+        (
+            Entity,
+            &UiButton,
+            &Hovered,
+            &ComputedNode,
+            &UiGlobalTransform,
+        ),
+        Without<ItemTip>,
+    >,
+    tip: Single<(Entity, &mut Node, &ComputedNode), With<Tooltip>>,
+    mut since: Local<Option<(Entity, f32)>>,
+    mut shown: Local<Option<TipContent>>,
+) {
+    let quiet = drag.busy() || touches.iter().next().is_some();
+    let hovered_cell = cells.iter().find(|(_, _, hovered, ..)| hovered.get());
+    let target = if quiet {
+        None
+    } else if let Some((entity, ItemTip(stack), _, node, at, button)) = hovered_cell {
+        stack.and_then(|(id, count)| {
+            let me = game.me()?;
+            let worn = me.equipped.contains(&Some(id));
+            let price = match button {
+                Some(&b @ UiButton::Buy(_)) => buy_price(b, me).map(|p| (p, me.gems >= p)),
+                _ => None,
+            };
+            let info = item_info(id, count, worn, price)?;
+            Some((
+                entity,
+                TipContent::Item(info),
+                logical_rect(node, at),
+                false,
+            ))
+        })
+    } else {
+        tops.iter()
+            .find_map(|(entity, button, hovered, node, at)| match button {
+                UiButton::Top(top) if hovered.get() => Some((
+                    entity,
+                    TipContent::Text(top_label(*top)),
+                    logical_rect(node, at),
+                    true,
+                )),
+                _ => None,
+            })
+    };
+    let now = time.elapsed_secs();
+    let entity = target.as_ref().map(|t| t.0);
+    if since.map(|(e, _)| e) != entity {
+        *since = entity.map(|e| (e, now));
+    }
+    let ready = since.is_some_and(|(_, from)| now - from >= TOOLTIP_DELAY_SECS);
+    let (tip_entity, mut node, computed) = tip.into_inner();
+    let Some((_, content, cell, below)) = target.filter(|_| ready) else {
+        if node.display != Display::None {
+            node.display = Display::None;
+        }
+        *shown = None;
+        return;
+    };
+    if shown.as_ref() != Some(&content) {
+        commands
+            .entity(tip_entity)
+            .despawn_children()
+            .with_children(|tip| spawn_tip_lines(tip, &assets, &content));
+        *shown = Some(content);
+    }
+    if node.display != Display::Flex {
+        node.display = Display::Flex;
+    }
+    // The box's own size is known a frame after it is first shown; it settles then.
+    let size = computed.size * computed.inverse_scale_factor();
+    let at = tip_position(cell, size, window.size(), below);
+    if node.left != px(at.x) || node.top != px(at.y) {
+        node.left = px(at.x);
+        node.top = px(at.y);
+    }
+}
+
+/// The tooltip's lines: name, mods, what it is, price (red when the player can't pay).
+fn spawn_tip_lines(tip: &mut ChildSpawnerCommands, assets: &AssetServer, content: &TipContent) {
+    let info = match content {
+        TipContent::Text(text) => {
+            tip.spawn((ink(text.clone()), tip_part()));
+            return;
+        }
+        TipContent::Item(info) => info,
+    };
+    tip.spawn((ink(info.title.clone()), tip_part()));
+    if !info.mods.is_empty() {
+        let mods = Node {
+            column_gap: px(HUD_MARGIN),
+            flex_wrap: FlexWrap::Wrap,
+            ..default()
+        };
+        tip.spawn((mods, tip_part())).with_children(|row| {
+            for &m in &info.mods {
+                let entry = Node {
+                    column_gap: px(SLOT_GAP),
+                    align_items: AlignItems::Center,
+                    ..default()
+                };
+                row.spawn((entry, tip_part())).with_children(|entry| {
+                    entry.spawn((
+                        ImageNode::new(assets.load(mod_icon(m))),
+                        icon_node(MOD_ICON_SIZE),
+                        tip_part(),
+                    ));
+                    entry.spawn((ink(mod_label(m)), tip_part()));
+                });
+            }
+        });
+    }
+    if let Some(kind) = &info.kind {
+        tip.spawn((ink(kind.clone()), tip_part()));
+    }
+    if let Some((price, affordable)) = info.price {
+        let colour = if affordable {
+            INK_COLOR
+        } else {
+            SHORT_PRICE_COLOR
+        };
+        let line = Node {
+            column_gap: px(SLOT_GAP),
+            align_items: AlignItems::Center,
+            ..default()
+        };
+        tip.spawn((line, tip_part())).with_children(|line| {
+            line.spawn((gem_icon(assets), tip_part()));
+            line.spawn((label(price.to_string()), TextColor(colour), tip_part()));
+        });
+    }
+}
+
+/// The selection strip above the hotbar: name, mods and what it is (tooltip lines 1-3, ` · `
+/// between them) of the item cell under the pointer, else the last one pointed at or tapped while
+/// a panel is open, else the selected item (`discard_target`). An armed equipment cell says
+/// `Click again to buy for <gem> <price>` instead. Rewritten only when what it says changes.
+#[allow(clippy::too_many_arguments)] // state, two selections, the cells and the two outputs
+fn refresh_item_info(
+    mut commands: Commands,
+    assets: Res<AssetServer>,
+    game: Res<Game>,
+    open: Res<OpenPanel>,
+    selected: Res<Selected>,
+    wardrobe: Res<WardrobeSelected>,
+    armed: Res<ArmedBuy>,
+    cells: Query<(&ItemTip, &Hovered, Option<&UiButton>)>,
+    mut name: Single<&mut Text, With<SelectedName>>,
+    mods: Single<Entity, With<ModLine>>,
+    mut last_cell: Local<Option<(ItemId, u16)>>,
+    mut shown: Local<Option<(Option<ItemInfo>, bool, Option<u32>)>>,
+) {
+    let hovered = cells.iter().find(|(_, hovered, _)| hovered.get());
+    if open.is_changed() {
+        *last_cell = None;
+    }
+    if let Some((ItemTip(Some(stack)), _, _)) = hovered
+        && *open != OpenPanel::None
+    {
+        *last_cell = Some(*stack);
+    }
+    let Some(me) = game.me() else { return };
+    let focus = hovered
+        .and_then(|(tip, _, _)| tip.0)
+        .or(*last_cell)
+        .or_else(|| {
+            let id = discard_target(&game, *open, &selected, &wardrobe)?;
+            Some((id, me.inventory.count(id)))
+        });
+    let info =
+        focus.and_then(|(id, count)| item_info(id, count, me.equipped.contains(&Some(id)), None));
+    let claim_row = matches!(
+        hovered.and_then(|(_, _, button)| button.copied()),
+        Some(UiButton::Buy(id)) if claim_kind(id).is_some()
+    );
+    // Only the narrow equipment cells move their confirm text here; claim rows say it inline.
+    let armed_cell = armed.0.and_then(|(button, _)| match button {
+        UiButton::Buy(id) => equip_price(id),
+        _ => None,
+    });
+    let view = (info, claim_row, armed_cell);
+    if shown.as_ref() == Some(&view) {
+        return;
+    }
+    let (info, claim_row, armed_cell) = &view;
+    name.0 = match (armed_cell, info) {
+        (Some(_), _) => STRIP_ARMED_TEXT.to_string(),
+        (None, Some(info)) if *claim_row => format!("{}: {CLAIM_ROW_HINT}", info.title),
+        (None, Some(info)) => info.title.clone(),
+        (None, None) => String::new(),
+    };
+    commands
+        .entity(*mods)
+        .despawn_children()
+        .with_children(|row| {
+            if let Some(price) = armed_cell {
+                row.spawn(gem_icon(&assets));
+                row.spawn(label(price.to_string()));
+                return;
+            }
+            let Some(info) = info else { return };
+            for &m in &info.mods {
+                row.spawn(label(STRIP_SEP));
+                spawn_mod_entry(row, &assets, m, Color::WHITE);
+            }
+            if let Some(kind) = &info.kind {
+                row.spawn(label(STRIP_SEP));
+                row.spawn(label(kind.clone()));
+            }
+        });
+    *shown = Some(view);
+}
+
+pub(crate) fn item_name(id: ItemId) -> &'static str {
     item(id).map_or("?", |def| def.name)
 }
 
@@ -1609,15 +2691,26 @@ fn toast_for_event(event: &Event) -> Option<String> {
         Event::BackpackUpgraded { capacity, .. } => {
             Some(format!("Backpack now holds {capacity} item types"))
         }
+        // Private: only the crafter receives it.
+        Event::Crafted { recipe: number, .. } => {
+            recipe(number).map(|r| format!("Crafted {}", item_name(r.output.0)))
+        }
         _ => None,
     }
 }
 
-/// The player must always learn why nothing happened. Cooldown and plain misses stay silent.
-fn toast_for_reject(reject: Reject) -> Option<&'static str> {
+/// The player must always learn why nothing happened (U2), except where the world already shows
+/// it (`SILENT_REJECTS`). Claim refusals name the owner and come from `claim_ui.rs`. A craft has
+/// its own words for the refusals that mean something else there.
+fn toast_for_reject(action: &Action, reject: Reject) -> Option<&'static str> {
+    if let Action::Craft { .. } = action {
+        match reject {
+            Reject::OutOfRange => return Some("Stand next to a Workbench to craft that"),
+            Reject::NoItem => return Some("Not enough ingredients"),
+            _ => {}
+        }
+    }
     match reject {
-        Reject::NoPermission => Some("Locked: this area belongs to someone else"),
-        Reject::NotOwner => Some("Only the owner of this claim can do that"),
         Reject::NoRecipe => Some("These two seeds cannot be spliced"),
         Reject::AlreadySpliced => Some("This tree has already been spliced"),
         Reject::NeedsGround => Some("Seeds need solid ground below"),
@@ -1626,13 +2719,24 @@ fn toast_for_reject(reject: Reject) -> Option<&'static str> {
         Reject::InventoryFull => Some("No room in the backpack"),
         Reject::WorldAlreadyClaimed => Some("This world is already claimed"),
         Reject::ForeignClaims => Some("Someone else has a claim in this world"),
-        Reject::OutOfRange
-        | Reject::Occupied
-        | Reject::NoItem
-        | Reject::Unbreakable
-        | Reject::Cooldown
-        | Reject::Invalid => None,
+        Reject::Unbreakable => Some("This block can't be broken"),
+        Reject::NoItem => Some("You don't have that item"),
+        Reject::Invalid => Some("That didn't work"),
+        // Named by `claim_ui.rs`.
+        Reject::NoPermission | Reject::NotOwner => None,
+        Reject::Occupied | Reject::OutOfRange | Reject::Cooldown => None,
     }
+}
+
+/// Whether a refusal stays silent on purpose: no toast, no tile flash (`interact.rs`).
+pub(crate) fn silent_reject(reject: Reject) -> bool {
+    SILENT_REJECTS.contains(&reject)
+}
+
+/// Whether a refusal text may show at `now`: not the same text as the last one within
+/// `REJECT_REPEAT_SECS`.
+fn may_repeat(last: Option<(&'static str, f32)>, text: &str, now: f32) -> bool {
+    last.is_none_or(|(shown, at)| shown != text || now >= at + REJECT_REPEAT_SECS)
 }
 
 fn show_toasts(
@@ -1641,21 +2745,33 @@ fn show_toasts(
     mut results: MessageReader<ActionResult>,
     mut notices: MessageReader<Notice>,
     toast: Single<(&mut Text, &mut Toast)>,
+    mut last_reject: Local<Option<(&'static str, f32)>>,
 ) {
     let (mut text, mut toast) = toast.into_inner();
+    let now = time.elapsed_secs();
     let from_events = events
         .read()
         .filter_map(|GameEvent(event)| toast_for_event(event));
-    let from_rejects = results
-        .read()
-        .filter_map(|result| result.result.as_ref().err().copied())
-        .filter_map(toast_for_reject)
-        .map(String::from);
+    let mut from_rejects = Vec::new();
+    for ActionResult { action, result } in results.read() {
+        let Err(reject) = result else { continue };
+        let reject = *reject;
+        if reject == Reject::Invalid {
+            // The catch-all: logged so it can get a real message later.
+            warn!("{action:?} rejected: {reject:?}");
+        }
+        if let Some(message) = toast_for_reject(action, reject)
+            && may_repeat(*last_reject, message, now)
+        {
+            *last_reject = Some((message, now));
+            from_rejects.push(message.to_string());
+        }
+    }
     let from_notices = notices.read().map(|Notice(text)| text.clone());
     if let Some(message) = from_events.chain(from_rejects).chain(from_notices).last() {
         text.0 = message;
-        toast.until = time.elapsed_secs() + TOAST_SECS;
-    } else if !text.0.is_empty() && time.elapsed_secs() >= toast.until {
+        toast.until = now + TOAST_SECS;
+    } else if !text.0.is_empty() && now >= toast.until {
         text.0.clear();
     }
 }
@@ -1686,6 +2802,45 @@ mod tests {
             Some("dirt and stone spliced into gravel")
         );
         assert_eq!(toast_for_event(&Event::TreeHarvested { x: 1, y: 1 }), None);
+    }
+
+    #[test]
+    fn every_mod_reads_in_a_few_words() {
+        assert_eq!(mod_label(Mod::ExtraJump), "Extra jump");
+        assert_eq!(mod_label(Mod::Glide), "Glide");
+        assert_eq!(mod_label(Mod::RunBoost(20)), "+20% run");
+        assert_eq!(mod_label(Mod::DigBoost(4)), "Dig 1.0×");
+        assert_eq!(mod_label(Mod::DigBoost(5)), "Dig 1.25×");
+        assert_eq!(mod_label(Mod::DigBoost(6)), "Dig 1.5×");
+        assert_eq!(mod_label(Mod::DigBoost(8)), "Dig 2.0×");
+        assert_eq!(mod_label(Mod::Reach(1)), "+1 reach");
+        assert_eq!(mod_label(Mod::GemFinder(1)), "+1 gems");
+    }
+
+    #[test]
+    fn claim_rows_say_what_they_cover() {
+        assert_eq!(claim_coverage(Some(48)), "Protects the 48 tiles nearest it");
+        assert_eq!(
+            claim_coverage(None),
+            "Protects the whole world. Only if no one else has a claim here"
+        );
+    }
+
+    #[test]
+    fn crafting_says_what_was_made() {
+        let crafted = Event::Crafted {
+            player: game_shared::rules::PlayerId(1),
+            recipe: 0,
+        };
+        assert_eq!(
+            toast_for_event(&crafted).as_deref(),
+            Some("Crafted workbench")
+        );
+        let unknown = Event::Crafted {
+            player: game_shared::rules::PlayerId(1),
+            recipe: u16::MAX,
+        };
+        assert_eq!(toast_for_event(&unknown), None);
     }
 
     #[test]
@@ -1772,21 +2927,288 @@ mod tests {
     }
 
     #[test]
-    fn rejects_the_player_cannot_guess_get_a_message() {
-        for reject in [
+    fn a_hotbar_place_maps_to_the_raw_slot_shown_there() {
+        // Raw slots: 0 fist, 1 hat, 2 wrench, 3 shirt, 4 dirt, 5 hair. Equipment (1, 3, 5) is
+        // never shown, so the view is [0, 2, 4].
+        let carried = [0, 2, 4];
+        let len = 6;
+        assert_eq!(
+            move_target(&carried, len, 4, 0),
+            Some(0),
+            "dirt onto hotbar 1: swap with fist"
+        );
+        assert_eq!(
+            move_target(&carried, len, 0, 1),
+            Some(2),
+            "fist onto hotbar 2: the wrench's raw slot"
+        );
+        assert_eq!(move_target(&carried, len, 2, 1), None, "onto itself");
+        // Empty places: past the end, the item goes last, behind the trailing equipment.
+        assert_eq!(move_target(&carried, len, 0, 5), Some(6));
+        assert_eq!(
+            move_target(&carried, len, 4, 7),
+            None,
+            "already the last shown item"
+        );
+        // After a move to the end, the item is the last one shown.
+        let mut slots: Vec<usize> = (0..len).collect();
+        let item = slots.remove(0);
+        slots.push(item);
+        let shown: Vec<_> = slots.iter().filter(|&&i| [0, 2, 4].contains(&i)).collect();
+        assert_eq!(shown.last(), Some(&&0));
+    }
+
+    #[test]
+    fn the_selection_follows_a_moved_item() {
+        assert_eq!(index_after_move(3, 3, 0, 5), 0);
+        assert_eq!(index_after_move(0, 3, 0, 5), 3);
+        assert_eq!(index_after_move(2, 3, 0, 5), 2);
+        assert_eq!(index_after_move(1, 1, 5, 5), 4, "moved to the end");
+        assert_eq!(index_after_move(3, 1, 5, 5), 2, "shifted down");
+        assert_eq!(index_after_move(0, 1, 5, 5), 0);
+    }
+
+    #[test]
+    fn only_a_real_drag_released_on_a_slot_moves_an_item() {
+        let at = Vec2::new(100.0, 100.0);
+        assert!(
+            !drag_moved(at, at),
+            "a press without movement stays a click"
+        );
+        assert!(!drag_moved(at, at + Vec2::new(DRAG_THRESHOLD - 1.0, 0.0)));
+        assert!(drag_moved(at, at + Vec2::new(0.0, DRAG_THRESHOLD)));
+        let carried = [0, 1, 2];
+        let pressed = ItemDrag::Pressed { from: 2, at };
+        assert_eq!(
+            drop_action(pressed, Some(0), &carried, 3),
+            None,
+            "a click moves nothing"
+        );
+        let dragging = ItemDrag::Dragging { from: 2 };
+        assert_eq!(
+            drop_action(dragging, None, &carried, 3),
+            None,
+            "released outside: cancelled"
+        );
+        assert_eq!(
+            drop_action(dragging, Some(0), &carried, 3),
+            Some(Action::MoveItem { from: 2, to: 0 })
+        );
+        assert!(dragging.busy() && pressed.busy() && !ItemDrag::Idle.busy());
+    }
+
+    /// Every `Reject` is either mapped to its exact text, named by the claim UI, or silent on
+    /// purpose. The `match` stops compiling when a variant is added, so none is forgotten.
+    #[test]
+    fn every_refusal_says_why_or_is_silent_on_purpose() {
+        fn listed(reject: Reject) -> Option<&'static str> {
+            match reject {
+                Reject::NoRecipe => Some("These two seeds cannot be spliced"),
+                Reject::AlreadySpliced => Some("This tree has already been spliced"),
+                Reject::NeedsGround => Some("Seeds need solid ground below"),
+                Reject::DropLimit => Some("This world cannot hold more dropped items"),
+                Reject::NotEnoughGems => Some("Not enough gems"),
+                Reject::InventoryFull => Some("No room in the backpack"),
+                Reject::WorldAlreadyClaimed => Some("This world is already claimed"),
+                Reject::ForeignClaims => Some("Someone else has a claim in this world"),
+                Reject::Unbreakable => Some("This block can't be broken"),
+                Reject::NoItem => Some("You don't have that item"),
+                Reject::Invalid => Some("That didn't work"),
+                Reject::NoPermission | Reject::NotOwner => None,
+                Reject::Occupied | Reject::OutOfRange | Reject::Cooldown => None,
+            }
+        }
+        let all = [
+            Reject::OutOfRange,
             Reject::NoPermission,
             Reject::NotOwner,
+            Reject::Occupied,
+            Reject::NoItem,
+            Reject::Unbreakable,
+            Reject::Cooldown,
             Reject::NoRecipe,
             Reject::AlreadySpliced,
             Reject::NeedsGround,
+            Reject::DropLimit,
             Reject::NotEnoughGems,
             Reject::InventoryFull,
             Reject::WorldAlreadyClaimed,
             Reject::ForeignClaims,
-            Reject::DropLimit,
-        ] {
-            assert!(toast_for_reject(reject).is_some(), "{reject:?}");
+            Reject::Invalid,
+        ];
+        let punch = Action::Punch { x: 1, y: 1 };
+        for reject in all {
+            let text = toast_for_reject(&punch, reject);
+            assert_eq!(text, listed(reject), "{reject:?}");
+            let claim_named = matches!(reject, Reject::NoPermission | Reject::NotOwner);
+            assert_eq!(
+                text.is_none(),
+                silent_reject(reject) || claim_named,
+                "{reject:?}: mapped, or silent on purpose"
+            );
         }
-        assert_eq!(toast_for_reject(Reject::Cooldown), None);
+        let craft = Action::Craft { recipe: 0 };
+        assert_eq!(
+            toast_for_reject(&craft, Reject::OutOfRange),
+            Some("Stand next to a Workbench to craft that")
+        );
+        assert_eq!(
+            toast_for_reject(&craft, Reject::NoItem),
+            Some("Not enough ingredients")
+        );
+        assert_eq!(
+            toast_for_reject(&craft, Reject::InventoryFull),
+            Some("No room in the backpack")
+        );
+    }
+
+    #[test]
+    fn tab_keys_wrap_around() {
+        assert_eq!(cycle(0, 9, 1), 1);
+        assert_eq!(cycle(8, 9, 1), 0, "past the last: the first");
+        assert_eq!(cycle(0, 3, -1), 2, "before the first: the last");
+        assert_eq!(cycle(0, 0, 1), 0);
+    }
+
+    #[test]
+    fn the_same_refusal_waits_two_seconds() {
+        assert!(may_repeat(None, "a", 0.0));
+        assert!(!may_repeat(Some(("a", 1.0)), "a", 2.9));
+        assert!(may_repeat(Some(("a", 1.0)), "a", 3.0));
+        assert!(may_repeat(Some(("a", 1.0)), "b", 1.5), "another text");
+    }
+
+    #[test]
+    fn only_affordable_buys_of_a_thousand_gems_or_more_ask_twice() {
+        assert!(!needs_confirm(999, 5000));
+        assert!(needs_confirm(1000, 5000));
+        assert!(needs_confirm(1000, 1000));
+        assert!(
+            !needs_confirm(1000, 999),
+            "unaffordable: straight to the rules"
+        );
+        assert_eq!(CONFIRM_PRICE, 1000);
+    }
+
+    #[test]
+    fn the_tooltip_says_name_mods_and_what_it_is() {
+        let find = |kind: ItemKind| ITEMS.iter().find(|d| d.kind == kind).unwrap();
+        // Block, with count.
+        let dirt = item(DIRT).unwrap();
+        let info = item_info(DIRT, 5, false, None).unwrap();
+        assert_eq!(info.title, "Dirt ×5");
+        assert!(info.mods.is_empty());
+        assert_eq!(info.kind, Some(format!("Block · {} punches", dirt.hits)));
+        assert_eq!(info.price, None);
+        assert_eq!(item_info(DIRT, 1, false, None).unwrap().title, "Dirt");
+        // Workbench, tools, background, resource, claim.
+        assert_eq!(
+            item_info(WORKBENCH, 1, false, None)
+                .unwrap()
+                .kind
+                .as_deref(),
+            Some("Block · wrench it to craft")
+        );
+        assert_eq!(
+            item_info(WRENCH, 1, false, None).unwrap().kind.as_deref(),
+            Some("Click your claim or a Workbench")
+        );
+        assert_eq!(
+            item_info(FIST, 1, false, None).unwrap().kind.as_deref(),
+            Some("Punch blocks, harvest trees")
+        );
+        let wall = find(ItemKind::Background);
+        assert_eq!(kind_line(wall, false).as_deref(), Some("Background"));
+        // No resource item yet: a made-up one.
+        let resource = ItemDef {
+            kind: ItemKind::Resource,
+            ..*dirt
+        };
+        assert_eq!(
+            kind_line(&resource, false).as_deref(),
+            Some("Used in crafting")
+        );
+        let small = &CLAIMS[0];
+        assert_eq!(
+            item_info(small.item, 1, false, Some((small.price, true))).unwrap(),
+            ItemInfo {
+                title: title_case(item(small.item).unwrap().name),
+                mods: Vec::new(),
+                kind: Some(claim_coverage(small.tiles)),
+                price: Some((small.price, true)),
+            }
+        );
+        // Seed: its grow time.
+        let seed = find(ItemKind::Seed);
+        assert_eq!(
+            kind_line(seed, false),
+            Some(format!(
+                "Plant on soil · grows in {}",
+                duration_text(grow_seconds(seed.rarity))
+            ))
+        );
+        // Equipment: slot, worn, mods.
+        let wings = ITEMS
+            .iter()
+            .find(|d| d.kind == ItemKind::Equip(Slot::Back) && mods_of(d.id).next().is_some())
+            .unwrap();
+        let info = item_info(wings.id, 1, true, Some((10_000, false))).unwrap();
+        assert_eq!(info.kind.as_deref(), Some("Back · worn"));
+        assert_eq!(info.mods, mods_of(wings.id).collect::<Vec<_>>());
+        assert_eq!(info.price, Some((10_000, false)));
+        let hat = find(ItemKind::Equip(Slot::Hat));
+        assert_eq!(kind_line(hat, false).as_deref(), Some("Hat"));
+    }
+
+    #[test]
+    fn names_are_title_case_and_times_read_short() {
+        assert_eq!(title_case("golden pickaxe"), "Golden Pickaxe");
+        assert_eq!(title_case("dirt"), "Dirt");
+        assert_eq!(duration_text(45), "45s");
+        assert_eq!(duration_text(200), "3m 20s");
+        assert_eq!(duration_text(180), "3m");
+        assert_eq!(duration_text(3900), "1h 5m");
+        assert_eq!(duration_text(7200), "2h");
+    }
+
+    #[test]
+    fn top_bar_labels_name_their_keys() {
+        assert_eq!(top_label(TopButton::Store), "Store (B)");
+        assert_eq!(top_label(TopButton::Inventory), "Inventory (E)");
+        assert_eq!(top_label(TopButton::Wardrobe), "Wardrobe");
+        assert_eq!(top_label(TopButton::Chat), "Chat (Enter)");
+        assert_eq!(top_label(TopButton::Voice), "Voice (N)");
+        assert_eq!(top_label(TopButton::Settings), "Settings");
+        assert_eq!(key_name(KeyCode::KeyC), "C");
+    }
+
+    #[test]
+    fn the_tooltip_sits_beside_the_cell_and_on_screen() {
+        let window = Vec2::new(800.0, 600.0);
+        let tip = Vec2::new(200.0, 100.0);
+        let cell = Rect::new(100.0, 100.0, 174.0, 174.0);
+        assert_eq!(
+            tip_position(cell, tip, window, false),
+            Vec2::new(178.0, 100.0),
+            "right"
+        );
+        let edge = Rect::new(700.0, 100.0, 774.0, 174.0);
+        assert_eq!(
+            tip_position(edge, tip, window, false),
+            Vec2::new(496.0, 100.0),
+            "left"
+        );
+        let low = Rect::new(100.0, 550.0, 174.0, 600.0);
+        assert_eq!(
+            tip_position(low, tip, window, false).y,
+            500.0,
+            "kept on screen"
+        );
+        let top = Rect::new(740.0, 8.0, 784.0, 52.0);
+        assert_eq!(
+            tip_position(top, tip, window, true),
+            Vec2::new(584.0, 56.0),
+            "under"
+        );
     }
 }

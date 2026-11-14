@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use game_protocol::{
-    Auth, ClientMsg, MAX_CLIENT_MSG, MAX_TOKEN_LEN, PROTOCOL_VERSION, ReadError, ServerMsg,
-    clean_chat, encode, read_msg, valid_country, valid_name, write_msg,
+    Auth, ClientMsg, MAX_CLIENT_MSG, MAX_LOOKUP, MAX_TOKEN_LEN, PROTOCOL_VERSION, ReadError,
+    ServerMsg, clean_chat, encode, read_msg, valid_country, valid_name, write_msg,
 };
 use game_shared::commands::Role;
 use game_shared::physics::TICK_RATE;
@@ -34,6 +34,9 @@ const CHAT_BURST: f32 = 5.0;
 /// Voice mutes per second (docs/knowledge/12: rate-limited), with a short burst.
 const VOICE_MUTE_RATE: f32 = 1.0;
 const VOICE_MUTE_BURST: f32 = 3.0;
+/// Name lookups per second, with a burst (each is one small query).
+const LOOKUP_RATE: f32 = 2.0;
+const LOOKUP_BURST: f32 = 5.0;
 /// Dropped messages tolerated before the connection is closed.
 const MAX_STRIKES: u32 = 200;
 /// Players one server process takes; more players means another server (docs/knowledge/10, "Scaling").
@@ -371,6 +374,7 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) {
         Bucket::new(ACT_RATE, ACT_BURST, now),
     );
     let mut chats = Bucket::new(CHAT_RATE, CHAT_BURST, now);
+    let mut lookups = Bucket::new(LOOKUP_RATE, LOOKUP_BURST, now);
     let mut voice_mutes = Bucket::new(VOICE_MUTE_RATE, VOICE_MUTE_BURST, now);
     let (mut input_seq, mut act_seq) = (Seq::default(), Seq::default());
     let mut strikes = 0;
@@ -419,6 +423,25 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) {
             (ClientMsg::Chat { text }, Some(name)) => clean_chat(&text)
                 .filter(|_| chats.take(now))
                 .map(|text| (name.clone(), ToWorld::Chat { id, text })),
+            // Answered here, not by the world: names live in the accounts table.
+            (ClientMsg::LookupNames { ids }, _) => {
+                if ids.len() > MAX_LOOKUP || !lookups.take(now) {
+                    strikes += 1;
+                } else {
+                    let names = server.accounts.names_of(&ids).await;
+                    let _ = out.try_send(Out::Reliable(ServerMsg::Names { names }));
+                }
+                continue;
+            }
+            (ClientMsg::FindPlayer { name: asked }, _) => {
+                if !lookups.take(now) {
+                    strikes += 1;
+                } else {
+                    let found = server.accounts.find_name(&asked).await;
+                    let _ = out.try_send(Out::Reliable(ServerMsg::PlayerFound { asked, found }));
+                }
+                continue;
+            }
             (ClientMsg::VoiceMute { player, muted }, Some(name)) => voice_mutes
                 .take(now)
                 .then(|| (name.clone(), ToWorld::VoiceMute { id, player, muted })),

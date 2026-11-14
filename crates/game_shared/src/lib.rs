@@ -2,11 +2,13 @@
 
 pub mod claims;
 pub mod commands;
+pub mod crafting;
 pub mod farming;
 pub mod inventory;
 pub mod items;
 pub mod levels;
 pub mod mirror;
+pub mod mods;
 pub mod physics;
 pub mod rng;
 pub mod rules;

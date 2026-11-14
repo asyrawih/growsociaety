@@ -1,0 +1,4 @@
+# Build context of infra/game/Dockerfile: only the prebuilt world_server binary
+# (scripts/deploy-game.sh builds it on the Mac). Everything else stays out.
+*
+!infra/game/bin/world_server

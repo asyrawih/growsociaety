@@ -14,9 +14,10 @@ use crate::farming::{
 use crate::inventory::{Inventory, MAX_STACK, MAX_UPGRADES, SLOTS_PER_UPGRADE, upgrade_cost};
 use crate::items::{
     Collision, EMPTY, ItemDef, ItemId, ItemKind, MAIN_DOOR, PERMANENT, SLOT_COUNT, STARTER_OUTFIT,
-    Slot, UNBREAKABLE, UNTRADEABLE, equip_price, item, punch_power, seed_of, seed_parent, slot_of,
+    Slot, UNBREAKABLE, UNTRADEABLE, equip_price, item, seed_of, seed_parent, slot_of,
 };
 use crate::levels::{XP_BREAK_MIN, XP_HARVEST_PER_RARITY, XP_PLANT, XP_SPLICE, add_xp};
+use crate::mods::{DAMAGE_PER_HIT, Mods, worn_mods};
 use crate::physics::{Body, hitbox_contains, hitbox_overlaps_tile, spawn_body};
 use crate::rng::Rng;
 use crate::trade::{Trade, TradeEnd};
@@ -166,6 +167,16 @@ pub enum Action {
         item: ItemId,
     },
     BuyBackpackUpgrade,
+    /// Reorders the inventory: raw slot index `from` to raw slot index `to` (`Inventory::move_slot`).
+    /// The client maps its hotbar positions to raw indices itself.
+    MoveItem {
+        from: u16,
+        to: u16,
+    },
+    /// Make `crafting::RECIPES[recipe]` at a station within reach.
+    Craft {
+        recipe: u16,
+    },
     /// Wear or hold an item from the inventory in its slot, replacing what was there (it stays in
     /// the inventory).
     Equip {
@@ -249,6 +260,17 @@ pub enum Event {
     BackpackUpgraded {
         player: PlayerId,
         capacity: u16,
+    },
+    /// The player crafted `crafting::RECIPES[recipe]` (after its inventory events). Private.
+    Crafted {
+        player: PlayerId,
+        recipe: u16,
+    },
+    /// The player's inventory slot `from` moved to `to` (`Inventory::move_slot`). Private.
+    InventoryMoved {
+        player: PlayerId,
+        from: u16,
+        to: u16,
     },
     TreePlanted {
         x: u32,
@@ -357,8 +379,14 @@ pub enum Reject {
 /// Whether tile `(x, y)` is within punch and build range of `body`. The one range rule; the client
 /// uses it for the hover tint.
 pub fn in_reach(body: &Body, x: u32, y: u32) -> bool {
+    in_reach_with(body, x, y, Mods::default())
+}
+
+/// `in_reach` for a player wearing `mods` (the Reach mod adds tiles).
+pub fn in_reach_with(body: &Body, x: u32, y: u32, mods: Mods) -> bool {
+    let reach = REACH + u32::from(mods.reach);
     world_to_tile(body.pos.0, body.pos.1)
-        .is_some_and(|(px, py)| px.abs_diff(x).max(py.abs_diff(y)) <= REACH)
+        .is_some_and(|(px, py)| px.abs_diff(x).max(py.abs_diff(y)) <= reach)
 }
 
 /// Rejects with nothing changed, or applies the action and returns every change it made.
@@ -375,6 +403,19 @@ pub fn apply(
         Action::Trash { item, count } => discard(state, player, item, count, None),
         Action::Buy { item } => buy(state, player, item),
         Action::BuyBackpackUpgrade => buy_backpack_upgrade(state, player),
+        Action::Craft { recipe } => craft(state, player, recipe),
+        Action::MoveItem { from, to } => {
+            let inventory = &mut state
+                .players
+                .get_mut(&player)
+                .ok_or(Reject::Invalid)?
+                .inventory;
+            if inventory.move_slot(from, to) {
+                Ok(vec![Event::InventoryMoved { player, from, to }])
+            } else {
+                Err(Reject::Invalid)
+            }
+        }
         Action::Equip { item } => equip(state, player, item),
         Action::Unequip { slot } => unequip(state, player, slot),
         Action::SetClaimAccess {
@@ -412,6 +453,67 @@ pub fn apply(
 }
 
 pub use crate::trade::end_trades_of;
+
+/// One recipe at a station within reach: inputs out, output in, all or nothing.
+fn craft(state: &mut WorldState, id: PlayerId, recipe: u16) -> Result<Vec<Event>, Reject> {
+    let number = recipe;
+    let recipe = crate::crafting::recipe(recipe).ok_or(Reject::Invalid)?;
+    let player = state.players.get(&id).ok_or(Reject::Invalid)?;
+    if let Some(station) = recipe.station {
+        let (px, py) =
+            world_to_tile(player.body.pos.0, player.body.pos.1).ok_or(Reject::Invalid)?;
+        let reach = crate::crafting::CRAFT_STATION_REACH;
+        let near = (py.saturating_sub(reach)..=py + reach).any(|y| {
+            (px.saturating_sub(reach)..=px + reach)
+                .any(|x| state.world.get(x, y).is_some_and(|t| t.fg == station))
+        });
+        if !near {
+            return Err(Reject::OutOfRange);
+        }
+    }
+    // Try it on a copy first: the inputs must be there and the output must fit afterwards.
+    let mut trial = player.inventory.clone();
+    for &(input, count) in recipe.inputs {
+        if !trial.remove(input, count) {
+            return Err(Reject::NoItem);
+        }
+    }
+    let (output, count) = recipe.output;
+    if trial.add(output, count) < count {
+        return Err(Reject::InventoryFull);
+    }
+
+    let player = state.players.get_mut(&id).ok_or(Reject::Invalid)?;
+    player.inventory = trial;
+    let mut changed: Vec<ItemId> = recipe.inputs.iter().map(|&(i, _)| i).collect();
+    changed.push(output);
+    changed.dedup();
+    let mut events: Vec<Event> = changed
+        .iter()
+        .map(|&item| Event::InventoryChanged {
+            player: id,
+            item,
+            count: player.inventory.count(item),
+        })
+        .collect();
+    // A worn item used up as an input comes off.
+    for slot in Slot::ALL {
+        let worn = player.equipped[slot as usize];
+        if worn.is_some_and(|item| player.inventory.count(item) == 0) {
+            player.equipped[slot as usize] = None;
+            events.push(Event::Equipped {
+                player: id,
+                slot,
+                item: None,
+            });
+        }
+    }
+    events.push(Event::Crafted {
+        player: id,
+        recipe: number,
+    });
+    Ok(events)
+}
 
 /// Automatic pickup: moves every drop whose point is inside the player's hitbox into the
 /// inventory, as far as it fits. Not an `Action` (nobody asks for it); call it after each physics
@@ -457,7 +559,7 @@ fn reachable_tile(state: &WorldState, id: PlayerId, x: u32, y: u32) -> Result<(T
         .get(x, y)
         .zip(World::tile_key(x, y))
         .ok_or(Reject::OutOfRange)?;
-    if in_reach(&player.body, x, y) {
+    if in_reach_with(&player.body, x, y, worn_mods(&player.equipped)) {
         Ok(tile)
     } else {
         Err(Reject::OutOfRange)
@@ -514,16 +616,17 @@ fn punch(
         Layer::Background => None,
     };
     let grown = tree.filter(|tree| is_grown(tree, now));
-    let needed = if tree.is_some() {
+    // Health and damage are in points (docs/knowledge/18): `hits * DAMAGE_PER_HIT` to break,
+    // each punch adds the worn DigBoost (a bare fist: `FIST_DAMAGE`).
+    let needed = u16::from(if tree.is_some() {
         SAPLING_HITS
     } else {
         def.hits
-    };
+    }) * DAMAGE_PER_HIT;
     let earlier = state.damage.get(&key);
     let fresh = earlier.filter(|d| d.layer == layer && now - d.last_hit <= DAMAGE_RESET);
-    // The pickaxe in the hand decides how much one punch adds (docs/knowledge/03, "Punch power").
-    let power = punch_power(player.worn(Slot::Hand));
-    let hits = fresh.map_or(0, |d| d.hits).saturating_add(power);
+    let points = worn_mods(&player.equipped).dig;
+    let hits = u16::from(fresh.map_or(0, |d| d.hits)).saturating_add(points);
     // A claim always drops itself, so its last punch waits until the world can hold the drop.
     if claim_owner.is_some() && hits >= needed && !can_drop(&state.world, target, 1, x, y) {
         return Err(Reject::DropLimit);
@@ -535,6 +638,8 @@ fn punch(
         return Ok(harvest(state, id, x, y, tile, tree));
     }
     if hits < needed {
+        // Below `needed`, which fits a u8 for every block.
+        let hits = u8::try_from(hits).unwrap_or(u8::MAX);
         state.damage.insert(
             key,
             Damage {
@@ -648,13 +753,21 @@ fn roll_drop(rng: &mut Rng, broken: &ItemDef) -> Option<ItemId> {
 }
 
 /// Uniform `0 ..= GEMS_BASE_MAX + rarity / divisor`.
-fn roll_gems(rng: &mut Rng, rarity: u16, divisor: u16) -> u32 {
-    rng.range(0, GEMS_BASE_MAX + u32::from(rarity / divisor.max(1)))
+fn roll_gems(rng: &mut Rng, rarity: u16, divisor: u16, bonus: u32) -> u32 {
+    rng.range(
+        0,
+        GEMS_BASE_MAX + u32::from(rarity / divisor.max(1)) + bonus,
+    )
 }
 
 /// Credits the gems straight to the player. No event when the roll is zero.
 fn award_gems(state: &mut WorldState, id: PlayerId, rarity: u16, divisor: u16) -> Option<Event> {
-    let amount = roll_gems(&mut state.rng, rarity, divisor);
+    // GemFinder raises the roll's upper bound (docs/knowledge/18).
+    let bonus = state
+        .players
+        .get(&id)
+        .map_or(0, |p| u32::from(worn_mods(&p.equipped).gem));
+    let amount = roll_gems(&mut state.rng, rarity, divisor, bonus);
     let player = state.players.get_mut(&id).filter(|_| amount > 0)?;
     let before = player.gems;
     player.gems = before.saturating_add(amount);
@@ -751,6 +864,19 @@ fn new_claim(
     let kind = claim_kind(placed).ok_or(Reject::Invalid)?;
     let tiles = match kind.tiles {
         Some(count) => {
+            let key = World::tile_key(x, y).ok_or(Reject::OutOfRange)?;
+            // The block must stand on unclaimed ground: no claims inside claims, not even your own
+            // (it would grab far, disconnected tiles, and inside someone's public claim it could
+            // never be removed by them).
+            if world.claim_of.contains_key(&key) {
+                return Err(Reject::Occupied);
+            }
+            // Inside a world claim only its owner and access list may carve out an area claim:
+            // `public` lets everyone build, not take land away from the owner.
+            let world_claim = world.world_claim.and_then(|k| world.claim(k));
+            if world_claim.is_some_and(|c| c.owner != owner && !c.access.contains(&owner)) {
+                return Err(Reject::NoPermission);
+            }
             let tiles = claim_area(world, x, y, count);
             // Every tile already belongs to an area claim: there is nothing left to own.
             if tiles.is_empty() {
@@ -1536,8 +1662,8 @@ mod tests {
             layer: Layer::Foreground,
             damage,
         };
-        assert_eq!(punch_at(&mut state, target, 0.0), Ok(vec![damaged(1)]));
-        assert_eq!(punch_at(&mut state, target, 1.0), Ok(vec![damaged(2)]));
+        assert_eq!(punch_at(&mut state, target, 0.0), Ok(vec![damaged(4)]));
+        assert_eq!(punch_at(&mut state, target, 1.0), Ok(vec![damaged(8)]));
         let events = punch_at(&mut state, target, 2.0).unwrap();
         assert_eq!(
             events[0],
@@ -1552,11 +1678,11 @@ mod tests {
 
         // Twice, wait past DAMAGE_RESET, once more: back to one hit.
         state.world.set(target.0, target.1, fg(DIRT));
-        assert_eq!(punch_at(&mut state, target, 10.0), Ok(vec![damaged(1)]));
-        assert_eq!(punch_at(&mut state, target, 11.0), Ok(vec![damaged(2)]));
+        assert_eq!(punch_at(&mut state, target, 10.0), Ok(vec![damaged(4)]));
+        assert_eq!(punch_at(&mut state, target, 11.0), Ok(vec![damaged(8)]));
         assert_eq!(
             punch_at(&mut state, target, 11.0 + DAMAGE_RESET + 0.1),
-            Ok(vec![damaged(1)])
+            Ok(vec![damaged(4)])
         );
         assert_eq!(state.world.get(12, 1), Some(fg(DIRT)));
     }
@@ -1672,7 +1798,7 @@ mod tests {
                 x: 11,
                 y: 1,
                 layer: Layer::Background,
-                damage: 1
+                damage: 4
             }]
         );
         punch_at(&mut state, target, 4.0).unwrap();
@@ -2246,7 +2372,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pickaxe_adds_its_power_to_every_punch() {
+    fn a_pickaxe_adds_its_dig_points_to_every_punch() {
         let target = (12, 1);
         let damaged = |damage| {
             Ok(vec![Event::TileDamaged {
@@ -2274,17 +2400,17 @@ mod tests {
         state.players.get_mut(&ME).unwrap().equipped = [None; SLOT_COUNT];
         assert_eq!(breaks(&mut state), 6);
 
-        // Power 4: 2 punches, and the damage reported is the accumulated total.
+        // Tier 4 (8 points, docs/knowledge/18): 3 punches; the damage reported is the total.
         let mut state = fixture();
         let royal = equipment("pickaxe_royal");
         give(&mut state, royal, 1);
         apply(&mut state, ME, Action::Equip { item: royal }, 0.0).unwrap();
-        assert_eq!(breaks(&mut state), 2);
+        assert_eq!(breaks(&mut state), 3);
         state.world.set(target.0, target.1, fg(STONE));
-        assert_eq!(punch_at(&mut state, target, 100.0), damaged(4));
-        assert_eq!(state.damage.values().next().map(|d| d.hits), Some(4));
+        assert_eq!(punch_at(&mut state, target, 100.0), damaged(8));
+        assert_eq!(state.damage.values().next().map(|d| d.hits), Some(8));
 
-        // Power 2 on dirt (3 hits): 2, then broken. Backgrounds take the power too.
+        // Tier 2 (5 points) on dirt (3 hits = 12 points): 5, 10, then broken. Backgrounds too.
         let mut state = fixture();
         let iron = equipment("pickaxe_iron");
         give(&mut state, iron, 1);
@@ -2297,21 +2423,24 @@ mod tests {
                 bg: CAVE_WALL,
             },
         );
-        assert_eq!(punch_at(&mut state, target, 1.0), damaged(2));
-        assert!(punch_at(&mut state, target, 2.0).is_ok());
+        assert_eq!(punch_at(&mut state, target, 1.0), damaged(5));
+        assert_eq!(punch_at(&mut state, target, 2.0), damaged(10));
+        assert!(punch_at(&mut state, target, 2.5).is_ok());
         assert_eq!(
             state.world.get(target.0, target.1).map(|t| t.fg),
             Some(EMPTY)
         );
-        // The cave wall has 2 hits: one punch.
+        // The cave wall has 2 hits (8 points): two punches.
         assert!(punch_at(&mut state, target, 3.0).is_ok());
+        assert!(punch_at(&mut state, target, 3.5).is_ok());
         assert_eq!(state.world.get(target.0, target.1), Some(Tile::default()));
 
-        // A sapling (3 hits) goes in 2 punches; a grown tree still in one.
+        // A sapling (3 hits = 12 points) goes in 3 punches; a grown tree still in one.
         give(&mut state, DIRT_SEED, 2);
         place_at(&mut state, PLOT, DIRT_SEED, 10.0).unwrap();
         assert!(punch_at(&mut state, PLOT, 11.0).is_ok());
         assert!(punch_at(&mut state, PLOT, 12.0).is_ok());
+        assert!(punch_at(&mut state, PLOT, 13.0).is_ok());
         assert!(state.world.tree(PLOT.0, PLOT.1).is_none());
         place_at(&mut state, PLOT, DIRT_SEED, 20.0).unwrap();
         let grown = 20.0 + grow_seconds(1) as f64;
@@ -2785,7 +2914,7 @@ mod tests {
                     x: PLOT.0,
                     y: PLOT.1,
                     layer: Layer::Foreground,
-                    damage: 1
+                    damage: 4
                 }
             ));
             assert_trees_match_tiles(&state);
@@ -2853,7 +2982,7 @@ mod tests {
                     x: PLOT.0,
                     y: PLOT.1,
                     layer: Layer::Foreground,
-                    damage: 1
+                    damage: 4
                 }]
             );
             assert!(state.world.drops.is_empty() && state.world.tree(PLOT.0, PLOT.1).is_some());
@@ -2965,7 +3094,7 @@ mod tests {
             (0, GEMS_HARVEST_RARITY_DIVISOR, 1),
         ] {
             let rolls: Vec<u32> = (0..2000)
-                .map(|_| roll_gems(&mut rng, rarity, divisor))
+                .map(|_| roll_gems(&mut rng, rarity, divisor, 0))
                 .collect();
             assert_eq!(
                 rolls.iter().max(),
@@ -2999,7 +3128,7 @@ mod tests {
             state.damage.insert(
                 World::tile_key(12, 1).unwrap(),
                 Damage {
-                    hits: 4,
+                    hits: 4 * 4,
                     layer: Layer::Foreground,
                     last_hit: f64::from(i),
                 },
@@ -3076,7 +3205,7 @@ mod tests {
         state.damage.insert(
             World::tile_key(12, 1).unwrap(),
             Damage {
-                hits: target.hits - 1,
+                hits: (target.hits - 1) * 4,
                 layer,
                 last_hit: now,
             },
@@ -3670,7 +3799,7 @@ mod tests {
                     x: PLOT.0,
                     y: PLOT.1,
                     layer: Layer::Foreground,
-                    damage: hit
+                    damage: hit * 4
                 }]
             );
         }
@@ -4191,7 +4320,8 @@ mod tests {
                     y: 2,
                     item: MEDIUM_CLAIM,
                 },
-                Reject::NoItem,
+                // Inside an existing claim: refused before the inventory is checked (docs/knowledge/07).
+                Reject::Occupied,
             ),
             (
                 ME,
@@ -4751,5 +4881,276 @@ mod admin_tests {
         let events = run(&mut state, Admin::ClearBlock { x, y }).expect("cleared");
         assert!(events.contains(&Event::ClaimRemoved { x, y }));
         assert!(state.world.claim(key).is_none() && state.world.claim_of.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod craft_tests {
+    use super::*;
+    use crate::crafting::RECIPES;
+    use crate::items::{CRATE, LOG_END, PLANKS, WORKBENCH};
+    use crate::mods::{FIST_DAMAGE, equip};
+    use crate::worldgen::generate;
+
+    const ME: PlayerId = PlayerId(1);
+
+    /// A world with the player on the door and, if `bench`, a workbench right next to them.
+    fn world(bench: bool) -> WorldState {
+        let mut state = WorldState::new(generate("CRAFT"), 1);
+        state.join(ME);
+        if bench {
+            let (x, y) = state.world.door;
+            state.world.set(
+                x + 1,
+                y,
+                Tile {
+                    fg: WORKBENCH,
+                    bg: EMPTY,
+                },
+            );
+        }
+        state
+    }
+
+    fn give(state: &mut WorldState, item: ItemId, count: u16) {
+        state
+            .players
+            .get_mut(&ME)
+            .expect("joined")
+            .inventory
+            .add(item, count);
+    }
+
+    fn craft(state: &mut WorldState, recipe: u16) -> Result<Vec<Event>, Reject> {
+        apply(state, ME, Action::Craft { recipe }, 0.0)
+    }
+
+    #[test]
+    fn the_workbench_needs_no_station_and_the_rest_need_one() {
+        let mut state = world(false);
+        give(&mut state, PLANKS, 30);
+        give(&mut state, LOG_END, 10);
+        let events = craft(&mut state, 0).expect("workbench anywhere");
+        assert!(events.contains(&Event::Crafted {
+            player: ME,
+            recipe: 0
+        }));
+        assert_eq!(state.players[&ME].inventory.count(WORKBENCH), 1);
+        let before = state.clone();
+        assert_eq!(
+            craft(&mut state, 1),
+            Err(Reject::OutOfRange),
+            "crates need a workbench"
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn a_craft_conserves_everything_but_its_inputs_and_output() {
+        let mut state = world(true);
+        give(&mut state, PLANKS, 20);
+        give(&mut state, LOG_END, 5);
+        let before = state.players[&ME].inventory.clone();
+        craft(&mut state, 1).expect("crafted");
+        let after = &state.players[&ME].inventory;
+        assert_eq!(after.count(PLANKS), 12);
+        assert_eq!(after.count(LOG_END), 3);
+        assert_eq!(after.count(CRATE), 2);
+        for &(item, count) in before.slots() {
+            if ![PLANKS, LOG_END, CRATE].contains(&item) {
+                assert_eq!(after.count(item), count, "{item:?} untouched");
+            }
+        }
+    }
+
+    #[test]
+    fn crafting_refusals_change_nothing() {
+        // Short input.
+        let mut state = world(true);
+        give(&mut state, PLANKS, 3);
+        let before = state.clone();
+        assert_eq!(craft(&mut state, 2), Err(Reject::NoItem));
+        assert_eq!(state, before);
+        assert_eq!(craft(&mut state, 999), Err(Reject::Invalid));
+        // No room for the output: a full stack of it already.
+        let mut state = world(true);
+        give(&mut state, PLANKS, 6);
+        give(&mut state, RECIPES[2].output.0, MAX_STACK);
+        let before = state.clone();
+        assert_eq!(craft(&mut state, 2), Err(Reject::InventoryFull));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn consuming_a_worn_pickaxe_unequips_it() {
+        let mut state = world(true);
+        let wood = equip("pickaxe_wood");
+        give(&mut state, wood, 1);
+        give(&mut state, crate::items::STONE, 20);
+        give(&mut state, crate::items::COBBLESTONE, 10);
+        state.players.get_mut(&ME).expect("joined").equipped[Slot::Hand as usize] = Some(wood);
+        let events = craft(&mut state, 4).expect("stone pickaxe");
+        assert!(events.contains(&Event::Equipped {
+            player: ME,
+            slot: Slot::Hand,
+            item: None
+        }));
+        assert_eq!(state.players[&ME].worn(Slot::Hand), None);
+    }
+
+    #[test]
+    fn the_pickaxe_ladder_breaks_stone_in_six_six_five_four_three() {
+        let picks = [
+            None,
+            Some("pickaxe_wood"),
+            Some("pickaxe_stone"),
+            Some("pickaxe_gold"),
+            Some("pickaxe_diamond"),
+        ];
+        let mut punches = Vec::new();
+        for pick in picks {
+            let mut state = world(false);
+            let (dx, dy) = state.world.door;
+            let (x, y) = (dx + 1, dy);
+            state.world.set(
+                x,
+                y,
+                Tile {
+                    fg: crate::items::STONE,
+                    bg: EMPTY,
+                },
+            );
+            if let Some(name) = pick {
+                let id = equip(name);
+                give(&mut state, id, 1);
+                state.players.get_mut(&ME).expect("joined").equipped[Slot::Hand as usize] =
+                    Some(id);
+            }
+            let mut n = 0;
+            while state
+                .world
+                .get(x, y)
+                .is_some_and(|t| t.fg == crate::items::STONE)
+            {
+                n += 1;
+                apply(&mut state, ME, Action::Punch { x, y }, f64::from(n)).expect("punch");
+            }
+            punches.push(n);
+        }
+        assert_eq!(punches, [6, 6, 5, 4, 3], "fist {FIST_DAMAGE} points");
+    }
+
+    #[test]
+    fn reach_one_allows_three_tiles_not_four() {
+        let state = world(false);
+        let body = state.players[&ME].body;
+        let (x, y) = world_to_tile(body.pos.0, body.pos.1).expect("in world");
+        let mods = Mods {
+            reach: 1,
+            ..Mods::default()
+        };
+        assert!(in_reach_with(&body, x + 3, y, mods));
+        assert!(!in_reach_with(&body, x + 4, y, mods));
+        assert!(!in_reach_with(&body, x + 3, y, Mods::default()));
+    }
+}
+
+#[cfg(test)]
+mod claim_rule_tests {
+    use super::*;
+    use crate::items::{LARGE_CLAIM, SMALL_CLAIM, WORLD_CLAIM};
+    use crate::worldgen::generate;
+
+    const A: PlayerId = PlayerId(1);
+    const B: PlayerId = PlayerId(2);
+
+    fn world() -> WorldState {
+        let mut state = WorldState::new(generate("CLAIMS"), 1);
+        for id in [A, B] {
+            state.join(id);
+            let player = state.players.get_mut(&id).expect("joined");
+            for claim in [SMALL_CLAIM, LARGE_CLAIM, WORLD_CLAIM] {
+                player.inventory.add(claim, 2);
+            }
+        }
+        state
+    }
+
+    fn place(
+        state: &mut WorldState,
+        who: PlayerId,
+        at: (u32, u32),
+        item: ItemId,
+    ) -> Result<Vec<Event>, Reject> {
+        apply(
+            state,
+            who,
+            Action::Place {
+                x: at.0,
+                y: at.1,
+                item,
+            },
+            0.0,
+        )
+    }
+
+    fn public(state: &mut WorldState, at: (u32, u32)) {
+        apply(
+            state,
+            A,
+            Action::SetClaimPublic {
+                x: at.0,
+                y: at.1,
+                public: true,
+            },
+            0.0,
+        )
+        .expect("public");
+    }
+
+    #[test]
+    fn a_public_world_claim_does_not_let_strangers_carve_out_land() {
+        let mut state = world();
+        let (dx, dy) = state.world.door;
+        let throne = (dx + 1, dy);
+        place(&mut state, A, throne, WORLD_CLAIM).expect("world claim");
+        public(&mut state, throne);
+        let before = state.clone();
+        assert_eq!(
+            place(&mut state, B, (dx + 2, dy), SMALL_CLAIM),
+            Err(Reject::NoPermission)
+        );
+        assert_eq!(state, before, "refused: nothing changed");
+        // B may still build ordinary blocks there: that is what public means.
+        state
+            .players
+            .get_mut(&B)
+            .expect("joined")
+            .inventory
+            .add(crate::items::DIRT, 1);
+        assert!(place(&mut state, B, (dx + 2, dy), crate::items::DIRT).is_ok());
+        // The owner can carve out an area claim, and so can someone on the access list.
+        assert!(place(&mut state, A, (dx - 1, dy), SMALL_CLAIM).is_ok());
+    }
+
+    #[test]
+    fn no_claim_block_inside_another_claim_public_or_your_own() {
+        let mut state = world();
+        let (dx, dy) = state.world.door;
+        let big = (dx + 1, dy);
+        place(&mut state, A, big, LARGE_CLAIM).expect("large claim");
+        public(&mut state, big);
+        let before = state.clone();
+        assert_eq!(
+            place(&mut state, B, (dx + 2, dy), SMALL_CLAIM),
+            Err(Reject::Occupied),
+            "inside A's public claim"
+        );
+        assert_eq!(
+            place(&mut state, A, (dx + 2, dy), SMALL_CLAIM),
+            Err(Reject::Occupied),
+            "inside your own claim"
+        );
+        assert_eq!(state, before);
     }
 }

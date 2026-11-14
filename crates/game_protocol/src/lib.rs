@@ -11,7 +11,7 @@ use game_shared::world::World;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change; a mismatch is refused at `Hello`.
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 pub const DEFAULT_PORT: u16 = 7777;
 /// The name the dev certificate is issued for and the client connects to.
 pub const SERVER_NAME: &str = "localhost";
@@ -69,7 +69,20 @@ pub enum ClientMsg {
         player: PlayerId,
         muted: bool,
     },
+    /// Display names for ids the client has seen but nobody here named (offline claim owners,
+    /// access lists). At most `MAX_LOOKUP` ids; the answer is `Names`.
+    LookupNames {
+        ids: Vec<PlayerId>,
+    },
+    /// The account called `name` (case-insensitive), for the claim panel's "Add" field
+    /// (docs/knowledge/ux/claims.md). The answer is `PlayerFound`.
+    FindPlayer {
+        name: String,
+    },
 }
+
+/// Ids per `LookupNames`.
+pub const MAX_LOOKUP: usize = 64;
 
 /// Who is connecting (docs/knowledge/10, "Authentication").
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -151,6 +164,15 @@ pub enum ServerMsg {
     },
     Kicked {
         reason: String,
+    },
+    /// The answer to `LookupNames`: the ids that are accounts, with their names.
+    Names {
+        names: Vec<(PlayerId, String)>,
+    },
+    /// The answer to `FindPlayer`: the name as asked, and the account's id and exact name, if any.
+    PlayerFound {
+        asked: String,
+        found: Option<(PlayerId, String)>,
     },
     /// Already cleaned by the server; draw it as given.
     Chat {

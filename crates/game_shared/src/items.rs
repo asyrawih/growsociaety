@@ -32,6 +32,11 @@ pub const LARGE_CLAIM: ItemId = ItemId(202);
 pub const WORLD_CLAIM: ItemId = ItemId(203);
 pub const MAIN_DOOR: ItemId = ItemId(300);
 pub const WRENCH: ItemId = ItemId(301);
+/// The crafting station (docs/knowledge/18): crafting needs one within reach.
+pub const WORKBENCH: ItemId = ItemId(67);
+/// One-way platforms (docs/knowledge/ux/platforms.md): stand on them, jump up through them.
+pub const WOOD_PLATFORM: ItemId = ItemId(68);
+pub const STONE_PLATFORM: ItemId = ItemId(69);
 /// The starter outfit: the first four `EQUIPMENT` entries (a test checks the names).
 pub const HAIR_BROWN: ItemId = ItemId(EQUIP_ID_BASE);
 pub const SHIRT_RED: ItemId = ItemId(EQUIP_ID_BASE + 1);
@@ -207,6 +212,9 @@ const BASE_ITEMS: &[ItemDef] = &[
     def(CAVE_WALL, "cave wall", Background, Collision::None, 1, 2, 0,             Sprite::Block("bg_dirt.png")),
     def(MAIN_DOOR, "main door", Block,      Collision::None, 0, 0, FIXTURE_FLAGS, Sprite::Block("65_door.png")),
     def(WRENCH,    "wrench",    Tool,       Collision::None, 0, 0, TOOL_FLAGS,    Sprite::Block("64_wrench.png")),
+    def(WORKBENCH, "workbench", Block,      Solid,           0, 6, NO_SEED,       Sprite::Block("67_workbench.png")),
+    def(WOOD_PLATFORM,  "wood platform",  Block, Collision::Platform, 0, 2, NO_SEED, Sprite::Block("68_wood_platform.png")),
+    def(STONE_PLATFORM, "stone platform", Block, Collision::Platform, 0, 5, NO_SEED, Sprite::Block("69_stone_platform.png")),
     // Splice results (docs/knowledge/06). Rarity = sum of the parents' rarities.
     def(GRAVEL,           "gravel",           Block,      Solid,             2, 3, 0, Sprite::Block("09_gravel.png")),
     def(COBBLESTONE,      "cobblestone",      Block,      Solid,             2, 5, 0, Sprite::Block("03_cobblestone.png")),

@@ -3,3 +3,4 @@ world_server_cert.der
 .env
 world_server_cert.der.key
 /dist
+/infra/game/bin/

@@ -348,15 +348,18 @@ fn type_chat(
     game: Res<Game>,
     mut admins: MessageWriter<AdminMsg>,
     mut open: MessageReader<OpenChat>,
+    text_focus: Option<Res<crate::hud::TextFocus>>,
 ) {
     let was_open = chat.open;
+    // A HUD text field (e.g. the claim panel's name box) owns Enter while it has focus.
+    let field_focused = text_focus.is_some_and(|focus| focus.0);
     if open.read().count() > 0 {
         chat.open = true;
     }
     for key in typed.read().filter(|k| k.state == ButtonState::Pressed) {
         if !chat.open {
             // Only a fresh Enter opens it; the press is swallowed below.
-            if key.logical_key == Key::Enter && !key.repeat {
+            if key.logical_key == Key::Enter && !key.repeat && !field_focused {
                 chat.open = true;
             }
             continue;

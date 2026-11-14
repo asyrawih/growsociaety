@@ -97,12 +97,53 @@ impl Inventory {
             _ => false,
         }
     }
+
+    /// Moves raw slot `from` to raw slot `to`: swaps with an occupied
+    /// `to`, or goes last when `to` is past the end. `false` (and nothing changes) for an
+    /// out-of-range `from`, `from == to`, or a move that would change nothing.
+    pub fn move_slot(&mut self, from: u16, to: u16) -> bool {
+        let (from, to, len) = (usize::from(from), usize::from(to), self.slots.len());
+        if from >= len || from == to || (to >= len && from == len - 1) {
+            return false;
+        }
+        if to < len {
+            self.slots.swap(from, to);
+        } else {
+            let slot = self.slots.remove(from);
+            self.slots.push(slot);
+        }
+        true
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::items::{DIRT, EMPTY, ITEMS, SAND, STONE};
+
+    #[test]
+    fn move_slot_swaps_or_moves_to_the_end() {
+        let mut inventory = Inventory::default(); // fist, wrench
+        inventory.add(DIRT, 5);
+        inventory.add(SAND, 3);
+        let order = |inv: &Inventory| inv.slots().iter().map(|s| s.0).collect::<Vec<_>>();
+        assert!(inventory.move_slot(3, 0), "swap onto an occupied slot");
+        assert_eq!(
+            order(&inventory),
+            [SAND, crate::items::WRENCH, DIRT, crate::items::FIST]
+        );
+        assert!(inventory.move_slot(0, 99), "past the end: goes last");
+        assert_eq!(
+            order(&inventory),
+            [crate::items::WRENCH, DIRT, crate::items::FIST, SAND]
+        );
+        let before = inventory.clone();
+        assert!(!inventory.move_slot(9, 0), "out of range");
+        assert!(!inventory.move_slot(1, 1), "same slot");
+        assert!(!inventory.move_slot(3, 50), "already last");
+        assert_eq!(inventory, before, "refusals change nothing");
+        assert_eq!(inventory.count(DIRT), 5, "counts are untouched");
+    }
 
     #[test]
     fn upgrade_cost_rises_by_a_fifth_in_integer_maths() {

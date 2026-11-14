@@ -153,7 +153,7 @@ mod tests {
             x,
             y,
             layer: Layer::Foreground,
-            damage: 1,
+            damage: game_shared::mods::FIST_DAMAGE as u8,
         };
         let (events, result) = send(&mut app, Action::Punch { x, y });
         assert_eq!(events, vec![damaged.clone()]);

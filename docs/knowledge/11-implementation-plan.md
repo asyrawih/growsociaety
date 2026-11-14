@@ -14,6 +14,9 @@ No QC during development: **QC happens once, at the end, when the owner asks for
 2026-11-13). Finished work is reported to the owner, not reviewed step by step. File ownership between
 sessions is in the [README](README.md#who-owns-which-files).
 
+**UI/UX spec first** (owner's rule, 2026-11-14): every new UI or feature gets a one-page spec from the UI/UX session
+(growsociaety-64) in `docs/knowledge/ux/<feature>.md` before it is implemented.
+
 ## Status (2026-11-13)
 
 | Milestone | State | QC |
@@ -42,6 +45,8 @@ on unit tests, pipeline tests and still screenshots.
    - Use `cargo check -p <crate you touched>` and `cargo test -p <that crate>` (or one test by name).
    - Do **not** run `cargo clippy --workspace --all-targets` or `cargo test --workspace` after each change.
    - Batch edits and build once, not after every small edit.
+   - **Never run `cargo fmt --all`** while others work (it rewrites every session's files mid-edit); format only your
+     own files with `rustfmt <file>`. Workspace formatting happens once, at the final QC.
    - **One build at a time** across all sessions: before running cargo, check
      `ps aux | grep -E '[c]argo|[r]ustc'` and wait if another build is running.
    - Batch dependency changes (`Cargo.toml`) into one edit; add dependencies only when needed (a change makes Bevy

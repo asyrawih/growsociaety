@@ -10,8 +10,8 @@ use game_shared::trade::{TRADE_REVIEW_DELAY, Trade, TradeStage};
 
 use crate::audio::Sfx;
 use crate::hud::{
-    FitWindow, HUD_MARGIN, KIT_SCALE, SCROLLBAR_SPACE, SLOT_GAP, ink, label, panel_max_height,
-    scroll_grid, sliced, tab_node,
+    FitWindow, HUD_MARGIN, ItemTip, KIT_SCALE, SCROLLBAR_SPACE, SLOT_GAP, ink, label,
+    panel_max_height, scroll_grid, sliced, tab_node,
 };
 use crate::net::Net;
 use crate::screenshot;
@@ -358,7 +358,7 @@ fn slot_cell(
         ..default()
     };
     let image = sliced(assets, SLOT_IMAGE, SLOT_INSET);
-    let mut cell = parent.spawn((node, image, Hovered::default()));
+    let mut cell = parent.spawn((node, image, ItemTip(stack), Hovered::default()));
     if let Some(button) = button {
         cell.insert(button);
     }

@@ -3,7 +3,10 @@ use bevy::prelude::*;
 mod audio;
 mod camera;
 mod chat;
+mod claim_ui;
+mod craft_ui;
 mod foliage;
+mod hints;
 mod hud;
 mod icon;
 mod interact;
@@ -82,7 +85,13 @@ fn main() {
         chat::ChatPlugin,
         screenshot::DebugScreenshotPlugin,
     ));
-    app.add_plugins((trade_ui::TradeUiPlugin, levels_ui::LevelsUiPlugin));
+    app.add_plugins((
+        trade_ui::TradeUiPlugin,
+        levels_ui::LevelsUiPlugin,
+        craft_ui::CraftUiPlugin,
+        claim_ui::ClaimUiPlugin,
+        hints::HintsPlugin,
+    ));
     app.add_plugins((audio::AudioPlugin, icon::IconPlugin));
     // After `NetPlugin` (voice is online only) and `HudPlugin` (its panel uses the HUD's).
     #[cfg(feature = "voice")]

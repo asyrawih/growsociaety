@@ -27,6 +27,8 @@ const FOOTSTEP_SECS: f32 = 0.35;
 const WALKING_SPEED: f32 = WALK_SPEED * 0.25;
 /// The same sound never starts twice within this many seconds (a held punch, a burst of drops).
 const SFX_MIN_GAP: f32 = 0.08;
+/// The refusal sound plays at most this often, like the refusal text (holding the mouse on bedrock).
+const DENIED_MIN_GAP: f32 = 2.0;
 /// Struck with `punch_stone`; everything else sounds like `punch_dirt`. Claim blocks count too.
 const HARD_BLOCKS: [ItemId; 7] = [
     STONE,
@@ -60,9 +62,10 @@ pub enum Sfx {
     LevelUp,
     UiClick,
     PanelOpen,
+    Craft,
 }
 
-const SFX_COUNT: usize = Sfx::PanelOpen as usize + 1;
+const SFX_COUNT: usize = Sfx::Craft as usize + 1;
 
 impl Sfx {
     fn file(self) -> &'static str {
@@ -86,6 +89,7 @@ impl Sfx {
             Sfx::LevelUp => "audio/sfx/level_up.ogg",
             Sfx::UiClick => "audio/sfx/ui_click.ogg",
             Sfx::PanelOpen => "audio/sfx/panel_open.ogg",
+            Sfx::Craft => "audio/sfx/craft.ogg",
         }
     }
 }
@@ -236,7 +240,12 @@ impl Default for Gaps {
 impl Gaps {
     fn allow(&mut self, sfx: Sfx, now: f32) -> bool {
         let last = &mut self.0[sfx as usize];
-        let free = now - *last >= SFX_MIN_GAP;
+        let gap = if sfx == Sfx::Denied {
+            DENIED_MIN_GAP
+        } else {
+            SFX_MIN_GAP
+        };
+        let free = now - *last >= gap;
         if free {
             *last = now;
         }
@@ -257,6 +266,7 @@ fn event_sfx(event: &Event, me: PlayerId, gems: &mut u32) -> Option<Sfx> {
         Event::TreePlanted { .. } => Some(Sfx::Plant),
         Event::LeftWorld { player } if player == me => Some(Sfx::Door),
         Event::Equipped { player, .. } if player == me => Some(Sfx::Equip),
+        Event::Crafted { player, .. } if player == me => Some(Sfx::Craft),
         // The trade window opens.
         Event::TradeRequested { from, to, .. } if from == me || to == me => Some(Sfx::PanelOpen),
         _ => None,
@@ -355,6 +365,15 @@ mod tests {
     }
 
     #[test]
+    fn the_refusal_sound_waits_two_seconds() {
+        let mut gaps = Gaps::default();
+        assert!(gaps.allow(Sfx::Denied, 0.0));
+        assert!(!gaps.allow(Sfx::Denied, 1.9));
+        assert!(gaps.allow(Sfx::Denied, 2.0));
+        assert!(gaps.allow(Sfx::UiClick, 0.0) && gaps.allow(Sfx::UiClick, 0.1));
+    }
+
+    #[test]
     fn results_map_to_punch_purchase_and_denied_but_cooldown_is_silent() {
         let mut world = generate("TEST");
         let (x, y) = (3, 20);
@@ -429,6 +448,9 @@ mod tests {
             to: ME,
         };
         assert_eq!(event_sfx(&requested, ME, &mut gems), Some(Sfx::PanelOpen));
+        let crafted = |player| Event::Crafted { player, recipe: 0 };
+        assert_eq!(event_sfx(&crafted(ME), ME, &mut gems), Some(Sfx::Craft));
+        assert_eq!(event_sfx(&crafted(OTHER), ME, &mut gems), None);
     }
 
     #[test]

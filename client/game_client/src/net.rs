@@ -18,7 +18,7 @@ use game_protocol::{
 };
 use game_shared::commands::Role;
 use game_shared::mirror::apply_event;
-use game_shared::physics::{Input, step};
+use game_shared::physics::{Input, step_with};
 use game_shared::rules::{Action, Event, PlayerId, WorldState};
 use game_shared::world::TileExtra;
 use quinn::rustls::RootCertStore;
@@ -83,6 +83,12 @@ pub struct Net {
     countries: HashMap<PlayerId, String>,
     /// Our own role, as the server said at login (for which commands to list).
     role: Role,
+    /// Names of players not in the world (offline claim owners, access lists), from `lookup_names`.
+    known_names: HashMap<PlayerId, String>,
+    /// Ids already asked about, so each is looked up once.
+    asked: std::collections::HashSet<PlayerId>,
+    /// Answers to `find_player` (name asked, account found), until taken.
+    found: Vec<(String, Option<(PlayerId, String)>)>,
     /// The newest voice token (url, token) and world-owner mutes, until `voice.rs` takes them.
     voice_token: Option<(String, String)>,
     voice_muted: Vec<(PlayerId, bool)>,
@@ -328,6 +334,9 @@ fn connect(server: &str, world: &str) -> Result<(Net, WorldState, PlayerId), Str
         names,
         countries,
         role,
+        known_names: HashMap::new(),
+        asked: Default::default(),
+        found: Vec::new(),
         voice_token: None,
         voice_muted: Vec::new(),
     };
@@ -362,8 +371,41 @@ impl Net {
         self.names.values().map(String::as_str)
     }
 
+    /// A player's display name: someone in the world, else one learned by `lookup_names`.
     pub fn name(&self, id: PlayerId) -> Option<&str> {
-        self.names.get(&id).map(String::as_str)
+        self.names
+            .get(&id)
+            .or_else(|| self.known_names.get(&id))
+            .map(String::as_str)
+    }
+
+    /// Asks the server for the names of `ids` this client cannot name yet (each id once). The
+    /// answer arrives in a later frame; `name` returns it from then on.
+    /// Asks the server for the account called `name` (the claim panel's Add field). The answer
+    /// comes back through `take_found`.
+    #[allow(dead_code)] // the claim panel (hud.rs, growsociaety-1a) calls it; not wired yet
+    pub fn find_player(&mut self, name: &str) {
+        let _ = self.to_server.send(ClientMsg::FindPlayer {
+            name: name.to_owned(),
+        });
+    }
+
+    /// `find_player` answers since the last call: (name asked, Some((id, exact name)) or None).
+    #[allow(dead_code)] // as above
+    pub fn take_found(&mut self) -> Vec<(String, Option<(PlayerId, String)>)> {
+        std::mem::take(&mut self.found)
+    }
+
+    #[allow(dead_code)] // the claim panel (hud.rs, growsociaety-1a) calls it; not wired yet
+    pub fn lookup_names(&mut self, ids: impl IntoIterator<Item = PlayerId>) {
+        let new: Vec<PlayerId> = ids
+            .into_iter()
+            .filter(|id| self.name(*id).is_none() && self.asked.insert(*id))
+            .take(game_protocol::MAX_LOOKUP)
+            .collect();
+        if !new.is_empty() {
+            let _ = self.to_server.send(ClientMsg::LookupNames { ids: new });
+        }
     }
 
     /// Chat lines received since the last call.
@@ -488,6 +530,13 @@ impl Net {
                     error!("kicked by the server: {reason}");
                 }
                 ServerMsg::Chat { from, text, kind } => self.chat.push((from, text, kind)),
+                ServerMsg::Names { names } => self.known_names.extend(names),
+                ServerMsg::PlayerFound { asked, found } => {
+                    if let Some((id, name)) = &found {
+                        self.known_names.insert(*id, name.clone());
+                    }
+                    self.found.push((asked, found));
+                }
                 ServerMsg::VoiceToken { url, token, .. } => self.voice_token = Some((url, token)),
                 ServerMsg::VoiceMuted { player, muted } => self.voice_muted.push((player, muted)),
                 ServerMsg::Welcome { .. } | ServerMsg::Joined { .. } => {}
@@ -501,10 +550,16 @@ impl Net {
         while self.inputs.front().is_some_and(|&(seq, _)| seq <= ack_seq) {
             self.inputs.pop_front();
         }
-        for &(_, input) in &self.inputs {
-            step(&mut body, input, &game.0.world);
-        }
         let me = game.1;
+        let mods = game
+            .0
+            .players
+            .get(&me)
+            .map(|p| game_shared::mods::worn_mods(&p.equipped))
+            .unwrap_or_default();
+        for &(_, input) in &self.inputs {
+            step_with(&mut body, input, &game.0.world, mods);
+        }
         if let Some(player) = game.0.players.get_mut(&me) {
             player.body = body;
         }
@@ -514,6 +569,7 @@ impl Net {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use game_shared::physics::step;
     use game_shared::worldgen::generate;
 
     fn offline_net() -> (
@@ -537,6 +593,9 @@ mod tests {
             names: HashMap::new(),
             countries: HashMap::new(),
             role: Role::Player,
+            known_names: HashMap::new(),
+            asked: Default::default(),
+            found: Vec::new(),
             voice_token: None,
             voice_muted: Vec::new(),
         };

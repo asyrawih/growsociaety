@@ -8,7 +8,7 @@ use bevy::render::render_resource::TextureFormat;
 use bevy::sprite::{Anchor, Text2dShadow};
 use bevy::text::TextLayoutInfo;
 use game_shared::items::{SLOT_COUNT, item};
-use game_shared::physics::{Body, HITBOX_HEIGHT, Input, TICK_RATE, step};
+use game_shared::physics::{Body, HITBOX_HEIGHT, Input, TICK_RATE, step_with};
 use game_shared::rules::{Action, PUNCH_COOLDOWN, PlayerId, collect_drops};
 use game_shared::tile_to_world;
 
@@ -173,6 +173,8 @@ impl Plugin for PlayerPlugin {
 }
 
 const JUMP_KEYS: [KeyCode; 3] = [KeyCode::Space, KeyCode::KeyW, KeyCode::ArrowUp];
+/// Drop through one-way platforms (docs/knowledge/ux/platforms.md).
+const DOWN_KEYS: [KeyCode; 2] = [KeyCode::KeyS, KeyCode::ArrowDown];
 const LEFT_KEYS: [KeyCode; 2] = [KeyCode::KeyA, KeyCode::ArrowLeft];
 const RIGHT_KEYS: [KeyCode; 2] = [KeyCode::KeyD, KeyCode::ArrowRight];
 
@@ -293,6 +295,7 @@ fn tick_player(
         move_x: i8::from(keys.any_pressed(RIGHT_KEYS)) - i8::from(keys.any_pressed(LEFT_KEYS)),
         jump_held: keys.any_pressed(JUMP_KEYS),
         jump_pressed: std::mem::take(&mut jump.0),
+        down: keys.any_pressed(DOWN_KEYS),
     };
     if input.move_x != 0 {
         player.facing_west = input.move_x < 0;
@@ -303,7 +306,9 @@ fn tick_player(
         return;
     };
     player.previous = me.body;
-    step(&mut me.body, input, &state.world);
+    // The same worn mods the server steps with, so the prediction matches.
+    let mods = game_shared::mods::worn_mods(&me.equipped);
+    step_with(&mut me.body, input, &state.world, mods);
     if let Some(mut net) = net {
         net.input(input);
         return;

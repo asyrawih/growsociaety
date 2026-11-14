@@ -141,6 +141,58 @@ impl Accounts {
         }
     }
 
+    /// The account called `name`, ignoring case.
+    pub async fn find_name(&self, name: &str) -> Option<(PlayerId, String)> {
+        if !game_protocol::valid_name(name) {
+            return None;
+        }
+        match self {
+            Accounts::Memory(store) => store.lock().ok()?.iter().find_map(|a| {
+                a.name
+                    .eq_ignore_ascii_case(name)
+                    .then(|| (PlayerId(a.id), a.name.clone()))
+            }),
+            Accounts::Postgres(pool) => {
+                let row: Option<(i64, String)> =
+                    sqlx::query_as("SELECT id, name FROM account WHERE lower(name) = lower($1)")
+                        .bind(name)
+                        .fetch_optional(pool)
+                        .await
+                        .ok()?;
+                let (id, name) = row?;
+                Some((PlayerId(u32::try_from(id).ok()?), name))
+            }
+        }
+    }
+
+    /// Account names for `ids`; unknown ids are left out.
+    pub async fn names_of(&self, ids: &[PlayerId]) -> Vec<(PlayerId, String)> {
+        match self {
+            Accounts::Memory(store) => store.lock().map_or_else(
+                |_| Vec::new(),
+                |store| {
+                    store
+                        .iter()
+                        .filter(|a| ids.contains(&PlayerId(a.id)))
+                        .map(|a| (PlayerId(a.id), a.name.clone()))
+                        .collect()
+                },
+            ),
+            Accounts::Postgres(pool) => {
+                let wanted: Vec<i64> = ids.iter().map(|id| i64::from(id.0)).collect();
+                let rows: Vec<(i64, String)> =
+                    sqlx::query_as("SELECT id, name FROM account WHERE id = ANY($1)")
+                        .bind(&wanted)
+                        .fetch_all(pool)
+                        .await
+                        .unwrap_or_default();
+                rows.into_iter()
+                    .filter_map(|(id, name)| Some((PlayerId(u32::try_from(id).ok()?), name)))
+                    .collect()
+            }
+        }
+    }
+
     /// Development logins without an account are only for servers without a database.
     pub fn allows_dev(&self) -> bool {
         matches!(self, Accounts::Memory(_))

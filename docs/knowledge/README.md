@@ -23,6 +23,9 @@ the code is laid out. Read `01` first, then the doc for the system you are touch
 | 14 | [Levels and XP](14-levels.md) | Knowledge + technical | XP sources, level curve, level-up event, name colour |
 | 15 | [Mobile (iOS and Android)](15-mobile.md) | Plan | What carries over, what breaks today, touch controls, permissions, store rules, phases |
 | 16 | [Auto-update](16-auto-update.md) | Plan | Server version gate, desktop self-update (Velopack), store updates, signing, release pipeline |
+| 17 | [Growtopia reference](17-growtopia-reference.md) | Research | How the genre reference's systems work (player mods, pickaxes, wings, item categories) and takeaways; structures only, never content |
+| 18 | [Crafting and item mods](18-crafting-and-mods.md) | Knowledge + technical | Mods by slot (extra jump, glide, run, dig, reach, gems), pickaxe ladder to 2×, Workbench and starter recipes |
+| ux/ | [UX specs](ux/) | UI/UX | One-page spec per new UI or feature, written by the UI/UX session (growsociaety-64) **before** implementation (owner's rule, 2026-11-14). Implement from the spec; ask 64 about anything it does not cover |
 
 Art rules live separately in [`../art/STYLE.md`](../art/STYLE.md) and [`../art/tileset-terrain.md`](../art/tileset-terrain.md).
 
@@ -77,7 +80,8 @@ symbols after another session built, `cargo clean -p <crate>` and rebuild.
 
 | Area | Owner |
 |---|---|
-| `docs/knowledge/**` | Research/QC session |
+| `docs/knowledge/**` except `ux/` | Research/QC session |
+| `docs/knowledge/ux/**` (UX specs) | UI/UX session (growsociaety-64) |
 | `crates/game_shared/**` (rules, items, world, farming, claims, …) | Scripting subagent of the research/QC session. The optional `serde` feature and its derives: coding session |
 | `client/game_client/src/{world_view,hud,interact,screenshot}.rs` | Scripting subagent of the research/QC session |
 | `client/game_client/src/player.rs`, `player/rig.rs`, `camera.rs` | Coding session (rig, equipment, zoom) |

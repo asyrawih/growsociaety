@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use game_protocol::{ChatKind, ServerMsg, WorldSnapshot};
 use game_shared::commands::Role;
-use game_shared::physics::{Input, step};
+use game_shared::physics::{Input, step_with};
 use game_shared::rules::{
     Action, Event, PlayerId, WorldState, apply, collect_drops, end_trades_of,
 };
@@ -168,6 +168,8 @@ fn is_private(event: &Event) -> Option<PlayerId> {
         Event::InventoryChanged { player, .. }
         | Event::GemsChanged { player, .. }
         | Event::BackpackUpgraded { player, .. }
+        | Event::InventoryMoved { player, .. }
+        | Event::Crafted { player, .. }
         | Event::XpChanged { player, .. } => Some(player),
         _ => None,
     }
@@ -369,7 +371,8 @@ impl Room {
                     return;
                 };
                 // The server's own step is the position; the client only ever predicts it.
-                step(&mut player.body, input, &state.world);
+                let mods = game_shared::mods::worn_mods(&player.equipped);
+                step_with(&mut player.body, input, &state.world, mods);
                 let events = collect_drops(state, id);
                 self.broadcast(&events, None);
             }
@@ -615,6 +618,56 @@ mod tests {
         };
         assert!(events.iter().all(|e| is_private(e).is_none()), "{events:?}");
         assert!(matches!(events.as_slice(), [Event::ItemDropped { drop }] if drop.y == door.1));
+    }
+
+    #[test]
+    fn moving_an_item_is_private_and_reorders_the_saved_inventory() {
+        let mut room = Room::new(WorldState::new(generate("MOVE"), 1));
+        let (a, b) = (PlayerId(1), PlayerId(2));
+        let mut rx_a = join(&mut room, 1);
+        let mut rx_b = join(&mut room, 2);
+        drain(&mut rx_a);
+        drain(&mut rx_b);
+        room.state
+            .players
+            .get_mut(&a)
+            .expect("joined")
+            .inventory
+            .add(DIRT, 4);
+        let last = room.state.players[&a].inventory.slots().len() as u16 - 1;
+        let action = Action::MoveItem { from: last, to: 0 };
+        room.handle(
+            ToWorld::Act {
+                id: a,
+                seq: 1,
+                action,
+            },
+            1.0,
+        );
+        let to_a = drain(&mut rx_a);
+        assert!(
+            matches!(to_a.as_slice(), [ServerMsg::Acted { result: Ok(events), .. }]
+            if events == &[Event::InventoryMoved { player: a, from: last, to: 0 }]),
+            "{to_a:?}"
+        );
+        assert!(drain(&mut rx_b).is_empty(), "nobody else sees it");
+        // What the next save writes is the new order.
+        let saved = crate::store::PlayerSave::of(&room.state.players[&a]);
+        assert_eq!(saved.items.first().map(|s| s.0), Some(DIRT));
+        let bad = Action::MoveItem { from: 99, to: 0 };
+        room.handle(
+            ToWorld::Act {
+                id: a,
+                seq: 2,
+                action: bad,
+            },
+            1.0,
+        );
+        assert!(matches!(
+            drain(&mut rx_a).as_slice(),
+            [ServerMsg::Acted { result: Err(_), .. }]
+        ));
+        let _ = b;
     }
 
     #[test]

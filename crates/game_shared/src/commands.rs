@@ -76,6 +76,11 @@ pub enum Command {
     Trade {
         who: Target,
     },
+    /// Put a player on (or take them off) the access list of your nearest claim (docs/knowledge/07).
+    Access {
+        who: Target,
+        on: bool,
+    },
     Kick {
         who: Target,
     },
@@ -212,6 +217,7 @@ impl Command {
             Command::Ignore { on: true, .. } => "ignore",
             Command::Ignore { on: false, .. } => "unignore",
             Command::Trade { .. } => "trade",
+            Command::Access { .. } => "access",
             Command::Kick { .. } => "kick",
             Command::Pull { .. } => "pull",
             Command::WorldBan { .. } => "wban",
@@ -292,6 +298,12 @@ pub const COMMANDS: &[Spec] = &[
         "trade",
         "/trade <player>",
         "Ask a player in this world to trade",
+        Anyone,
+    ),
+    spec(
+        "access",
+        "/access <player> on|off",
+        "Let a player edit your nearest claim, or stop them",
         Anyone,
     ),
     spec(
@@ -528,6 +540,14 @@ pub fn parse(line: &str) -> Result<Command, ParseError> {
             on: spec.name == "ignore",
         },
         ("trade", [who]) => Command::Trade { who: target(who) },
+        ("access", [who, switch]) => Command::Access {
+            who: target(who),
+            on: match switch.to_ascii_lowercase().as_str() {
+                "on" => true,
+                "off" => false,
+                _ => return Err(usage),
+            },
+        },
         ("kick", [who]) => Command::Kick { who: target(who) },
         ("pull", [who]) => Command::Pull { who: target(who) },
         ("wban", [who, length @ ..]) => {
@@ -747,6 +767,20 @@ mod tests {
                 },
             ),
             ("/trade Budi", Command::Trade { who: name("Budi") }),
+            (
+                "/access Budi on",
+                Command::Access {
+                    who: name("Budi"),
+                    on: true,
+                },
+            ),
+            (
+                "/access #7 OFF",
+                Command::Access {
+                    who: Target::Id(PlayerId(7)),
+                    on: false,
+                },
+            ),
             ("/kick Budi", Command::Kick { who: name("Budi") }),
             ("/pull Budi", Command::Pull { who: name("Budi") }),
             (
@@ -904,6 +938,7 @@ mod tests {
             ("/ignore a", Requirement::Anyone),
             ("/unignore a", Requirement::Anyone),
             ("/trade a", Requirement::Anyone),
+            ("/access a on", Requirement::Anyone),
             ("/kick a", Requirement::WorldAccess),
             ("/pull a", Requirement::WorldAccess),
             ("/wban a", Requirement::WorldOwner),

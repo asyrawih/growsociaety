@@ -1,14 +1,8 @@
-# world_server image. Build context is the repo root: docker compose -f infra/game/docker-compose.yml build
-FROM rust:1.97-bookworm AS build
-WORKDIR /src
-COPY . .
-# One job by default so the build does not starve other services on the small shared VPS;
-# `--build-arg JOBS=2` when a deploy is urgent.
-ARG JOBS=1
-RUN cargo build --release -p world_server -j ${JOBS}
-
+# world_server runtime image. Nothing is compiled here: scripts/deploy-game.sh cross-compiles the
+# binary on a Mac (x86_64 Linux, glibc 2.36 = bookworm) into infra/game/bin/. Build context is the
+# repo root, filtered by /.dockerignore.
 FROM debian:bookworm-slim
-COPY --from=build /src/target/release/world_server /usr/local/bin/world_server
+COPY infra/game/bin/world_server /usr/local/bin/world_server
 WORKDIR /data
 EXPOSE 7777/udp
 CMD ["world_server"]

@@ -1,6 +1,7 @@
 //! Player movement as a pure function. Client and server run the same `step` (docs/knowledge/04).
 
 use crate::items::{Collision, item};
+use crate::mods::{EXTRA_JUMP_VELOCITY, GLIDE_FALL_SPEED, Mods};
 use crate::world::World;
 use crate::{TILE_SIZE, WORLD_HEIGHT, WORLD_WIDTH, tile_to_world};
 
@@ -21,6 +22,9 @@ pub const MAX_FALL_SPEED: f32 = 24.0 * TILE_SIZE;
 pub const COYOTE_TIME: f32 = 0.1;
 /// Seconds.
 pub const JUMP_BUFFER: f32 = 0.1;
+/// The biggest RunBoost in `mods::ITEM_MODS`, for the tunnelling check below.
+const MAX_RUN_PCT: f32 = 20.0;
+
 /// Px. Open decision D2: change the height here for 1-tile tunnels.
 pub const HITBOX_WIDTH: f32 = 20.0;
 pub const HITBOX_HEIGHT: f32 = 44.0;
@@ -34,6 +38,8 @@ const HALF_H: f32 = HITBOX_HEIGHT / 2.0;
 const _: () = assert!(MAX_FALL_SPEED / TICK_RATE < TILE_SIZE);
 const _: () = assert!(JUMP_VELOCITY / TICK_RATE < TILE_SIZE);
 const _: () = assert!(WALK_SPEED / TICK_RATE < TILE_SIZE);
+const _: () = assert!(WALK_SPEED * (1.0 + MAX_RUN_PCT / 100.0) / TICK_RATE < TILE_SIZE);
+const _: () = assert!(EXTRA_JUMP_VELOCITY / TICK_RATE < TILE_SIZE);
 
 #[derive(Clone, Copy, Default, PartialEq, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -42,6 +48,9 @@ pub struct Input {
     pub move_x: i8,
     pub jump_held: bool,
     pub jump_pressed: bool,
+    /// Held: fall through every one-way platform; pressed on one, drop through it
+    /// (docs/knowledge/ux/platforms.md).
+    pub down: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -55,6 +64,8 @@ pub struct Body {
     pub jump_buffer: f32,
     /// Rising from a jump that has not been cut yet; makes the jump cut apply once per jump.
     pub jump_cut_ready: bool,
+    /// The ExtraJump mod's one mid-air jump is spent; cleared on landing.
+    pub extra_jump_used: bool,
 }
 
 /// A body at rest on the main door tile: centred on it, hitbox bottom on the tile's bottom edge.
@@ -67,7 +78,17 @@ pub fn spawn_body(world: &World) -> Body {
         coyote: 0.0,
         jump_buffer: 0.0,
         jump_cut_ready: false,
+        extra_jump_used: false,
     }
+}
+
+fn platform(world: &World, tx: i32, ty: i32) -> bool {
+    let tile = u32::try_from(tx)
+        .ok()
+        .zip(u32::try_from(ty).ok())
+        .and_then(|(x, y)| world.get(x, y));
+    tile.and_then(|tile| item(tile.fg))
+        .is_some_and(|def| def.collision == Collision::Platform)
 }
 
 fn solid(world: &World, tx: i32, ty: i32) -> bool {
@@ -111,8 +132,14 @@ fn approach(value: f32, target: f32, max_delta: f32) -> f32 {
     value + (target - value).clamp(-max_delta, max_delta)
 }
 
-/// Advances `body` by exactly `1 / TICK_RATE` seconds.
+/// Advances `body` by exactly `1 / TICK_RATE` seconds, with no item mods.
 pub fn step(body: &mut Body, input: Input, world: &World) {
+    step_with(body, input, world, Mods::default());
+}
+
+/// `step` with the movement mods of what the player wears (`mods::worn_mods`). The client's
+/// prediction and the server must pass the same mods, so reconciliation stays exact.
+pub fn step_with(body: &mut Body, input: Input, world: &World, mods: Mods) {
     // 1. Timers.
     body.coyote = (body.coyote - DT).max(0.0);
     body.jump_buffer = (body.jump_buffer - DT).max(0.0);
@@ -126,7 +153,8 @@ pub fn step(body: &mut Body, input: Input, world: &World) {
     } else {
         AIR_ACCEL
     };
-    let target = f32::from(input.move_x.signum()) * WALK_SPEED;
+    let speed = WALK_SPEED * (1.0 + f32::from(mods.run_pct) / 100.0);
+    let target = f32::from(input.move_x.signum()) * speed;
     body.vel.0 = approach(body.vel.0, target, accel * DT);
 
     // 3. Jump.
@@ -134,6 +162,11 @@ pub fn step(body: &mut Body, input: Input, world: &World) {
         body.vel.1 = JUMP_VELOCITY;
         body.coyote = 0.0;
         body.jump_buffer = 0.0;
+        body.jump_cut_ready = true;
+    } else if input.jump_pressed && mods.extra_jump && !body.extra_jump_used {
+        body.vel.1 = EXTRA_JUMP_VELOCITY;
+        body.jump_buffer = 0.0;
+        body.extra_jump_used = true;
         body.jump_cut_ready = true;
     }
 
@@ -146,7 +179,12 @@ pub fn step(body: &mut Body, input: Input, world: &World) {
     }
 
     // 5. Gravity.
-    body.vel.1 = (body.vel.1 - GRAVITY * DT).max(-MAX_FALL_SPEED);
+    let max_fall = if mods.glide && input.jump_held {
+        GLIDE_FALL_SPEED
+    } else {
+        MAX_FALL_SPEED
+    };
+    body.vel.1 = (body.vel.1 - GRAVITY * DT).max(-max_fall);
 
     // 6. Move X, resolve.
     body.pos.0 += body.vel.0 * DT;
@@ -166,13 +204,33 @@ pub fn step(body: &mut Body, input: Input, world: &World) {
         body.vel.0 = 0.0;
     }
 
-    // 7. Move Y, resolve.
+    // 7. Move Y, resolve. One-way platforms only catch feet that were at or above their top edge
+    // a tick ago, so jumping up through them and walking through them just works. Down ignores
+    // them for that tick: a tap drops through the one stood on (a tick later the feet are below
+    // it, so it no longer catches), holding falls through a whole stack.
+    let feet_before = body.pos.1 - HALF_H;
     body.pos.1 += body.vel.1 * DT;
     body.on_ground = false;
+    let feet = body.pos.1 - HALF_H;
     if body.vel.1 < 0.0 {
-        let floor = overlapped_solids(world, body.pos)
+        let solid_floor = overlapped_solids(world, body.pos)
             .map(|(_, ty)| (ty + 1) as f32 * TILE_SIZE + HALF_H)
             .reduce(f32::max);
+        let platform_floor = if input.down {
+            None
+        } else {
+            let columns = tile_span(body.pos.0 - HALF_W, body.pos.0 + HALF_W);
+            tile_span(feet, body.pos.1 + HALF_H)
+                .filter(|&ty| columns.clone().any(|tx| platform(world, tx, ty)))
+                .map(|ty| (ty + 1) as f32 * TILE_SIZE)
+                .filter(|&top| feet_before >= top - COLLISION_EPSILON && feet < top)
+                .map(|top| top + HALF_H)
+                .reduce(f32::max)
+        };
+        let floor = match (solid_floor, platform_floor) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
         if let Some(y) = floor {
             body.pos.1 = y;
             body.vel.1 = 0.0;
@@ -205,6 +263,7 @@ pub fn step(body: &mut Body, input: Input, world: &World) {
 
     if body.on_ground {
         body.coyote = COYOTE_TIME;
+        body.extra_jump_used = false;
     }
 }
 
@@ -221,11 +280,13 @@ mod tests {
         move_x: 1,
         jump_held: false,
         jump_pressed: false,
+        down: false,
     };
     const HOLD_JUMP: Input = Input {
         move_x: 0,
         jump_held: true,
         jump_pressed: false,
+        down: false,
     };
 
     fn put(world: &mut World, x: u32, y: u32) {
@@ -461,6 +522,7 @@ mod tests {
                 move_x,
                 jump_held: true,
                 jump_pressed: true,
+                down: false,
             };
             for _ in 0..300 {
                 step(&mut body, input, &world);
@@ -508,6 +570,7 @@ mod tests {
                     move_x: rng.range(0, 2) as i8 - 1,
                     jump_held: rng.chance(0.5),
                     jump_pressed: rng.chance(0.05),
+                    down: rng.chance(0.1),
                 };
                 step(&mut body, input, &world);
                 trace.push((
@@ -521,5 +584,317 @@ mod tests {
         let first = run();
         assert!(first.iter().any(|t| t.0 != first[0].0), "body never moved");
         assert_eq!(first, run());
+    }
+}
+
+#[cfg(test)]
+mod mod_tests {
+    use super::*;
+    use crate::items::{DIRT, EMPTY};
+    use crate::world::Tile;
+    use crate::worldgen::generate;
+
+    fn mods(f: impl FnOnce(&mut Mods)) -> Mods {
+        let mut m = Mods::default();
+        f(&mut m);
+        m
+    }
+
+    /// Flat floor at row 1, a wall of `height` tiles at column `wall`.
+    fn wall_world(wall: u32, height: u32) -> World {
+        let mut world = generate("MODS");
+        for y in 0..crate::WORLD_HEIGHT {
+            for x in 0..crate::WORLD_WIDTH {
+                let fg = if y == 0 || (x == wall && (1..=height).contains(&y)) {
+                    DIRT
+                } else {
+                    EMPTY
+                };
+                world.set(x, y, Tile { fg, bg: EMPTY });
+            }
+        }
+        world.door = (wall - 3, 1);
+        world
+    }
+
+    /// Walks right, jumps, jumps again at the top: does the body end up past the wall?
+    fn clears(height: u32, m: Mods) -> bool {
+        let world = wall_world(20, height);
+        let mut body = spawn_body(&world);
+        for _ in 0..30 {
+            step_with(&mut body, Input::default(), &world, m);
+        }
+        let mut pressed = false;
+        for tick in 0..240 {
+            let jump = tick == 0 || (!pressed && body.vel.1 <= 0.0 && tick > 1);
+            pressed |= jump && tick > 0;
+            let input = Input {
+                move_x: 1,
+                jump_pressed: jump,
+                down: false,
+                jump_held: true,
+            };
+            step_with(&mut body, input, &world, m);
+        }
+        body.pos.0 > 21.0 * TILE_SIZE
+    }
+
+    #[test]
+    fn extra_jump_clears_three_tiles_not_five_and_only_once() {
+        let jumper = mods(|m| m.extra_jump = true);
+        assert!(clears(3, jumper));
+        assert!(!clears(5, jumper));
+        assert!(
+            !clears(3, Mods::default()),
+            "without the mod a 3-tile wall stops you"
+        );
+        // A second press in the same airtime does nothing.
+        let world = wall_world(60, 1);
+        let mut body = spawn_body(&world);
+        for _ in 0..30 {
+            step_with(&mut body, Input::default(), &world, jumper);
+        }
+        let press = Input {
+            jump_pressed: true,
+            jump_held: true,
+            ..Input::default()
+        };
+        step_with(&mut body, press, &world, jumper);
+        while body.vel.1 > 0.0 {
+            step_with(
+                &mut body,
+                Input {
+                    jump_held: true,
+                    ..Input::default()
+                },
+                &world,
+                jumper,
+            );
+        }
+        step_with(&mut body, press, &world, jumper);
+        assert!(body.extra_jump_used && body.vel.1 > 0.0);
+        while body.vel.1 > 0.0 {
+            step_with(&mut body, Input::default(), &world, jumper);
+        }
+        step_with(&mut body, press, &world, jumper);
+        assert!(body.vel.1 <= 0.0, "no third jump");
+    }
+
+    #[test]
+    fn glide_caps_the_fall_only_while_jump_is_held() {
+        let world = wall_world(60, 1);
+        let glider = mods(|m| m.glide = true);
+        let mut body = spawn_body(&world);
+        body.pos.1 = 40.0 * TILE_SIZE;
+        for _ in 0..60 {
+            step_with(
+                &mut body,
+                Input {
+                    jump_held: true,
+                    ..Input::default()
+                },
+                &world,
+                glider,
+            );
+        }
+        assert!(body.vel.1 >= -GLIDE_FALL_SPEED);
+        for _ in 0..30 {
+            step_with(&mut body, Input::default(), &world, glider);
+        }
+        assert!(body.vel.1 < -GLIDE_FALL_SPEED, "released: falls fast again");
+    }
+
+    #[test]
+    fn run_boost_twenty_walks_at_seven_point_two() {
+        // The wall is 3 tiles right of the spawn: run left, into the open.
+        let world = wall_world(90, 1);
+        let mut body = spawn_body(&world);
+        let m = mods(|m| m.run_pct = 20);
+        let left = Input {
+            move_x: -1,
+            ..Input::default()
+        };
+        for _ in 0..60 {
+            step_with(&mut body, left, &world, m);
+        }
+        let speed = -body.vel.0;
+        assert!(
+            (speed - 7.2 * TILE_SIZE).abs() < 0.01,
+            "{}",
+            speed / TILE_SIZE
+        );
+    }
+
+    #[test]
+    fn same_mods_same_steps_bit_for_bit() {
+        let world = generate("MODS");
+        let m = mods(|m| {
+            m.extra_jump = true;
+            m.run_pct = 10;
+        });
+        let (mut a, mut b) = (spawn_body(&world), spawn_body(&world));
+        for tick in 0..300u32 {
+            let input = Input {
+                move_x: if tick % 90 < 45 { 1 } else { -1 },
+                jump_pressed: tick % 37 == 0,
+                down: tick % 53 < 3,
+                jump_held: tick % 37 < 20,
+            };
+            step_with(&mut a, input, &world, m);
+            step_with(&mut b, input, &world, m);
+        }
+        assert_eq!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+    use crate::items::{DIRT, EMPTY, STONE_PLATFORM, WOOD_PLATFORM};
+    use crate::world::Tile;
+    use crate::worldgen::generate;
+
+    /// Flat ground at row 0, platforms at the given rows across columns 40..60, spawn at column 50.
+    fn world_with(rows: &[u32]) -> World {
+        let mut world = generate("PLATFORMS");
+        for y in 0..crate::WORLD_HEIGHT {
+            for x in 0..crate::WORLD_WIDTH {
+                let fg = if y == 0 {
+                    DIRT
+                } else if (40..60).contains(&x) && rows.contains(&y) {
+                    if y % 2 == 0 {
+                        WOOD_PLATFORM
+                    } else {
+                        STONE_PLATFORM
+                    }
+                } else {
+                    EMPTY
+                };
+                world.set(x, y, Tile { fg, bg: EMPTY });
+            }
+        }
+        world.door = (50, 1);
+        world
+    }
+
+    fn settle(body: &mut Body, world: &World, input: Input, ticks: u32) {
+        for _ in 0..ticks {
+            step(body, input, world);
+        }
+    }
+
+    fn feet_row(body: &Body) -> f32 {
+        (body.pos.1 - HALF_H) / TILE_SIZE
+    }
+
+    #[test]
+    fn jump_up_through_and_land_on_top() {
+        let world = world_with(&[2]);
+        let mut body = spawn_body(&world);
+        settle(&mut body, &world, Input::default(), 30);
+        assert!(body.on_ground && feet_row(&body) == 1.0);
+        let jump = Input {
+            jump_pressed: true,
+            jump_held: true,
+            ..Input::default()
+        };
+        step(&mut body, jump, &world);
+        settle(
+            &mut body,
+            &world,
+            Input {
+                jump_held: true,
+                ..Input::default()
+            },
+            120,
+        );
+        assert!(body.on_ground, "landed");
+        assert_eq!(feet_row(&body), 3.0, "on top of the platform at row 2");
+    }
+
+    #[test]
+    fn walking_sideways_passes_through() {
+        // A platform at row 1 is level with the feet: walking into it from the side does not stop.
+        let world = world_with(&[1, 2]);
+        let mut body = spawn_body(&world);
+        body.pos.0 = 30.0 * TILE_SIZE;
+        settle(&mut body, &world, Input::default(), 30);
+        let start = body.pos.0;
+        settle(
+            &mut body,
+            &world,
+            Input {
+                move_x: 1,
+                ..Input::default()
+            },
+            120,
+        );
+        assert!(body.pos.0 > start + 10.0 * TILE_SIZE, "walked through");
+    }
+
+    #[test]
+    fn tap_down_drops_one_platform_hold_drops_all() {
+        let world = world_with(&[6, 3]);
+        let start = |world: &World| {
+            let mut body = spawn_body(world);
+            body.pos.1 = 7.0 * TILE_SIZE + HALF_H;
+            body
+        };
+        let mut body = start(&world);
+        settle(&mut body, &world, Input::default(), 30);
+        assert_eq!(feet_row(&body), 7.0, "standing on the top platform");
+        step(
+            &mut body,
+            Input {
+                down: true,
+                ..Input::default()
+            },
+            &world,
+        );
+        settle(&mut body, &world, Input::default(), 60);
+        assert_eq!(feet_row(&body), 4.0, "a tap drops through one");
+
+        let mut body = start(&world);
+        settle(&mut body, &world, Input::default(), 30);
+        settle(
+            &mut body,
+            &world,
+            Input {
+                down: true,
+                ..Input::default()
+            },
+            90,
+        );
+        assert_eq!(
+            feet_row(&body),
+            1.0,
+            "holding drops through both, onto the ground"
+        );
+    }
+
+    #[test]
+    fn down_on_ground_does_nothing_and_a_platform_never_moves_a_player() {
+        let world = world_with(&[]);
+        let mut body = spawn_body(&world);
+        settle(&mut body, &world, Input::default(), 30);
+        let before = body;
+        settle(
+            &mut body,
+            &world,
+            Input {
+                down: true,
+                ..Input::default()
+            },
+            30,
+        );
+        assert_eq!(body, before);
+        // A platform where the player stands (rows 1 and 2 overlap the hitbox).
+        let mut inside = world_with(&[1, 2]);
+        inside.door = (50, 1);
+        let mut body = spawn_body(&inside);
+        settle(&mut body, &world, Input::default(), 30);
+        let still = body;
+        settle(&mut body, &inside, Input::default(), 30);
+        assert_eq!(body.pos, still.pos, "not pushed");
     }
 }

@@ -73,6 +73,13 @@ pub fn apply_event(state: &mut WorldState, event: &Event, now: f64) {
                 player.gems = gems;
             }
         }
+        // Feedback only; its inventory changes came as their own events.
+        Event::Crafted { .. } => {}
+        &Event::InventoryMoved { player, from, to } => {
+            if let Some(player) = state.players.get_mut(&player) {
+                player.inventory.move_slot(from, to);
+            }
+        }
         &Event::BackpackUpgraded { player, capacity } => {
             if let Some(player) = state.players.get_mut(&player) {
                 player.inventory.capacity = capacity;
