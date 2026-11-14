@@ -1,6 +1,7 @@
 //! Mouse and keys -> `Action`. Shows which tile is hovered and whether it is in range, flashes a
 //! tile when the rules reject an action on it (a blinking lock on a protected one), and opens the
-//! claim panel for a claim clicked with the wrench (`claim_ui.rs`). Decides nothing itself.
+//! claim panel for a claim clicked with the wrench (`claim_ui.rs`). A right-click, a wrench-click or a
+//! long-press on a player opens the avatar menu instead (`avatar_menu.rs`). Decides nothing itself.
 
 use bevy::picking::hover::Hovered;
 use bevy::platform::collections::HashMap;
@@ -11,10 +12,11 @@ use game_shared::items::{
     FIST, ItemId, MAIN_DOOR, PERMANENT, UNTRADEABLE, WORKBENCH, WRENCH, item, slot_of,
 };
 use game_shared::mods::worn_mods;
-use game_shared::rules::{Action, Event, PUNCH_COOLDOWN, Reject, in_reach_with};
+use game_shared::rules::{Action, Event, PUNCH_COOLDOWN, PlayerId, Reject, in_reach_with};
 use game_shared::world::World;
 use game_shared::{TILE_SIZE, tile_to_world, world_to_tile};
 
+use crate::avatar_menu::{OpenAvatarMenu, player_at};
 use crate::farming_ui::LONG_PRESS_SECS;
 use crate::hud::{
     ItemDrag, Notice, OpenPanel, Selected, WardrobeSelected, discard_target, key_name,
@@ -52,6 +54,14 @@ const LOCK_BLINK_SECS: f32 = 0.1;
 /// The tile under the cursor, if the cursor is over the world and not over the HUD.
 #[derive(Resource, Default)]
 pub(crate) struct HoveredTile(pub Option<(u32, u32)>);
+
+/// The player under the cursor (over the world, not the HUD): right-click or wrench-click opens
+/// the avatar menu on them.
+#[derive(Resource, Default)]
+pub(crate) struct HoveredPlayer(pub Option<PlayerId>);
+
+/// A touch held this far (px) from where it started is a drag, not a long-press.
+const TOUCH_SLOP: f32 = 12.0;
 
 /// The claim block the player is looking at with the wrench. View state only.
 #[derive(Resource, Default)]
@@ -137,11 +147,12 @@ impl Plugin for InteractPlugin {
     fn build(&self, app: &mut App) {
         app.add_message::<DiscardPress>()
             .init_resource::<HoveredTile>()
+            .init_resource::<HoveredPlayer>()
             .init_resource::<InspectedClaim>()
             .add_systems(Startup, spawn_highlight)
             .add_systems(
                 Update,
-                (hover, (click, inspect, discard))
+                (hover, (click, inspect, pick_player, discard))
                     .chain()
                     .in_set(Phase::Input),
             )
@@ -164,15 +175,20 @@ fn hover(
     ui: Query<&Hovered>,
     drag: Res<ItemDrag>,
     mut hovered: ResMut<HoveredTile>,
+    mut hovered_player: ResMut<HoveredPlayer>,
     highlight: Single<(&mut Sprite, &mut Transform, &mut Visibility), With<Highlight>>,
 ) {
     let (camera, camera_transform) = *camera;
     // On the HUD, or carrying an item from it, the pointer belongs to the HUD, not to the world.
-    hovered.0 = window
+    let point = window
         .cursor_position()
         .filter(|_| !pointer_over_ui(&ui) && !drag.busy())
-        .and_then(|cursor| camera.viewport_to_world_2d(camera_transform, cursor).ok())
-        .and_then(|point| world_to_tile(point.x, point.y));
+        .and_then(|cursor| camera.viewport_to_world_2d(camera_transform, cursor).ok());
+    hovered.0 = point.and_then(|point| world_to_tile(point.x, point.y));
+    let player = point.and_then(|point| player_at(&game, point));
+    if hovered_player.0 != player {
+        hovered_player.0 = player;
+    }
 
     let (mut sprite, mut transform, mut visibility) = highlight.into_inner();
     let Some((x, y)) = hovered.0 else {
@@ -211,9 +227,49 @@ fn click(
     mut touch_started: Local<HashMap<u64, f32>>,
     mut open: ResMut<OpenPanel>,
     mut actions: MessageWriter<ActionMsg>,
+    mut menus: MessageWriter<OpenAvatarMenu>,
+    mut long_pressed: Local<Vec<u64>>,
 ) {
     let now = time.elapsed_secs_f64();
+    // A long-press on a player opens the avatar menu, whatever is selected (players before tiles).
+    {
+        let (camera, camera_transform) = *camera;
+        let secs = time.elapsed_secs();
+        for touch in touches.iter() {
+            let held = touch_started
+                .get(&touch.id())
+                .map_or(0.0, |&from| secs - from);
+            if held < LONG_PRESS_SECS
+                || touch.distance().length() > TOUCH_SLOP
+                || long_pressed.contains(&touch.id())
+                || pointer_over_ui(&ui)
+            {
+                continue;
+            }
+            let point = camera
+                .viewport_to_world_2d(camera_transform, touch.position())
+                .ok();
+            if let Some(player) = point.and_then(|point| player_at(&game, point)) {
+                long_pressed.push(touch.id());
+                menus.write(OpenAvatarMenu {
+                    player,
+                    touch: true,
+                });
+            }
+        }
+        long_pressed.retain(|&id| touches.get_pressed(id).is_some());
+    }
     let Some(item) = selected.item(&game).filter(|&item| item != WRENCH) else {
+        // Still note when touches start, for the long-press above.
+        for touch in touches.iter_just_pressed() {
+            touch_started.insert(touch.id(), time.elapsed_secs());
+        }
+        for touch in touches
+            .iter_just_released()
+            .chain(touches.iter_just_canceled())
+        {
+            touch_started.remove(&touch.id());
+        }
         return;
     };
     let act = |x, y| {
@@ -235,6 +291,13 @@ fn click(
             let point = camera.viewport_to_world_2d(camera_transform, screen).ok()?;
             world_to_tile(point.x, point.y)
         };
+        let on_player = |screen: Vec2| {
+            camera
+                .viewport_to_world_2d(camera_transform, screen)
+                .ok()
+                .and_then(|point| player_at(&game, point))
+                .is_some()
+        };
         let secs = time.elapsed_secs();
         for touch in touches.iter_just_pressed() {
             touch_started.insert(touch.id(), secs);
@@ -255,8 +318,10 @@ fn click(
                 }
                 continue;
             }
-            let on_tree = game.0.world.tree(x, y).is_some();
-            if !fired && touch_fires(on_tree, held, released, cadence_ready) {
+            // A player is treated like a tree: only a short tap acts, so a long-press (the avatar
+            // menu) never punches what is behind them.
+            let tap_only = game.0.world.tree(x, y).is_some() || on_player(touch.position());
+            if !fired && touch_fires(tap_only, held, released, cadence_ready) {
                 actions.write(act(x, y));
                 fired = true;
             }
@@ -307,6 +372,7 @@ fn inspect(
     game: Res<Game>,
     selected: Res<Selected>,
     hovered: Res<HoveredTile>,
+    hovered_player: Res<HoveredPlayer>,
     mut inspected: ResMut<InspectedClaim>,
     mut open: ResMut<OpenPanel>,
 ) {
@@ -324,6 +390,10 @@ fn inspect(
     ) else {
         return;
     };
+    // On a player the wrench opens the avatar menu (`pick_player`), not the claim under them.
+    if hovered_player.0.is_some() {
+        return;
+    }
     let workbench = game.0.world.get(x, y).is_some_and(|t| t.fg == WORKBENCH);
     let near = game
         .me()
@@ -342,6 +412,27 @@ fn inspect(
         None if *open == OpenPanel::Claim => open.set_if_neq(OpenPanel::None),
         None => false,
     };
+}
+
+/// Right-click, or a left click with the wrench, on a player opens the avatar menu.
+fn pick_player(
+    mouse: Res<ButtonInput<MouseButton>>,
+    game: Res<Game>,
+    selected: Res<Selected>,
+    hovered_player: Res<HoveredPlayer>,
+    mut menus: MessageWriter<OpenAvatarMenu>,
+) {
+    let wrench_click =
+        mouse.just_pressed(MouseButton::Left) && selected.item(&game) == Some(WRENCH);
+    if let (true, Some(player)) = (
+        mouse.just_pressed(MouseButton::Right) || wrench_click,
+        hovered_player.0,
+    ) {
+        menus.write(OpenAvatarMenu {
+            player,
+            touch: false,
+        });
+    }
 }
 
 /// Q drops one of the selected item on the side the player faces, Shift+Q the whole stack. X

@@ -2,7 +2,7 @@
 //! its queue, and is the only caller of `apply`, `step` and `collect_drops` on the server. No locks
 //! around world state, and no two commands ever interleave (docs/knowledge/10, "One world, one task").
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -82,7 +82,19 @@ pub enum ToWorld {
         player: PlayerId,
         muted: bool,
     },
+    /// `id` reports `target`: answered with the chat lines `id` last received here (JSON), or
+    /// `None` when `target` is not in this world. Writes the audit line.
+    Report {
+        id: PlayerId,
+        target: PlayerId,
+        reason: game_protocol::ReportReason,
+        note: Option<String>,
+        reply: oneshot::Sender<Option<String>>,
+    },
 }
+
+/// Chat lines kept per member for reports: the last ones they received.
+pub const HEARD_LINES: usize = 20;
 
 /// A message for one connection, and how to send it.
 #[derive(Debug)]
@@ -251,6 +263,8 @@ pub struct Room {
     pub(crate) touched: bool,
     /// Who entered a fresh world first: its first save counts towards their creation limit.
     pub(crate) opener: Option<PlayerId>,
+    /// The last `HEARD_LINES` World/Private lines each member received: (speaker, text, time).
+    pub(crate) heard: HashMap<PlayerId, VecDeque<(PlayerId, String, f64)>>,
 }
 
 impl Room {
@@ -273,6 +287,7 @@ impl Room {
             fresh: false,
             touched: false,
             opener: None,
+            heard: HashMap::new(),
             acks: Vec::new(),
             leavers: Vec::new(),
             trade_parties: HashMap::new(),
@@ -359,19 +374,17 @@ impl Room {
                         save.apply_to(player);
                     }
                     notices = save.notices;
+                    // Muted in every world: the saved `/ignore` list.
+                    self.ignores
+                        .insert(id, save.ignores.iter().copied().collect());
                 }
                 self.names.insert(id, name.clone());
                 if let Some(code) = &country {
                     self.countries.insert(id, code.clone());
                 }
-                let Some(mut snapshot) = WorldSnapshot::of(&self.state, id, &self.names) else {
+                let Some(snapshot) = self.snapshot_for(id) else {
                     return;
                 };
-                snapshot.countries = self
-                    .countries
-                    .iter()
-                    .map(|(&id, code)| (id, code.clone()))
-                    .collect();
                 let (body, equipped, level) =
                     (snapshot.you.body, snapshot.you.equipped, snapshot.you.level);
                 let snapshot = Box::new(snapshot);
@@ -391,6 +404,7 @@ impl Room {
                     level,
                     name,
                     country,
+                    role,
                 };
                 for member in self.members.values() {
                     let _ = member.out.try_send(Out::Reliable(joined.clone()));
@@ -401,11 +415,25 @@ impl Room {
                 for notice in notices {
                     self.system(id, notice);
                 }
+                // An empty list is the client's default: only a non-empty one is sent.
+                if self.ignores.get(&id).is_some_and(|set| !set.is_empty()) {
+                    self.send_ignoring(id);
+                }
             }
             ToWorld::Leave { id } => self.remove(id),
             ToWorld::Flush { done } => {
                 self.acks.push(done);
                 self.save_due = true;
+            }
+            ToWorld::Report {
+                id,
+                target,
+                reason,
+                note,
+                reply,
+            } => {
+                let found = self.report(id, target, reason, note.as_deref(), now);
+                let _ = reply.send(found);
             }
             ToWorld::VoiceMute { id, player, muted } => {
                 if self.members.contains_key(&id) {
@@ -483,6 +511,7 @@ impl Room {
             .filter(|&to| !self.ignoring(to, id))
             .collect();
         for to in ids {
+            self.heard(to, id, &text, now);
             let msg = ServerMsg::Chat {
                 from: id,
                 text: text.clone(),
@@ -518,6 +547,76 @@ impl Room {
         }
     }
 
+    /// The world as `id` should see it on joining: with everyone's names, countries and roles.
+    pub(crate) fn snapshot_for(&self, id: PlayerId) -> Option<WorldSnapshot> {
+        let mut snapshot = WorldSnapshot::of(&self.state, id, &self.names)?;
+        snapshot.countries = (self.countries.iter())
+            .map(|(&id, code)| (id, code.clone()))
+            .collect();
+        snapshot.roles = self.roles.iter().map(|(&id, &role)| (id, role)).collect();
+        Some(snapshot)
+    }
+
+    /// A player's save, with their `/ignore` list.
+    pub(crate) fn save_of(&self, player: &game_shared::rules::Player) -> PlayerSave {
+        let mut save = PlayerSave::of(player);
+        if let Some(ignored) = self.ignores.get(&player.id) {
+            save.ignores = ignored.iter().copied().collect();
+            save.ignores.sort_by_key(|p| p.0);
+        }
+        save
+    }
+
+    /// Tells `id` everyone they ignore (`ServerMsg::Ignoring`).
+    pub(crate) fn send_ignoring(&mut self, id: PlayerId) {
+        let mut ids: Vec<PlayerId> = self
+            .ignores
+            .get(&id)
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default();
+        ids.sort_by_key(|p| p.0);
+        self.send(id, Out::Reliable(ServerMsg::Ignoring { ids }));
+    }
+
+    /// Remembers a chat line `to` received, for a later report.
+    pub(crate) fn heard(&mut self, to: PlayerId, from: PlayerId, text: &str, now: f64) {
+        let lines = self.heard.entry(to).or_default();
+        if lines.len() == HEARD_LINES {
+            lines.pop_front();
+        }
+        lines.push_back((from, text.to_owned(), now));
+    }
+
+    /// `id` reports `target`: the audit line, and the context lines as JSON, or `None` if
+    /// `target` is not here.
+    fn report(
+        &mut self,
+        id: PlayerId,
+        target: PlayerId,
+        reason: game_protocol::ReportReason,
+        note: Option<&str>,
+        now: f64,
+    ) -> Option<String> {
+        if !self.members.contains_key(&target) || target == id {
+            return None;
+        }
+        let lines: Vec<serde_json::Value> = self
+            .heard
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .map(|(from, text, at)| serde_json::json!({ "from": from.0, "text": text, "at": at }))
+            .collect();
+        let line = format!(
+            "/report #{} {} {}",
+            target.0,
+            reason.name(),
+            note.unwrap_or("")
+        );
+        self.audit_line(id, line.trim_end(), now);
+        Some(serde_json::Value::Array(lines).to_string())
+    }
+
     fn count_members(&self) {
         let count = u8::try_from(self.members.len()).unwrap_or(u8::MAX);
         self.population.store(count, Ordering::Relaxed);
@@ -533,7 +632,7 @@ impl Room {
         self.broadcast(&ended, Some(id));
         // Their final inventory is saved before the player leaves `state.players`.
         if let Some(player) = self.state.players.get(&id) {
-            self.leavers.push(PlayerSave::of(player));
+            self.leavers.push(self.save_of(player));
         }
         self.save_due = true;
         self.state.players.remove(&id);
@@ -542,6 +641,7 @@ impl Room {
         self.roles.remove(&id);
         self.ignores.remove(&id);
         self.last_private.remove(&id);
+        self.heard.remove(&id);
         self.voice_left(id);
         let left = ServerMsg::PlayerLeft { id };
         for member in self.members.values() {
@@ -575,7 +675,12 @@ impl Room {
 
 /// Saves the world and everyone in it (and who just left) in one transaction, then answers flushes.
 async fn save(room: &mut Room, store: &Accounts, name: &str) {
-    let mut players: Vec<PlayerSave> = room.state.players.values().map(PlayerSave::of).collect();
+    let mut players: Vec<PlayerSave> = room
+        .state
+        .players
+        .values()
+        .map(|player| room.save_of(player))
+        .collect();
     players.append(&mut room.leavers);
     // An untouched new world is not stored: worldgen makes the same one from its name. Its
     // first stored save counts towards the opener's creation limit.

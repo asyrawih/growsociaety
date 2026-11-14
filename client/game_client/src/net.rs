@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use bevy::prelude::*;
 use game_protocol::{
-    Auth, ChatKind, ClientMsg, DEFAULT_PORT, MAX_SERVER_MSG, PROTOCOL_VERSION, SERVER_NAME,
-    ServerMsg, WorldStatus, decode, read_msg, write_msg,
+    Auth, ChatKind, ClientMsg, DEFAULT_PORT, MAX_SERVER_MSG, PROTOCOL_VERSION, ReportReason,
+    SERVER_NAME, ServerMsg, WorldStatus, decode, read_msg, write_msg,
 };
 use game_shared::commands::Role;
 use game_shared::mirror::apply_event;
@@ -105,6 +105,10 @@ pub struct Net {
     swings: Vec<(PlayerId, u32, u32, bool)>,
     /// The answer to `refresh_token`, until taken.
     token: Option<String>,
+    /// Everyone this player has muted with `/ignore`, from the server (kept across logins).
+    ignoring: std::collections::HashSet<PlayerId>,
+    /// Other players' roles, from the join snapshot and `PlayerJoined`.
+    roles: HashMap<PlayerId, Role>,
     /// The newest voice token (url, token) and world-owner mutes, until `voice.rs` takes them.
     voice_token: Option<(String, String)>,
     voice_muted: Vec<(PlayerId, bool)>,
@@ -112,12 +116,17 @@ pub struct Net {
     session: Option<std::thread::JoinHandle<()>>,
 }
 
-/// What the background thread hands over once joined: id, server clock, world, (names, countries).
+/// What the background thread hands over once joined: id, server clock, world, (names,
+/// countries, roles).
 type Joined = (
     PlayerId,
     f64,
     WorldState,
-    (HashMap<PlayerId, String>, HashMap<PlayerId, String>),
+    (
+        HashMap<PlayerId, String>,
+        HashMap<PlayerId, String>,
+        HashMap<PlayerId, Role>,
+    ),
     Role,
     Option<JoinRefused>,
 );
@@ -234,10 +243,14 @@ pub fn quic_target(server: &str) -> Result<(SocketAddr, quinn::ClientConfig), St
 }
 
 /// Blocks until the server has sent the world, then leaves the connection to a background thread.
-/// What a joined world hands over: its state and (names, countries).
+/// What a joined world hands over: its state and (names, countries, roles).
 type JoinedWorld = (
     WorldState,
-    (HashMap<PlayerId, String>, HashMap<PlayerId, String>),
+    (
+        HashMap<PlayerId, String>,
+        HashMap<PlayerId, String>,
+        HashMap<PlayerId, Role>,
+    ),
 );
 
 /// Asks to join `world`. `Ok(Err(refusal))` when the server says no (a world status or a kick);
@@ -255,7 +268,8 @@ async fn join(
         Ok(ServerMsg::Joined { snapshot }) => {
             let names: HashMap<_, _> = snapshot.names.iter().cloned().collect();
             let countries = snapshot.countries.iter().cloned().collect();
-            Ok(Ok((snapshot.into_state(), (names, countries))))
+            let roles = snapshot.roles.iter().copied().collect();
+            Ok(Ok((snapshot.into_state(), (names, countries, roles))))
         }
         Ok(ServerMsg::WorldStatus { status, .. }) => Ok(Err(Refusal::Status(status))),
         Ok(ServerMsg::Kicked { reason }) => Ok(Err(Refusal::Kicked(reason))),
@@ -419,7 +433,7 @@ fn connect(server: &str, world: &str) -> Result<(Net, WorldState, PlayerId), Str
         });
     });
 
-    let (me, server_time, mut state, (names, countries), role, join_refused) = ready_rx
+    let (me, server_time, mut state, (names, countries, roles), role, join_refused) = ready_rx
         .recv_timeout(JOIN_TIMEOUT)
         .map_err(|_| "timed out waiting for the server".to_owned())??;
     // The local clock is ~0 at startup.
@@ -447,6 +461,8 @@ fn connect(server: &str, world: &str) -> Result<(Net, WorldState, PlayerId), Str
         join_refused,
         swings: Vec::new(),
         token: None,
+        ignoring: Default::default(),
+        roles,
         voice_token: None,
         voice_muted: Vec::new(),
         session: Some(session),
@@ -475,6 +491,12 @@ impl Net {
 
     pub fn role(&self) -> Role {
         self.role
+    }
+
+    /// Another player's role in this world, from the server (`None` if unknown). Our own is
+    /// `role()`.
+    pub fn role_of(&self, player: PlayerId) -> Option<Role> {
+        self.roles.get(&player).copied()
     }
 
     /// Everyone in the world, by display name.
@@ -537,6 +559,27 @@ impl Net {
     /// The fresh token from `refresh_token`, once (empty on development logins).
     pub fn take_token(&mut self) -> Option<String> {
         self.token.take()
+    }
+
+    /// Reports `player` to staff (the avatar menu). The answer is a System chat line.
+    pub fn report(&mut self, player: PlayerId, reason: ReportReason, note: Option<String>) {
+        let _ = self.to_server.send(ClientMsg::Report {
+            player,
+            reason,
+            note,
+        });
+    }
+
+    /// Whether this player has muted `player` with `/ignore` (kept across logins): the avatar
+    /// menu shows Unmute for them, and their voice stays muted.
+    pub fn is_ignoring(&self, player: PlayerId) -> bool {
+        self.ignoring.contains(&player)
+    }
+
+    /// Everyone this player has muted, e.g. to mute their voices on joining.
+    #[cfg_attr(not(feature = "voice"), allow(dead_code))] // voice re-applies the mutes
+    pub fn ignoring(&self) -> impl Iterator<Item = PlayerId> + '_ {
+        self.ignoring.iter().copied()
     }
 
     /// Other players' swings since the last call: (player, x, y, place).
@@ -652,7 +695,9 @@ impl Net {
                     level,
                     name,
                     country,
+                    role,
                 } => {
+                    self.roles.insert(id, role);
                     self.names.insert(id, name);
                     if let Some(code) = country {
                         self.countries.insert(id, code);
@@ -701,6 +746,7 @@ impl Net {
                 ServerMsg::WorldStatus { name, status } => self.world_status = Some((name, status)),
                 ServerMsg::Worlds { active } => self.worlds = Some(active),
                 ServerMsg::Token { token } => self.token = Some(token),
+                ServerMsg::Ignoring { ids } => self.ignoring = ids.into_iter().collect(),
                 ServerMsg::Swing {
                     player,
                     x,
@@ -713,6 +759,7 @@ impl Net {
                 // drops leave as `DropTaken` by nobody (no pickup sound).
                 ServerMsg::Joined { snapshot } => {
                     self.names.extend(snapshot.names.iter().cloned());
+                    self.roles.extend(snapshot.roles.iter().copied());
                     self.countries.extend(snapshot.countries.iter().cloned());
                     let mut gone: Vec<Event> = (game.0.world.drops.iter())
                         .map(|drop| Event::DropTaken {
@@ -788,6 +835,8 @@ mod tests {
             join_refused: None,
             swings: Vec::new(),
             token: None,
+            ignoring: Default::default(),
+            roles: HashMap::new(),
             voice_token: None,
             voice_muted: Vec::new(),
             session: None,

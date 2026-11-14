@@ -64,10 +64,10 @@ fn worn_folders(player: &game_shared::rules::Player) -> [Option<&'static str>; S
 
 /// Overhead name: plain text a few px above the head, with a 1 px drop shadow for sky and blocks.
 /// Gap between the top edge of the 48 px rig (which tall hats and hair reach) and the name, world px.
-const NAME_GAP: f32 = 4.0;
+pub(crate) const NAME_GAP: f32 = 4.0;
 /// assets/README.md, "Font": glyphs on a 16 px grid, so 16 px and no smoothing keep them crisp.
 const NAME_FONT: &str = "fonts/growsociaety_pixel.ttf";
-const NAME_FONT_SIZE: f32 = 16.0;
+pub(crate) const NAME_FONT_SIZE: f32 = 16.0;
 const NAME_SHADOW: Text2dShadow = Text2dShadow {
     offset: Vec2::new(1.0, -1.0),
     color: Color::srgba(0.0, 0.0, 0.0, 0.85),
@@ -105,10 +105,10 @@ struct Wings;
 
 /// Another player in an online world, drawn from the bodies the server sends.
 #[derive(Component)]
-struct RemotePlayer {
-    id: PlayerId,
-    /// Smoothed towards the latest server body, world px.
-    position: Vec2,
+pub(crate) struct RemotePlayer {
+    pub id: PlayerId,
+    /// Smoothed towards the latest server body, world px. Chat bubbles follow it.
+    pub position: Vec2,
     facing_west: bool,
     /// Their front arm reaching out, from the server's `Swing`.
     reach: Option<rig::Reach>,

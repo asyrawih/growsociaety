@@ -411,6 +411,8 @@ fn type_chat(
     mut open: MessageReader<OpenChat>,
     mut warps: MessageWriter<WarpTo>,
     mut menus: MessageWriter<OpenWorldMenu>,
+    mut said: MessageWriter<crate::chat_bubbles::SaidInWorld>,
+    mut drafts: MessageReader<crate::avatar_menu::ChatDraft>,
     text_focus: Option<Res<crate::hud::TextFocus>>,
 ) {
     let was_open = chat.open;
@@ -418,6 +420,14 @@ fn type_chat(
     let field_focused = text_focus.is_some_and(|focus| focus.0);
     if open.read().count() > 0 {
         chat.open = true;
+    }
+    // "Whisper" in the avatar menu: chat opens with `/msg Name ` typed.
+    // A focused HUD text field keeps the keyboard; the draft is dropped then.
+    if let Some(draft) = drafts.read().last()
+        && !field_focused
+    {
+        chat.open = true;
+        chat.draft = draft.0.clone();
     }
     for key in typed.read().filter(|k| k.state == ButtonState::Pressed) {
         if !chat.open {
@@ -461,6 +471,11 @@ fn type_chat(
                 match (submit(&draft), net.as_deref_mut()) {
                     (Some(Submit::Say(text) | Submit::Command(text)), Some(net)) => net.chat(text),
                     (Some(Submit::Say(text)), None) => {
+                        let from = game.1;
+                        said.write(crate::chat_bubbles::SaidInWorld {
+                            from,
+                            text: text.clone(),
+                        });
                         chat.push(format!("You: {text}"), ChatKind::World, now)
                     }
                     (Some(Submit::Command(text)), None) => match offline_command(&text, game.1) {
@@ -512,12 +527,15 @@ fn name(net: &Net, from: PlayerId) -> String {
         .map_or_else(|| format!("Player{}", from.0), str::to_owned)
 }
 
+#[allow(clippy::too_many_arguments)] // a Bevy system: one parameter per message stream
 fn receive_chat(
     time: Res<Time>,
     mut chat: ResMut<Chat>,
     net: Option<ResMut<Net>>,
     mut lines: MessageReader<SystemLine>,
     mut received: MessageWriter<ChatReceived>,
+    mut said: MessageWriter<crate::chat_bubbles::SaidInWorld>,
+    mut notices: MessageWriter<crate::hud::Notice>,
     game: Res<Game>,
 ) {
     let now = time.elapsed_secs();
@@ -529,10 +547,19 @@ fn receive_chat(
         let line = match kind {
             ChatKind::World => format!("{}: {text}", name(&net, from)),
             ChatKind::Private => format!("[from {}] {text}", name(&net, from)),
-            ChatKind::System => text,
+            ChatKind::System => text.clone(),
         };
         if kind != ChatKind::System && from != game.1 {
             received.write(ChatReceived { from, kind });
+        }
+        // A bubble over the speaker, our own lines included (the server echoes them back).
+        if kind == ChatKind::World {
+            let text = text.clone();
+            said.write(crate::chat_bubbles::SaidInWorld { from, text });
+        }
+        // The answer to a report from the avatar menu is a toast too.
+        if kind == ChatKind::System && game_protocol::REPORT_ANSWERS.contains(&text.as_str()) {
+            notices.write(crate::hud::Notice(text.clone()));
         }
         chat.push(line, kind, now);
     }

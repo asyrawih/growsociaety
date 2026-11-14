@@ -3,7 +3,7 @@
 //! this world's task, so no Action interleaves. Claims go back to their owners: here at once,
 //! elsewhere through `returned_claim`, paid out by `load_player` when they next join a world.
 
-use game_protocol::{ServerMsg, WorldSnapshot};
+use game_protocol::ServerMsg;
 use game_shared::claims::claim_kind;
 use game_shared::commands::{RESET_CONFIRM_SECS, Reset};
 use game_shared::items::{ItemId, item};
@@ -197,12 +197,7 @@ impl Room {
         // then everyone sees everyone appear at the door.
         let members: Vec<PlayerId> = self.names.keys().copied().collect();
         for member in members {
-            if let Some(mut snapshot) = WorldSnapshot::of(&self.state, member, &self.names) {
-                snapshot.countries = self
-                    .countries
-                    .iter()
-                    .map(|(&id, code)| (id, code.clone()))
-                    .collect();
+            if let Some(snapshot) = self.snapshot_for(member) {
                 let snapshot = Box::new(snapshot);
                 self.send(member, Out::Reliable(ServerMsg::Joined { snapshot }));
             }

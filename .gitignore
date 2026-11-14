@@ -4,3 +4,5 @@ world_server_cert.der
 world_server_cert.der.key
 /dist
 /infra/game/bin/
+.DS_Store
+audit.log

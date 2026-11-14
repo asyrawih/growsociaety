@@ -9,9 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use game_protocol::{
-    ACTIVE_WORLDS_LISTED, Auth, ClientMsg, MAX_CLIENT_MSG, MAX_LOOKUP, MAX_TOKEN_LEN,
-    NEW_WORLDS_PER_HOUR, PROTOCOL_VERSION, ReadError, ServerMsg, WORLD_CAPACITY, WorldStatus,
-    clean_chat, encode, read_msg, valid_country, valid_name, world_name_allowed, write_msg,
+    ACTIVE_WORLDS_LISTED, Auth, ChatKind, ClientMsg, MAX_CLIENT_MSG, MAX_LOOKUP, MAX_REPORT_NOTE,
+    MAX_TOKEN_LEN, NEW_WORLDS_PER_HOUR, PROTOCOL_VERSION, REPORTS_PER_HOUR, ReadError, ServerMsg,
+    WORLD_CAPACITY, WorldStatus, clean_chat, encode, read_msg, valid_country, valid_name,
+    world_name_allowed, write_msg,
 };
 use game_shared::commands::Role;
 use game_shared::physics::TICK_RATE;
@@ -378,6 +379,8 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) {
     let mut chats = Bucket::new(CHAT_RATE, CHAT_BURST, now);
     let mut lookups = Bucket::new(LOOKUP_RATE, LOOKUP_BURST, now);
     let mut voice_mutes = Bucket::new(VOICE_MUTE_RATE, VOICE_MUTE_BURST, now);
+    // When this connection's reports were sent, for the hourly limit.
+    let mut reports: Vec<Instant> = Vec::new();
     let (mut input_seq, mut act_seq) = (Seq::default(), Seq::default());
     let mut strikes = 0;
     let reason = loop {
@@ -462,6 +465,23 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) {
                 }
                 continue;
             }
+            (
+                ClientMsg::Report {
+                    player,
+                    reason,
+                    note,
+                },
+                Some(name),
+            ) => {
+                let reply = report(&server, id, name, player, reason, note, &mut reports).await;
+                let msg = ServerMsg::Chat {
+                    from: id,
+                    text: reply.into(),
+                    kind: ChatKind::System,
+                };
+                let _ = out.try_send(Out::Reliable(msg));
+                continue;
+            }
             (ClientMsg::RefreshToken, _) => {
                 if !lookups.take(now) {
                     strikes += 1;
@@ -512,6 +532,72 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) {
     let _ = writer.await;
     conn.close(0u32.into(), reason.unwrap_or("bye").as_bytes());
     println!("player {} left ({})", id.0, reason.unwrap_or("closed"));
+}
+
+use game_protocol::{REPORT_FAILED, REPORT_LIMIT, REPORT_NOBODY, REPORT_SENT};
+/// How long a report waits for its world to hand over the chat lines.
+const REPORT_WAIT: Duration = Duration::from_secs(2);
+const HOUR: Duration = Duration::from_secs(3600);
+
+/// `id` reports `target` in world `world`: rate-limited (per connection and per account in the
+/// database), the context lines come from the world, then stored. Returns the reply line; the
+/// target is never told.
+async fn report(
+    server: &Server,
+    id: PlayerId,
+    world: &str,
+    target: PlayerId,
+    reason: game_protocol::ReportReason,
+    note: Option<String>,
+    sent: &mut Vec<Instant>,
+) -> &'static str {
+    let now = Instant::now();
+    sent.retain(|at| now.duration_since(*at) < HOUR);
+    let limit = REPORTS_PER_HOUR as usize;
+    if sent.len() >= limit || server.accounts.reports_last_hour(id).await >= REPORTS_PER_HOUR {
+        return REPORT_LIMIT;
+    }
+    let note = note.and_then(|text| clean_chat(&text)).map(|text| {
+        let end = (0..=MAX_REPORT_NOTE.min(text.len()))
+            .rev()
+            .find(|&i| text.is_char_boundary(i))
+            .unwrap_or(0);
+        text[..end].to_owned()
+    });
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    let asked = ToWorld::Report {
+        id,
+        target,
+        reason,
+        note: note.clone(),
+        reply,
+    };
+    if !crate::world::send_to(server, world, asked) {
+        return REPORT_FAILED;
+    }
+    let chat = match tokio::time::timeout(REPORT_WAIT, answer).await {
+        Ok(Ok(Some(chat))) => chat,
+        Ok(Ok(None)) => return REPORT_NOBODY,
+        _ => return REPORT_FAILED,
+    };
+    let stored = crate::store::Report {
+        reporter: id,
+        target,
+        world,
+        reason: reason.name(),
+        note: note.as_deref(),
+        chat,
+    };
+    match server.accounts.store_report(&stored).await {
+        Ok(()) => {
+            sent.push(now);
+            REPORT_SENT
+        }
+        Err(error) => {
+            eprintln!("report by {}: {error}", id.0);
+            REPORT_FAILED
+        }
+    }
 }
 
 /// What entering `name` (upper-case) would do for player `id`.

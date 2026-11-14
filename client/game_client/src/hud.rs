@@ -381,6 +381,8 @@ pub enum OpenPanel {
     Almanac,
     /// The World menu (`world_select.rs`).
     WorldSelect,
+    /// The menu beside a clicked player (`avatar_menu.rs`).
+    AvatarMenu,
 }
 
 /// The item Q (drop) and X (trash) act on: the one selected in the wardrobe grid while the

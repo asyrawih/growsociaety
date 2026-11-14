@@ -193,10 +193,31 @@ impl Plugin for VoicePlugin {
                         .run_if(resource_exists::<VoiceLink>),
                     panel::refresh_panel,
                     panel::show_indicators,
+                    follow_ignores.run_if(resource_exists::<Net>),
                 )
                     .in_set(Phase::View),
             );
     }
+}
+
+/// Muting someone (the avatar menu's Mute = `/ignore`) also mutes their voice for me; unmuting
+/// gives it back. Follows the server's ignore list (kept across logins), so it applies on join too.
+fn follow_ignores(
+    net: Res<Net>,
+    mut state: ResMut<VoiceState>,
+    mut last: Local<HashSet<PlayerId>>,
+) {
+    let now: HashSet<PlayerId> = net.ignoring().collect();
+    if now == *last {
+        return;
+    }
+    for id in now.difference(&last) {
+        state.local_muted.insert(*id);
+    }
+    for id in last.difference(&now) {
+        state.local_muted.remove(id);
+    }
+    *last = now;
 }
 
 /// Token in, connection decided, push-to-talk applied, news from the voice thread shown.

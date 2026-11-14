@@ -134,7 +134,7 @@ impl Room {
             }
             Command::Msg { to, text } => {
                 let to = self.resolve(&to).ok_or_else(missing)?;
-                self.private(id, to, text)
+                self.private(id, to, text, now)
             }
             Command::Reply { text } => {
                 let to = self
@@ -143,7 +143,7 @@ impl Room {
                     .copied()
                     .filter(|to| self.names.contains_key(to))
                     .ok_or("Nobody to reply to")?;
-                self.private(id, to, text)
+                self.private(id, to, text, now)
             }
             Command::Ignore { who, on } => {
                 let who = self.resolve(&who).ok_or_else(missing)?;
@@ -156,6 +156,7 @@ impl Room {
                 } else {
                     set.remove(&who);
                 }
+                self.send_ignoring(id);
                 let verb = if on { "Ignoring" } else { "No longer ignoring" };
                 Ok(format!("{verb} {}", self.name(who)))
             }
@@ -340,9 +341,16 @@ impl Room {
         }
     }
 
-    fn private(&mut self, from: PlayerId, to: PlayerId, text: String) -> Result<String, String> {
+    fn private(
+        &mut self,
+        from: PlayerId,
+        to: PlayerId,
+        text: String,
+        now: f64,
+    ) -> Result<String, String> {
         // An ignoring receiver hears nothing; the sender is not told (no ignore probing).
         if !self.ignoring(to, from) {
+            self.heard(to, from, &text, now);
             let msg = ServerMsg::Chat {
                 from,
                 text: text.clone(),
@@ -353,6 +361,11 @@ impl Room {
         }
         self.last_private.insert(from, to);
         Ok(format!("To {}: {text}", self.name(to)))
+    }
+
+    /// An audit line for something that is not a typed command (a report from the avatar menu).
+    pub(crate) fn audit_line(&self, actor: PlayerId, line: &str, now: f64) {
+        self.audit(actor, line, &Ok("stored".into()), now);
     }
 
     /// One JSON line: time, actor, role, the command as typed, world, result.
@@ -997,9 +1010,116 @@ mod reset_tests {
             level: 1,
             xp: 0,
             notices: vec![notice.into()],
+            ignores: vec![],
         };
         let mut seat = join(&mut room, 3, Role::Player, Some(save));
         assert_eq!(room.state.players[&seat.id].inventory.count(SMALL_CLAIM), 1);
         assert!(seat.replies().iter().any(|line| line == notice));
+    }
+
+    fn ignoring_msgs(seat: &mut Seat) -> Vec<Vec<PlayerId>> {
+        seat.drain()
+            .into_iter()
+            .filter_map(|m| match m {
+                ServerMsg::Ignoring { ids } => Some(ids),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_saved_ignore_list_applies_on_join_and_changes_are_sent_and_saved() {
+        let mut room = room();
+        let mut other = join(&mut room, 2, Role::Player, None);
+        other.drain();
+        let save = PlayerSave {
+            id: PlayerId(1),
+            gems: 0,
+            capacity: game_shared::inventory::Inventory::default().capacity,
+            items: vec![],
+            equipped: [None; game_shared::items::SLOT_COUNT],
+            level: 1,
+            xp: 0,
+            notices: vec![],
+            ignores: vec![PlayerId(2)],
+        };
+        let mut me = join(&mut room, 1, Role::Player, Some(save));
+        assert_eq!(ignoring_msgs(&mut me), [vec![PlayerId(2)]], "sent on join");
+        assert!(room.ignoring(PlayerId(1), PlayerId(2)));
+        // Muted in this world too: their world chat does not reach me.
+        say(&mut room, &other, "hello", 1.0);
+        assert!(
+            !me.drain()
+                .iter()
+                .any(|m| matches!(m, ServerMsg::Chat { text, .. } if text == "hello"))
+        );
+
+        say(&mut room, &me, "/unignore p2", 2.0);
+        assert_eq!(ignoring_msgs(&mut me), [Vec::<PlayerId>::new()]);
+        say(&mut room, &me, "/ignore p2", 3.0);
+        assert_eq!(ignoring_msgs(&mut me), [vec![PlayerId(2)]]);
+        let saved = room.save_of(&room.state.players[&PlayerId(1)]);
+        assert_eq!(saved.ignores, [PlayerId(2)], "goes into the save");
+    }
+
+    #[test]
+    fn a_report_gets_the_lines_the_reporter_heard_and_an_audit_line() {
+        let path = std::env::temp_dir().join(format!("report-audit-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut room = room();
+        room.audit = Some(path.clone());
+        let mut me = join(&mut room, 1, Role::Player, None);
+        let them = join(&mut room, 2, Role::Player, None);
+        me.drain();
+        say(&mut room, &them, "buy cheap gems at scam.example", 1.0);
+        let ask = |target| {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            let msg = ToWorld::Report {
+                id: PlayerId(1),
+                target: PlayerId(target),
+                reason: game_protocol::ReportReason::Spam,
+                note: Some("spamming".into()),
+                reply,
+            };
+            (msg, answer)
+        };
+        let (msg, mut answer) = ask(2);
+        room.handle(msg, 2.0);
+        let chat = answer
+            .try_recv()
+            .expect("answered")
+            .expect("target is here");
+        let lines: serde_json::Value = serde_json::from_str(&chat).expect("json");
+        assert_eq!(lines[0]["from"], 2);
+        assert_eq!(lines[0]["text"], "buy cheap gems at scam.example");
+        let log = std::fs::read_to_string(&path).expect("audit written");
+        assert!(log.contains("/report #2 spam spamming"), "{log}");
+
+        let (msg, mut answer) = ask(99);
+        room.handle(msg, 3.0);
+        assert_eq!(
+            answer.try_recv().expect("answered"),
+            None,
+            "not in this world"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn roles_reach_the_client_in_the_snapshot_and_on_joining() {
+        let mut room = room();
+        let mut staff = join(&mut room, 1, Role::Moderator, None);
+        staff.drain();
+        let mut player = join(&mut room, 2, Role::Player, None);
+        let snapshot_roles = player.drain().into_iter().find_map(|m| match m {
+            ServerMsg::Joined { snapshot } => Some(snapshot.roles),
+            _ => None,
+        });
+        let roles = snapshot_roles.expect("joined");
+        assert!(roles.contains(&(PlayerId(1), Role::Moderator)), "{roles:?}");
+        let announced = staff.drain().into_iter().any(|m| {
+            matches!(m, ServerMsg::PlayerJoined { id, role: Role::Player, .. } if id == PlayerId(2))
+        });
+        assert!(announced);
     }
 }

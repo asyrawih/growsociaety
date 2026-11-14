@@ -64,6 +64,8 @@ Use nearest-neighbour sampling. 9-slice insets (px, every side unless noted) kee
 | `tab.png` | 51×23 | 8 | Tab button (e.g. Inventory / Wardrobe, store categories) |
 | `close.png` | 27×27 | – | Close button, top-right corner of a panel |
 | `tooltip.png` | 48×32 | 6 | Item tooltip frame: slim dark-wood border on parchment, no ornate corners. Stays readable stretched to ~280×90 with 16 px dark-brown text (spec: docs/knowledge/ux/item-tooltip.md) |
+| `bubble.png` | 32×24 | 6 | Chat speech bubble (spec: docs/knowledge/ux/chat-bubbles.md). Parchment fill, dark 1 px outline, rounder corners than the tooltip so it reads as speech, soft bottom shade |
+| `bubble_tail.png` | 10×6 | – | Tail pointing down, centred under the bubble. Its top row is fill, so draw it **1 px up** (overlapping the bubble's bottom outline row) and the tail opens into the box with no seam |
 | `hotbar.png` | 138×47 | – | Has 5 cells baked in, so don't stretch it. Prefer a row of `slot.png` |
 
 Wardrobe layout (see mockup): left column hair, hat, face, shirt; right column pants, shoes, back, hand; character

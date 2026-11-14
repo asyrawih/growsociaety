@@ -1167,12 +1167,16 @@ fn refresh_panel(
             *shown = PanelView::default();
         }
         // The one writer of `TextFocus`: the craft panel, the store and the almanac keep Enter too
-        // (it crafts, buys or searches there), and so does the inventory's search field. One panel
-        // is open at a time.
+        // (it crafts, buys or searches there), and so does the inventory's search field and the
+        // avatar menu (Enter chooses the focused row). One panel is open at a time.
         text_focus.set_if_neq(TextFocus(
             matches!(
                 *open,
-                OpenPanel::Craft | OpenPanel::Store | OpenPanel::Almanac | OpenPanel::WorldSelect
+                OpenPanel::Craft
+                    | OpenPanel::Store
+                    | OpenPanel::Almanac
+                    | OpenPanel::WorldSelect
+                    | OpenPanel::AvatarMenu
             ) || search.focused,
         ));
         return;

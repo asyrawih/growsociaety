@@ -228,6 +228,47 @@ def icon_search():
     return im
 
 
+BUBBLE_FILL = (246, 231, 198, 255)  # parchment, same as ui/tooltip.png
+BUBBLE_LINE = (43, 26, 22, 255)
+
+
+def bubble():
+    """Chat speech bubble (docs/knowledge/ux/chat-bubbles.md): 32x24, 9-slice inset 6, rounder than tooltip."""
+    w, h, r = 32, 24, 5
+    im = Image.new("RGBA", (w, h))
+    px = im.load()
+    for y in range(h):
+        for x in range(w):
+            cx = min(max(x, r), w - 1 - r)
+            cy = min(max(y, r), h - 1 - r)
+            d = math.hypot(x - cx, y - cy)
+            if d > r + 0.35:
+                continue
+            if d > r - 0.65 or x in (0, w - 1) or y in (0, h - 1):
+                px[x, y] = BUBBLE_LINE
+            elif y == h - 2:
+                px[x, y] = (226, 205, 166, 255)  # soft bottom shade so the box has a little weight
+            else:
+                px[x, y] = BUBBLE_FILL
+    return im
+
+
+def bubble_tail():
+    """10x6 tail pointing down. Its top row is fill (outline only at the ends): draw it so that row overlaps the
+    bubble's bottom outline row, and the tail opens into the box with no seam."""
+    w, h = 10, 6
+    im = Image.new("RGBA", (w, h))
+    px = im.load()
+    for y in range(h):
+        half = (w / 2) * (1 - y / h)  # triangle narrowing to a point at the bottom
+        for x in range(w):
+            dx = abs(x + 0.5 - w / 2)
+            if dx < half:
+                edge = dx > half - 1.2 or y == h - 1
+                px[x, y] = BUBBLE_LINE if edge and not (y == 0 and dx < half - 1.2) else BUBBLE_FILL
+    return im
+
+
 def strip(frames, w, h):
     out = Image.new("RGBA", (w * len(frames), h))
     for i, f in enumerate(frames):
@@ -292,6 +333,8 @@ def main():
     chip(False).save(ROOT / "assets/ui/chip.png")
     chip(True).save(ROOT / "assets/ui/chip_active.png")
     icon_search().save(ROOT / "assets/ui/icon_search.png")
+    bubble().save(ROOT / "assets/ui/bubble.png")
+    bubble_tail().save(ROOT / "assets/ui/bubble_tail.png")
     print("wrote block_break_dust, soil_puff, splice_swirl, drop_glow (fx) + chip, chip_active, icon_search (ui)")
     assert ring.size == (192, 24) and puff.size == (192, 32) and sparkle.size == (64, 16)
     print("wrote assets/ui/respawn_ring.png, assets/fx/respawn_puff.png + .json, assets/fx/ready_sparkle.png + .json")

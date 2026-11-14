@@ -70,6 +70,8 @@ pub struct PlayerSave {
     /// Notices of claims a reset returned while the player was elsewhere. `load_player` has
     /// already paid them, in the database; the world only shows these once the player is in.
     pub notices: Vec<String>,
+    /// Who this player has muted with `/ignore`, in every world.
+    pub ignores: Vec<PlayerId>,
 }
 
 /// One claim returned by `/resetworld` to an owner who was not in that world (`returned_claim`).
@@ -80,6 +82,17 @@ pub struct Returned {
     /// Paid in gems instead when the backpack has no room.
     pub price: u32,
     pub notice: String,
+}
+
+/// One report to store (`reports`).
+pub struct Report<'a> {
+    pub reporter: PlayerId,
+    pub target: PlayerId,
+    pub world: &'a str,
+    pub reason: &'static str,
+    pub note: Option<&'a str>,
+    /// JSON array of the context lines.
+    pub chat: String,
 }
 
 /// What a world save writes besides the world and its players.
@@ -104,6 +117,7 @@ impl PlayerSave {
             level: player.level,
             xp: player.xp,
             notices: Vec::new(),
+            ignores: Vec::new(),
         }
     }
 
@@ -149,6 +163,45 @@ impl Accounts {
             eprintln!("world {name}: unreadable save, generating a new one");
         }
         state
+    }
+
+    /// Stores a report. `chat` is the JSON array of context lines.
+    pub async fn store_report(&self, report: &Report<'_>) -> Result<(), String> {
+        let Accounts::Postgres(pool) = self else {
+            return Ok(());
+        };
+        if !persistent(report.reporter) {
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT INTO reports (reporter_id, target_id, world, reason, note, chat)
+             VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
+        )
+        .bind(i64::from(report.reporter.0))
+        .bind(i64::from(report.target.0))
+        .bind(report.world)
+        .bind(report.reason)
+        .bind(report.note)
+        .bind(&report.chat)
+        .execute(pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
+    /// Reports `id` sent in the last hour.
+    pub async fn reports_last_hour(&self, id: PlayerId) -> u32 {
+        let Accounts::Postgres(pool) = self else {
+            return 0;
+        };
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM reports WHERE reporter_id = $1 AND created_at > now() - interval '1 hour'",
+        )
+        .bind(i64::from(id.0))
+        .fetch_one(pool)
+        .await
+        .map_err(|e| eprintln!("reports {}: {e}", id.0))
+        .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX))
     }
 
     /// Whether `name` is stored (it was built in at least once).
@@ -203,6 +256,17 @@ impl Accounts {
         .await
         .map_err(|e| eprintln!("load inventory {}: {e}", id.0))
         .ok()?;
+        let ignores: Vec<(i64,)> =
+            sqlx::query_as("SELECT ignored_id FROM ignores WHERE player_id = $1")
+                .bind(i64::from(id.0))
+                .fetch_all(pool)
+                .await
+                .map_err(|e| eprintln!("load ignores {}: {e}", id.0))
+                .unwrap_or_default();
+        let ignores = ignores
+            .into_iter()
+            .filter_map(|(n,)| u32::try_from(n).ok().map(PlayerId))
+            .collect();
         let (gems, capacity, worn, level, xp) = state;
         let item = |n: i32| u16::try_from(n).ok().filter(|&n| n > 0).map(ItemId);
         let mut equipped = [None; SLOT_COUNT];
@@ -221,6 +285,7 @@ impl Accounts {
             level: u16::try_from(level).unwrap_or(1),
             xp: u32::try_from(xp).unwrap_or(0),
             notices: Vec::new(),
+            ignores,
         };
         Some(self.pay_returned(pool, save).await)
     }
@@ -385,6 +450,21 @@ async fn write_player(
     .execute(&mut **tx)
     .await
     .map_err(|e| e.to_string())?;
+    // The `/ignore` list, replaced whole like the inventory.
+    sqlx::query("DELETE FROM ignores WHERE player_id = $1")
+        .bind(id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    let ignored: Vec<i64> = player.ignores.iter().map(|p| i64::from(p.0)).collect();
+    sqlx::query(
+        "INSERT INTO ignores (player_id, ignored_id) SELECT $1, * FROM UNNEST($2::BIGINT[])",
+    )
+    .bind(id)
+    .bind(&ignored)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -482,6 +562,7 @@ mod tests {
             level: 1,
             xp: 0,
             notices: vec![],
+            ignores: vec![],
         };
         let before = save.items.clone();
         credit(&mut save, &[row(SMALL_CLAIM)]);
@@ -503,6 +584,49 @@ mod tests {
         credit(&mut full, &[row(SMALL_CLAIM)]);
         assert_eq!(full.items, packed);
         assert_eq!(full.gems, 60, "paid the store price instead");
+    }
+
+    /// Against a real PostgreSQL: the ignore list survives a save and load, and a report is stored
+    /// and counted for the hourly limit.
+    #[tokio::test]
+    #[ignore]
+    async fn postgres_ignores_and_reports() {
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
+        let db = Accounts::open(Some(url))
+            .await
+            .expect("connects and migrates");
+        let account = db
+            .register(&format!("i{}", std::process::id()), "password1")
+            .await
+            .expect("account");
+        let mut state = WorldState::new(generate("PGIGNORE"), 9);
+        state.join(account.id);
+        let mut saved = PlayerSave::of(&state.players[&account.id]);
+        saved.ignores = vec![PlayerId(7), PlayerId(9)];
+        db.save(
+            "PGIGNORE",
+            None,
+            std::slice::from_ref(&saved),
+            SaveExtras::default(),
+        )
+        .await
+        .expect("saved");
+        let loaded = db.load_player(account.id).await.expect("loads");
+        let mut ignores = loaded.ignores.clone();
+        ignores.sort_by_key(|p| p.0);
+        assert_eq!(ignores, [PlayerId(7), PlayerId(9)]);
+
+        assert_eq!(db.reports_last_hour(account.id).await, 0);
+        let report = Report {
+            reporter: account.id,
+            target: PlayerId(7),
+            world: "PGIGNORE",
+            reason: "spam",
+            note: Some("selling"),
+            chat: r#"[{"from":7,"text":"buy","at":1.0}]"#.into(),
+        };
+        db.store_report(&report).await.expect("stored");
+        assert_eq!(db.reports_last_hour(account.id).await, 1);
     }
 
     /// Against a real PostgreSQL: a returned claim is paid once. The first load deletes the row

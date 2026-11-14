@@ -2,8 +2,10 @@ use bevy::prelude::*;
 
 mod almanac;
 mod audio;
+mod avatar_menu;
 mod camera;
 mod chat;
+mod chat_bubbles;
 mod claim_ui;
 mod craft_ui;
 mod farming_ui;
@@ -172,6 +174,8 @@ fn main() {
         inventory_filter::InventoryFilterPlugin,
         almanac::AlmanacPlugin,
         world_select::WorldSelectPlugin,
+        chat_bubbles::ChatBubblesPlugin,
+        avatar_menu::AvatarMenuPlugin,
     ));
     // After `NetPlugin` (voice is online only) and `HudPlugin` (its panel uses the HUD's).
     #[cfg(feature = "voice")]

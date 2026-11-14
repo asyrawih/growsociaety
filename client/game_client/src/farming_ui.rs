@@ -322,7 +322,13 @@ fn show_card(
             .touch_started
             .get(&touch.id())
             .is_some_and(|&from| now - from >= LONG_PRESS_SECS);
-        if held && touch.distance().length() <= TOUCH_SLOP {
+        // Players go before tiles: a long-press on a player is the avatar menu's, not the tree's.
+        let on_player = camera
+            .viewport_to_world_2d(camera_transform, touch.position())
+            .ok()
+            .and_then(|point| crate::avatar_menu::player_at(&game, point))
+            .is_some();
+        if held && !on_player && touch.distance().length() <= TOUCH_SLOP {
             let tile = tile_at(touch.position()).filter(|&(x, y)| world.tree(x, y).is_some());
             if tile.is_some() {
                 input.pinned = tile;

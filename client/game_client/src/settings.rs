@@ -73,6 +73,8 @@ pub struct Settings {
     pub inventory_sort: Sort,
     /// Worlds entered, newest first, at most 5 (`world_select.rs`).
     pub recent_worlds: Vec<String>,
+    /// Speech bubbles over players who talk in world chat; on by default (`chat_bubbles.rs`).
+    pub chat_bubbles: bool,
 }
 
 impl Default for Settings {
@@ -97,6 +99,7 @@ impl Default for Settings {
             screen_shake: false,
             inventory_sort: Sort::Slot,
             recent_worlds: Vec::new(),
+            chat_bubbles: true,
         }
     }
 }
@@ -146,6 +149,7 @@ impl Settings {
                         .collect();
                 }
                 "screen_shake" => s.screen_shake = yes,
+                "chat_bubbles" => s.chat_bubbles = yes,
                 "inventory_sort" => {
                     s.inventory_sort = Sort::parse(value).unwrap_or(s.inventory_sort)
                 }
@@ -185,7 +189,7 @@ impl Settings {
             "music={}\nsfx={}\nvoice_volume={}\nvoice={}\nopen_mic={}\nself_muted={}\nmic={}\n\
              fullscreen={}\nzoom={}\nskin={}\nlanguage={}\nhints={}\nclaim_tip_seen={}\n\
              workbench_tip_seen={}\nladder_tip_seen={}\nreduce_effects={}\nscreen_shake={}\n\
-             inventory_sort={}\nrecent_worlds={}\n",
+             inventory_sort={}\nrecent_worlds={}\nchat_bubbles={}\n",
             self.music,
             self.sfx,
             self.voice_volume,
@@ -205,6 +209,7 @@ impl Settings {
             self.screen_shake,
             self.inventory_sort.key(),
             self.recent_worlds.join(","),
+            self.chat_bubbles,
         )
     }
 
@@ -256,6 +261,7 @@ impl Settings {
             Field::SelfMute => self.self_muted,
             Field::ReduceEffects => self.reduce_effects,
             Field::ScreenShake => self.screen_shake,
+            Field::ChatBubbles => self.chat_bubbles,
             _ => self.fullscreen,
         }
     }
@@ -270,6 +276,7 @@ impl Settings {
             Field::SelfMute => self.self_muted = on,
             Field::ReduceEffects => self.reduce_effects = on,
             Field::ScreenShake => self.screen_shake = on,
+            Field::ChatBubbles => self.chat_bubbles = on,
             _ => self.fullscreen = on,
         }
     }
@@ -381,6 +388,7 @@ pub enum Field {
     Fullscreen,
     ReduceEffects,
     ScreenShake,
+    ChatBubbles,
     Zoom,
     Skin,
     Language,
@@ -717,6 +725,7 @@ pub fn spawn_settings(mut commands: Commands, assets: Res<AssetServer>, tab: Res
                             toggle_row(p, &assets, "Fullscreen", Field::Fullscreen);
                             dropdown_row(p, &assets, "Default zoom", Field::Zoom);
                             toggle_row(p, &assets, "Reduce effects", Field::ReduceEffects);
+                            toggle_row(p, &assets, "Chat bubbles", Field::ChatBubbles);
                             toggle_row(p, &assets, "Screen shake", Field::ScreenShake);
                         }
                         SettingsTab::Keys => {
@@ -1043,6 +1052,7 @@ mod tests {
             screen_shake: true,
             inventory_sort: Sort::Count,
             recent_worlds: vec!["MYFARM".into(), "START".into()],
+            chat_bubbles: false,
         };
         assert_eq!(Settings::parse(&s.to_text()), s);
         let dir = temp_dir("roundtrip");
@@ -1055,6 +1065,7 @@ mod tests {
         assert!(odd.mic.is_none());
         let fresh = Settings::parse("inventory_sort=Sideways");
         assert!(!fresh.reduce_effects && !fresh.screen_shake);
+        assert!(fresh.chat_bubbles, "bubbles are on by default");
         assert_eq!(fresh.inventory_sort, Sort::Slot);
         assert!(fresh.recent_worlds.is_empty());
         let recent = Settings::parse("recent_worlds=a,B B,c!,D");

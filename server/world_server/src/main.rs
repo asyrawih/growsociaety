@@ -563,4 +563,53 @@ mod tests {
             .expect("a valid token");
         assert_eq!((account.id, account.name.as_str()), (player, "Fresh"));
     }
+
+    #[tokio::test]
+    async fn a_report_is_acknowledged_and_limited_to_five_an_hour() {
+        let identity = new_identity().expect("identity");
+        let cert = identity.0.clone();
+        let endpoint = listen("127.0.0.1:0".parse().unwrap(), identity).expect("listen");
+        let addr = endpoint.local_addr().expect("bound");
+        tokio::spawn(serve(
+            endpoint,
+            accounts::Accounts::open(None).await.expect("memory"),
+            token::Signer::new(b"test"),
+            None,
+        ));
+        let mut a = join(addr, &cert, PROTOCOL_VERSION).await.expect("a joins");
+        let b = join(addr, &cert, PROTOCOL_VERSION).await.expect("b joins");
+        let report = ClientMsg::Report {
+            player: b.id,
+            reason: game_protocol::ReportReason::Rude,
+            note: Some("rude in chat".into()),
+        };
+        let mut replies = Vec::new();
+        for _ in 0..6 {
+            write_msg(&mut a.send, &report).await.expect("send");
+            let msg = expect_msg(&mut a, |m| {
+                matches!(
+                    m,
+                    ServerMsg::Chat {
+                        kind: ChatKind::System,
+                        ..
+                    }
+                )
+            })
+            .await;
+            if let ServerMsg::Chat { text, .. } = msg {
+                replies.push(text);
+            }
+        }
+        assert!(
+            replies[..5]
+                .iter()
+                .all(|r| r == "Thanks, your report was sent to the staff"),
+            "{replies:?}"
+        );
+        assert_eq!(
+            replies[5],
+            "You can send 5 reports an hour. Try again later"
+        );
+        drop(b);
+    }
 }

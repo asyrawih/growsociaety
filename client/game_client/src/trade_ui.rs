@@ -32,10 +32,8 @@ const PANEL_WIDTH: f32 = PICKER_COLUMNS * SLOT_SIZE
     + SCROLLBAR_SPACE
     + 2.0 * PANEL_PADDING;
 
-/// Ask `to` for a trade. The coding session's `/trade <name>` command (or a click on a player)
-/// writes this; nothing in the client targets players yet.
+/// Ask `to` for a trade: the avatar menu's Trade row writes this.
 #[derive(Message, Clone, Copy)]
-#[allow(dead_code)] // constructed by the pending entry point above
 pub struct RequestTrade(pub PlayerId);
 
 #[derive(Component)]

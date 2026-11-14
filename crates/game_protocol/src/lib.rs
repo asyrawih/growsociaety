@@ -11,7 +11,7 @@ use game_shared::world::World;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change; a mismatch is refused at `Hello`.
-pub const PROTOCOL_VERSION: u16 = 11;
+pub const PROTOCOL_VERSION: u16 = 12;
 pub const DEFAULT_PORT: u16 = 7777;
 /// The name the dev certificate is issued for and the client connects to.
 pub const SERVER_NAME: &str = "localhost";
@@ -88,7 +88,46 @@ pub enum ClientMsg {
     /// A fresh login token for this account, asked right before a world switch re-starts the
     /// game (tokens are short-lived). Answer: `Token`.
     RefreshToken,
+    /// Report a player in this world to staff (docs/knowledge/ux/avatar-menu.md). Stored with the
+    /// last chat lines the reporter received; the answer is a System line, the target is never told.
+    Report {
+        player: PlayerId,
+        reason: ReportReason,
+        /// Optional, cleaned like chat and cut to `MAX_REPORT_NOTE` bytes.
+        note: Option<String>,
+    },
 }
+
+/// Why a player is reported.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum ReportReason {
+    Spam,
+    Rude,
+    Cheating,
+}
+
+impl ReportReason {
+    pub fn name(self) -> &'static str {
+        match self {
+            ReportReason::Spam => "spam",
+            ReportReason::Rude => "rude",
+            ReportReason::Cheating => "cheating",
+        }
+    }
+}
+
+/// The server's answers to `Report` (System lines; the client also toasts them). Exact texts from
+/// docs/knowledge/ux/avatar-menu.md.
+pub const REPORT_SENT: &str = "Thanks, your report was sent to the staff";
+pub const REPORT_LIMIT: &str = "You can send 5 reports an hour. Try again later";
+pub const REPORT_FAILED: &str = "The report could not be sent. Try again";
+pub const REPORT_NOBODY: &str = "No such player in this world";
+pub const REPORT_ANSWERS: [&str; 4] = [REPORT_SENT, REPORT_LIMIT, REPORT_FAILED, REPORT_NOBODY];
+
+/// Bytes of a report's note.
+pub const MAX_REPORT_NOTE: usize = 120;
+/// Reports one account may send per hour.
+pub const REPORTS_PER_HOUR: u32 = 5;
 
 /// Players allowed in one world at a time.
 pub const WORLD_CAPACITY: u8 = 64;
@@ -183,6 +222,8 @@ pub enum ServerMsg {
         level: u16,
         name: String,
         country: Option<String>,
+        /// Public: the avatar menu greys Mute and hides Kick/Ban for staff.
+        role: game_shared::commands::Role,
     },
     PlayerLeft {
         id: PlayerId,
@@ -218,6 +259,11 @@ pub enum ServerMsg {
         x: u32,
         y: u32,
         place: bool,
+    },
+    /// Everyone the receiver has muted with `/ignore` (kept across logins), sent on joining a world
+    /// and after every change: the avatar menu shows Mute/Unmute from it and voice mutes them.
+    Ignoring {
+        ids: Vec<PlayerId>,
     },
     /// The answer to `RefreshToken`; empty on development logins, which have no token.
     Token {
@@ -263,6 +309,9 @@ pub struct WorldSnapshot {
     pub names: Vec<(PlayerId, String)>,
     /// Country codes of those who gave one; set by the server after `of`.
     pub countries: Vec<(PlayerId, String)>,
+    /// Everyone's role (for the avatar menu: staff cannot be muted or kicked); set by the server
+    /// after `of`. Missing = `Role::Player`.
+    pub roles: Vec<(PlayerId, game_shared::commands::Role)>,
 }
 
 impl WorldSnapshot {
@@ -283,6 +332,7 @@ impl WorldSnapshot {
             damage: state.damage.clone(),
             names: names.iter().map(|(&id, name)| (id, name.clone())).collect(),
             countries: Vec::new(),
+            roles: Vec::new(),
         })
     }
 
