@@ -124,11 +124,40 @@ pub struct ArmContact {
     pub place: bool,
 }
 
-/// The skin-coloured strip from the shoulder to the reached-out arm, child of the rig root.
+/// The tapered stretch from the shoulder to the reached-out fist, child of the rig root: an
+/// outline-coloured trapezoid with a skin-coloured one on top (`rig::TAPER_SHOULDER` to
+/// `rig::TAPER_FIST`). Both are unit meshes (1 px long) scaled along the arm, so the widths stay
+/// fixed in px whatever the length.
 #[derive(Component)]
 struct ArmFill;
-/// Px.
-const ARM_FILL_WIDTH: f32 = 3.0;
+/// Px: the arm sprite's middle lies this far forward of the shoulder pivot (columns 19..=24, pivot 21).
+const ARM_CENTRE_X: f32 = 1.0;
+/// The arm sprite's outline colour.
+const ARM_OUTLINE: Color = Color::srgb_u8(5, 2, 9);
+
+/// A trapezoid from `top` px wide at y = 0 to `bottom` px wide at y = -1, drawn from both sides
+/// (the rig root is mirrored when facing west).
+fn taper_mesh(top: f32, bottom: f32) -> Mesh {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::{Indices, PrimitiveTopology};
+    let corners = [
+        [-top / 2.0, 0.0, 0.0],
+        [top / 2.0, 0.0, 0.0],
+        [bottom / 2.0, -1.0, 0.0],
+        [-bottom / 2.0, -1.0, 0.0],
+    ];
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, corners.to_vec())
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0, 0.0, 1.0]; 4])
+    .with_inserted_attribute(
+        Mesh::ATTRIBUTE_UV_0,
+        vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+    )
+    .with_inserted_indices(Indices::U32(vec![0, 1, 2, 0, 2, 3, 0, 2, 1, 0, 3, 2]))
+}
 
 /// Per second, like the camera: `pos += (target - pos) * (1 - exp(-REMOTE_STIFFNESS * dt))`.
 const REMOTE_STIFFNESS: f32 = 15.0;
@@ -153,6 +182,8 @@ pub struct RigImages {
     /// Ramp the skinned copies currently hold.
     skin: Option<usize>,
     name_font: Handle<Font>,
+    /// The reach-out taper: (mesh, material) for the outline and for the skin.
+    taper: [(Handle<Mesh>, Handle<ColorMaterial>); 2],
 }
 
 /// Jump presses seen in `Update`, kept until exactly one fixed tick has consumed them: Space, and
@@ -228,14 +259,28 @@ pub fn spawn_player(
     mut commands: Commands,
     assets: Res<AssetServer>,
     images: Res<Assets<Image>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
     game: Res<Game>,
 ) {
     let Some(me) = game.me() else { return };
+    let (shoulder, fist) = (rig::TAPER_SHOULDER, rig::TAPER_FIST);
+    let skin = Color::WHITE; // set to the skin tone by `skin_rig`
     let rig = RigImages {
         source: Part::ALL.map(|part| assets.load(format!("player_rig/{}.png", part.name()))),
         skinned: Part::ALL.map(|_| images.reserve_handle()),
         skin: None,
         name_font: assets.load(NAME_FONT),
+        taper: [
+            (
+                meshes.add(taper_mesh(shoulder, fist)),
+                materials.add(ARM_OUTLINE),
+            ),
+            (
+                meshes.add(taper_mesh((shoulder - 2.0).max(0.5), fist - 2.0)),
+                materials.add(skin),
+            ),
+        ],
     };
     let position = Vec2::from(me.body.pos);
     let player = Player {
@@ -287,12 +332,18 @@ fn spawn_rig(commands: &mut Commands, rig: &RigImages, position: Vec2, root: imp
             }
             // Just under the front arm, over everything of the part below it.
             let z = arm_front_index() as f32 * PART_Z - ITEM_Z;
+            let [(outline, outline_colour), (skin, skin_colour)] = rig.taper.clone();
             root.spawn((
                 ArmFill,
-                Sprite::from_color(Color::WHITE, Vec2::ZERO),
-                Anchor::TOP_CENTER,
+                Mesh2d(outline),
+                MeshMaterial2d(outline_colour),
                 Transform::from_translation(pivot_offset(Part::ArmFront).extend(z)),
                 Visibility::Hidden,
+            ))
+            .with_child((
+                Mesh2d(skin),
+                MeshMaterial2d(skin_colour),
+                Transform::from_xyz(0.0, 0.0, ITEM_Z / 2.0),
             ));
         });
 }
@@ -411,7 +462,8 @@ fn tick_player(
         down: keys.any_pressed(DOWN_KEYS),
         up,
     };
-    if input.move_x != 0 {
+    // While the arm reaches out the body keeps facing the tile (the reach is drawn for it).
+    if input.move_x != 0 && player.reach.is_none() {
         player.facing_west = input.move_x < 0;
     }
     player.previous = me.body;
@@ -466,10 +518,10 @@ fn swing_target(action: Action) -> Option<(u32, u32, bool)> {
 
 /// Starts a reach-out: turn towards the tile first, then the arm goes out from wherever it is.
 fn reach_towards(
-    reach: &mut Option<rig::Reach>,
-    facing_west: &mut bool,
+    (reach, facing_west): (&mut Option<rig::Reach>, &mut bool),
     position: Vec2,
     (x, y, place): (u32, u32, bool),
+    in_range: bool,
     now: f32,
 ) {
     let target = tile_to_world(x, y);
@@ -477,6 +529,8 @@ fn reach_towards(
         *facing_west = target.0 < position.x;
     }
     let from = reach.and_then(|r| r.length_at(now)).unwrap_or(rig::ARM_LEN);
+    // Still out from the last swing: turn on from where the arm is, not from rest.
+    let from_angle = reach.and_then(|r| r.angle_at(now, 0.0));
     *reach = Some(rig::Reach::new(
         now,
         from,
@@ -484,7 +538,9 @@ fn reach_towards(
         [target.0, target.1],
         (x, y),
         place,
+        in_range,
         *facing_west,
+        from_angle,
     ));
 }
 
@@ -492,52 +548,60 @@ fn reach_towards(
 /// not), other players' from the server's `Swing`.
 fn start_reach(
     time: Res<Time>,
+    game: Res<Game>,
     net: Option<ResMut<Net>>,
     mut actions: MessageReader<ActionMsg>,
     mut player: Single<&mut Player>,
     mut remotes: Query<&mut RemotePlayer>,
 ) {
     let now = time.elapsed_secs();
+    // Whether `id` can reach the tile: a tile out of reach gets a shorter jab.
+    let reaches = |id: PlayerId, (x, y, _): (u32, u32, bool)| {
+        game.0.players.get(&id).is_some_and(|p| {
+            game_shared::rules::in_reach_with(
+                &p.body,
+                x,
+                y,
+                game_shared::mods::worn_mods(&p.equipped),
+            )
+        })
+    };
     let player: &mut Player = &mut player;
     for &ActionMsg(action) in actions.read() {
         if let Some(target) = swing_target(action) {
-            let position = player.position;
-            reach_towards(
-                &mut player.reach,
-                &mut player.facing_west,
-                position,
-                target,
-                now,
-            );
+            let (position, in_range) = (player.position, reaches(game.1, target));
+            let reach = (&mut player.reach, &mut player.facing_west);
+            reach_towards(reach, position, target, in_range, now);
         }
     }
     let Some(mut net) = net else { return };
     for (id, x, y, place) in net.take_swings() {
         if let Some(mut remote) = remotes.iter_mut().find(|remote| remote.id == id) {
             let remote = &mut *remote;
-            let position = remote.position;
-            reach_towards(
-                &mut remote.reach,
-                &mut remote.facing_west,
-                position,
-                (x, y, place),
-                now,
-            );
+            let target = (x, y, place);
+            let (position, in_range) = (remote.position, reaches(id, target));
+            let reach = (&mut remote.reach, &mut remote.facing_west);
+            reach_towards(reach, position, target, in_range, now);
         }
     }
 }
 
-/// The reach at `now`: (px the arm is pushed out, its angle). Sends `ArmContact` once at full
-/// extension and clears the reach when the arm is back.
-fn reach_now(
+/// This frame's reach, written into the rig's pose: the front arm turned (eased from and back to
+/// its rest angle) and pushed out; returns how far (px).
+/// Re-aims at the target from the current shoulder, sends `ArmContact` once at full extension,
+/// and clears the reach when done.
+fn apply_reach(
     reach: &mut Option<rig::Reach>,
     now: f32,
     player: PlayerId,
+    (position, facing_west): (Vec2, bool),
+    parts: &mut [(f32, f32); 6],
     contacts: &mut MessageWriter<ArmContact>,
-) -> (f32, Option<f32>) {
+) -> f32 {
     let Some(current) = reach.as_mut() else {
-        return (0.0, None);
+        return 0.0;
     };
+    current.aim(shoulder(position, facing_west), facing_west);
     if !current.contacted && now >= current.contact() {
         current.contacted = true;
         let (x, y) = current.tile;
@@ -549,11 +613,15 @@ fn reach_now(
             place,
         });
     }
-    match current.length_at(now) {
-        Some(length) => ((length - rig::ARM_LEN).max(0.0), Some(current.angle)),
-        None => {
+    let arm = &mut parts[arm_front_index()].0;
+    match (current.length_at(now), current.angle_at(now, *arm)) {
+        (Some(length), Some(angle)) => {
+            *arm = angle;
+            (length - rig::ARM_LEN).max(0.0)
+        }
+        _ => {
             *reach = None;
-            (0.0, None)
+            0.0
         }
     }
 }
@@ -634,14 +702,15 @@ fn dress_part(
                 Transform::from_xyz(0.0, 0.0, -WINGS_Z),
             ));
         }
-        // In the front hand, over the arm and its sleeves, so it swings with the punch.
-        (Part::ArmFront, _, Some(held)) => {
+        // In the back hand (both hands sit the same way from their shoulder), behind the body:
+        // the front arm punches bare (docs/knowledge/ux/vfx-farming-punch.md (a)).
+        (Part::ArmBack, _, Some(held)) => {
             let [x, y] = rig::hand_offset();
             commands.entity(entity).with_child((
                 Sprite::from_image(assets.load(format!("items/{held}/{}", rig::HELD_FILE))),
                 Anchor(rig::held_anchor().into()),
                 Transform::from_xyz(x, y, HELD_Z)
-                    .with_rotation(Quat::from_rotation_z(rig::HELD_ANGLE)),
+                    .with_rotation(Quat::from_rotation_z(rig::BACK_HELD_ANGLE)),
             ));
         }
         _ => {}
@@ -652,6 +721,7 @@ fn dress_part(
 /// ponytail: one set of skinned images, in the local player's tone, shared by every rig.
 fn skin_rig(
     mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
     mut rig: ResMut<RigImages>,
     look: Single<&Look, With<Player>>,
 ) {
@@ -678,6 +748,11 @@ fn skin_rig(
         images
             .insert(handle, image)
             .expect("reserved handle is valid");
+    }
+    // The reach-out taper's skin: the body's main skin colour in this tone.
+    let [_, r, g, b] = rig::SKIN_RAMPS[look.skin].1[1].to_be_bytes();
+    if let Some(mut skin) = materials.get_mut(&rig.taper[1].1) {
+        skin.color = Color::srgb_u8(r, g, b);
     }
     rig.skin = Some(look.skin);
 }
@@ -709,7 +784,6 @@ fn draw_player(
     player.position = from.lerp(to, fixed.overstep_fraction());
 
     let now = time.elapsed_secs();
-    let (pushed, angle) = reach_now(&mut player.reach, now, game.1, &mut contacts);
 
     // The layers face east; mirroring the root mirrors every part and its rotation.
     let side = if player.facing_west { -1.0 } else { 1.0 };
@@ -718,9 +792,15 @@ fn draw_player(
 
     let motion = motion(&me.body);
     let mut parts = rig::pose(motion, now, None);
-    if let Some(angle) = angle {
-        parts[arm_front_index()].0 = angle;
-    }
+    let at = (player.position, player.facing_west);
+    let pushed = apply_reach(
+        &mut player.reach,
+        now,
+        game.1,
+        at,
+        &mut parts,
+        &mut contacts,
+    );
     *pose = RigPose(parts, rig::flap(motion, now), pushed);
 }
 
@@ -747,12 +827,9 @@ fn draw_remotes(
         transform.translation = (remote.position + Vec2::Y * SPRITE_OFFSET_Y).extend(Z_PLAYER);
         transform.scale.x = side;
         let (motion, now) = (motion(&body), time.elapsed_secs());
-        let id = remote.id;
-        let (pushed, angle) = reach_now(&mut remote.reach, now, id, &mut contacts);
         let mut parts = rig::pose(motion, now, None);
-        if let Some(angle) = angle {
-            parts[arm_front_index()].0 = angle;
-        }
+        let (id, at) = (remote.id, (remote.position, remote.facing_west));
+        let pushed = apply_reach(&mut remote.reach, now, id, at, &mut parts, &mut contacts);
         *pose = RigPose(parts, rig::flap(motion, now), pushed);
     }
 }
@@ -882,14 +959,24 @@ fn place_names(
 /// Moves every body part, and the wings on the torso, to its rig's pose.
 fn pose_parts(
     poses: Query<&RigPose>,
-    rig: Res<RigImages>,
     mut parts: Query<(&RigPart, &ChildOf, &mut Transform), Without<Wings>>,
     mut wings: Query<(&ChildOf, &mut Transform), (With<Wings>, Without<RigPart>)>,
     mut fills: Query<
-        (&ChildOf, &mut Transform, &mut Sprite, &mut Visibility),
+        (&ChildOf, &mut Transform, &mut Visibility),
         (With<ArmFill>, Without<RigPart>, Without<Wings>),
     >,
 ) {
+    let front = arm_front_index();
+    // A steep up-punch passes behind the head (just under it, over the torso's layers).
+    let behind_head = |pose: &RigPose| pose.2 > 0.5 && pose.0[front].0 > rig::BEHIND_HEAD_ANGLE;
+    let head = Part::ALL.iter().position(|&p| p == Part::Head).unwrap_or(0);
+    let front_z = |pose: &RigPose| {
+        if behind_head(pose) {
+            head as f32 * PART_Z - 8.0 * ITEM_Z
+        } else {
+            front as f32 * PART_Z
+        }
+    };
     for (&RigPart(part), child_of, mut transform) in &mut parts {
         let Ok(pose) = poses.get(child_of.parent()) else {
             continue;
@@ -897,18 +984,17 @@ fn pose_parts(
         let i = Part::ALL.iter().position(|&p| p == part).unwrap_or(0);
         let (angle, dy) = pose.0[i];
         let mut at = pivot_offset(part) + Vec2::Y * dy;
+        let mut z = transform.translation.z;
         if part == Part::ArmFront {
-            // Reaching out: the whole arm slides along itself, so the fist and the held item stay
-            // crisp; `ArmFill` covers the gap from the shoulder.
+            // Reaching out: the whole arm slides along itself, so the fist stays crisp; `ArmFill`
+            // covers the gap from the shoulder.
             at += Vec2::new(angle.sin(), -angle.cos()) * pose.2;
+            z = front_z(pose);
         }
-        transform.translation = at.extend(transform.translation.z);
+        transform.translation = at.extend(z);
         transform.rotation = Quat::from_rotation_z(angle);
     }
-    let [r, g, b] = rig::SKIN_RAMPS[rig.skin.unwrap_or(0)].1[1].to_be_bytes()[1..] else {
-        return;
-    };
-    for (root, mut transform, mut sprite, mut visibility) in &mut fills {
+    for (root, mut transform, mut visibility) in &mut fills {
         let Ok(pose) = poses.get(root.parent()) else {
             continue;
         };
@@ -918,11 +1004,17 @@ fn pose_parts(
         } else {
             Visibility::Hidden
         });
-        if shown {
-            transform.rotation = Quat::from_rotation_z(pose.0[arm_front_index()].0);
-            sprite.custom_size = Some(Vec2::new(ARM_FILL_WIDTH, pose.2 + 2.0));
-            sprite.color = Color::srgb_u8(r, g, b);
+        if !shown {
+            continue;
         }
+        // From the arm's shoulder (with its pose shift), centred on the arm, as long as the gap
+        // plus a little overlap under the fist.
+        let (angle, dy) = pose.0[front];
+        let across = Vec2::new(angle.cos(), angle.sin()) * ARM_CENTRE_X;
+        let at = pivot_offset(Part::ArmFront) + Vec2::Y * dy + across;
+        transform.translation = at.extend(front_z(pose) - ITEM_Z);
+        transform.rotation = Quat::from_rotation_z(angle);
+        transform.scale = Vec3::new(1.0, pose.2 + 2.0, 1.0);
     }
     for (torso, mut transform) in &mut wings {
         let flap = parts
@@ -945,6 +1037,24 @@ mod tests {
         // The canvas bottom is (CANVAS - FEET_Y) px below the feet line.
         let canvas_bottom = SPRITE_OFFSET_Y - CANVAS / 2.0;
         assert_eq!(canvas_bottom + (CANVAS - FEET_Y), -HITBOX_HEIGHT / 2.0);
+    }
+
+    #[test]
+    fn the_taper_is_narrow_at_the_shoulder_and_wide_at_the_fist() {
+        let mesh = taper_mesh(rig::TAPER_SHOULDER, rig::TAPER_FIST);
+        let Some(bevy::mesh::VertexAttributeValues::Float32x3(corners)) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            panic!("positions");
+        };
+        let width_at = |y: f32| {
+            let xs: Vec<f32> = corners.iter().filter(|c| c[1] == y).map(|c| c[0]).collect();
+            xs.iter().cloned().fold(f32::MIN, f32::max)
+                - xs.iter().cloned().fold(f32::MAX, f32::min)
+        };
+        assert_eq!(width_at(0.0), rig::TAPER_SHOULDER);
+        assert_eq!(width_at(-1.0), rig::TAPER_FIST);
+        assert!(rig::TAPER_FIST > rig::TAPER_SHOULDER);
     }
 
     #[test]

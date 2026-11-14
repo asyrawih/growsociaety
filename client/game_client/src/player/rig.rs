@@ -118,6 +118,15 @@ pub const HELD_GRIP: [f32; 2] = [3.0, 29.0];
 /// Turn of the held item around its grip, radians (CCW). The icon points its head up-right; turned
 /// down this far it rests head-forward and rises to point up-forward at the top of a punch.
 pub const HELD_ANGLE: f32 = -60.0 * PI / 180.0;
+/// The held item's turn in the back hand, where the rig carries it: `HELD_ANGLE` lifted 15° so it
+/// does not drag (docs/knowledge/ux/vfx-farming-punch.md (a)).
+pub const BACK_HELD_ANGLE: f32 = -45.0 * PI / 180.0;
+/// The reach-out's taper, px (outline width; the skin inside is 2 px narrower): narrow at the
+/// shoulder, widest at the fist, so the punch reads as an elastic cartoon arm. Tuning.
+pub const TAPER_SHOULDER: f32 = 3.0;
+pub const TAPER_FIST: f32 = 10.0;
+/// An up-punch steeper than this (radians from hanging down) passes behind the head.
+pub const BEHIND_HEAD_ANGLE: f32 = 150.0 * PI / 180.0;
 /// Where the hand is in the rig canvas (y down). The held item is a child of `arm_front`.
 pub const HAND: [f32; 2] = [22.0, 36.0];
 
@@ -170,9 +179,10 @@ const CLIMB_HZ: f32 = 6.0;
 
 /// Shoulder pivot to the hand in the rig canvas, px (`ArmFront` pivot [21, 25], `HAND` [22, 36]).
 pub const ARM_LEN: f32 = 11.0;
-/// The longest reach-out, world px: past the farthest tile in reach, so it never falls short.
-/// ponytail: one length for everyone; per-player reach mods only change which tiles count.
-pub const MAX_REACH_PX: f32 = (game_shared::rules::REACH as f32 + 2.0) * game_shared::TILE_SIZE;
+/// How much longer than at rest the arm gets, world px: a jab towards the tile, not a pole to it.
+pub const MAX_EXTRA_PX: f32 = game_shared::TILE_SIZE;
+/// A tile out of reach gets this fraction of the jab.
+const OUT_OF_RANGE_EXTRA: f32 = 0.5;
 /// Reach-out timing, seconds (docs/knowledge/ux/vfx-farming-punch.md (a)).
 const PUNCH_OUT: f32 = 0.08;
 const PUNCH_BACK: f32 = 0.10;
@@ -187,18 +197,26 @@ pub struct Reach {
     pub started: f32,
     /// Arm length (px) when it started: a new swing during the return starts from there.
     pub from: f32,
-    /// Full length (px), clamped to `MAX_REACH_PX` and shortened for a place.
+    /// Full length (px): `ARM_LEN` plus at most `MAX_EXTRA_PX`, less for a place or a far tile.
     pub length: f32,
     /// Arm rotation (radians, CCW, as drawn facing east; the root mirrors it): 0 hangs down.
     pub angle: f32,
+    /// The arm's rotation when it started, if it was still out from an earlier swing; else it
+    /// turns from the pose's own angle.
+    pub from_angle: Option<f32>,
     pub place: bool,
+    /// The tile is within the player's reach; a tile out of reach gets a shorter jab.
+    pub in_range: bool,
     pub tile: (u32, u32),
+    /// The target tile's centre, world px: `aim` re-points the arm at it as the body moves.
+    pub target: [f32; 2],
     /// `ArmContact` has been sent for this reach.
     pub contacted: bool,
 }
 
 impl Reach {
     /// From the shoulder (world px) towards the target tile's centre (world px).
+    #[allow(clippy::too_many_arguments)] // one swing's whole description
     pub fn new(
         now: f32,
         from: f32,
@@ -206,25 +224,42 @@ impl Reach {
         target: [f32; 2],
         tile: (u32, u32),
         place: bool,
+        in_range: bool,
         facing_west: bool,
+        from_angle: Option<f32>,
     ) -> Self {
-        let side = if facing_west { -1.0 } else { 1.0 };
-        let (dx, dy) = ((target[0] - shoulder[0]) * side, target[1] - shoulder[1]);
-        let full = dx.hypot(dy).clamp(ARM_LEN, MAX_REACH_PX);
-        let length = if place {
-            ARM_LEN + (full - ARM_LEN) * PLACE_LENGTH
-        } else {
-            full
-        };
-        Reach {
+        let mut reach = Reach {
             started: now,
             from,
-            length,
-            angle: dy.atan2(dx) + PI / 2.0,
+            length: ARM_LEN,
+            angle: 0.0,
+            from_angle,
             place,
+            in_range,
             tile,
+            target,
             contacted: false,
+        };
+        reach.aim(shoulder, facing_west);
+        reach
+    }
+
+    /// Points the arm from `shoulder` (world px) at the target: its angle and full length.
+    pub fn aim(&mut self, shoulder: [f32; 2], facing_west: bool) {
+        let side = if facing_west { -1.0 } else { 1.0 };
+        let (dx, dy) = (
+            (self.target[0] - shoulder[0]) * side,
+            self.target[1] - shoulder[1],
+        );
+        let mut extra = (dx.hypot(dy) - ARM_LEN).clamp(0.0, MAX_EXTRA_PX);
+        if !self.in_range {
+            extra *= OUT_OF_RANGE_EXTRA;
         }
+        if self.place {
+            extra *= PLACE_LENGTH;
+        }
+        self.length = ARM_LEN + extra;
+        self.angle = dy.atan2(dx) + PI / 2.0;
     }
 
     fn times(&self) -> (f32, f32) {
@@ -238,6 +273,38 @@ impl Reach {
     /// When the arm is fully out: the moment of contact (hit particles line up with it).
     pub fn contact(&self) -> f32 {
         self.started + self.times().0
+    }
+
+    /// How far out the swing is at `now`: 0 → 1 easing out, 1 → 0 easing back, 0 when done.
+    /// Drives the arm's turn and the held item's strike, so neither snaps at either end.
+    pub fn weight_at(&self, now: f32) -> f32 {
+        let (out, back) = self.times();
+        let t = now - self.started;
+        if t < out {
+            let k = (t / out).max(0.0);
+            1.0 - (1.0 - k) * (1.0 - k)
+        } else if t < out + back {
+            let k = (t - out) / back;
+            1.0 - k * k
+        } else {
+            0.0
+        }
+    }
+
+    /// The arm's rotation at `now`: turning from where it was (or `rest`, the pose's angle) to
+    /// the target while going out, and back to `rest` while coming back. `None` once done.
+    pub fn angle_at(&self, now: f32, rest: f32) -> Option<f32> {
+        let (out, back) = self.times();
+        let t = now - self.started;
+        let w = self.weight_at(now);
+        if t < out {
+            let from = self.from_angle.unwrap_or(rest);
+            Some(from + (self.angle - from) * w)
+        } else if t < out + back {
+            Some(rest + (self.angle - rest) * w)
+        } else {
+            None
+        }
     }
 
     /// Arm length at `now` (px): ease-out to full, then ease-in back. `None` once back.
@@ -438,8 +505,21 @@ mod tests {
 
     #[test]
     fn a_reach_goes_out_to_the_target_and_comes_back() {
+        let new = |target, place, in_range, west| {
+            Reach::new(
+                1.0,
+                ARM_LEN,
+                [0.0, 0.0],
+                target,
+                (3, 4),
+                place,
+                in_range,
+                west,
+                None,
+            )
+        };
         // Straight right of the shoulder, facing east: the arm points right (a quarter turn CCW).
-        let reach = Reach::new(1.0, ARM_LEN, [0.0, 0.0], [40.0, 0.0], (3, 4), false, false);
+        let reach = new([40.0, 0.0], false, true, false);
         assert!((reach.angle - PI / 2.0).abs() < 1e-5);
         assert_eq!(reach.length, 40.0);
         assert_eq!(reach.length_at(1.0), Some(ARM_LEN));
@@ -454,21 +534,29 @@ mod tests {
                 .is_none(),
             "back"
         );
-        // Facing west, the same target behind is mirrored; a far target is clamped; a place is shorter.
-        let west = Reach::new(0.0, ARM_LEN, [0.0, 0.0], [-40.0, 0.0], (0, 0), false, true);
+        // Facing west, the same target behind is mirrored.
+        let west = new([-40.0, 0.0], false, true, true);
         assert!((west.angle - PI / 2.0).abs() < 1e-5);
-        let far = Reach::new(
-            0.0,
-            ARM_LEN,
-            [0.0, 0.0],
-            [0.0, -900.0],
-            (0, 0),
-            false,
-            false,
-        );
-        assert_eq!(far.length, MAX_REACH_PX);
+        // A far tile: a jab of at most one tile, half of it when out of reach, less for a place.
+        let far = new([0.0, -900.0], false, true, false);
+        assert_eq!(far.length, ARM_LEN + MAX_EXTRA_PX);
         assert!(far.angle.abs() < 1e-5, "straight down hangs at 0");
-        let place = Reach::new(0.0, ARM_LEN, [0.0, 0.0], [40.0, 0.0], (0, 0), true, false);
-        assert!(place.length < reach.length && place.contact() < PUNCH_OUT);
+        let out = new([0.0, -900.0], false, false, false);
+        assert_eq!(out.length, ARM_LEN + MAX_EXTRA_PX * OUT_OF_RANGE_EXTRA);
+        let place = new([40.0, 0.0], true, true, false);
+        assert!(place.length < reach.length && place.contact() < 1.0 + PUNCH_OUT);
+        // The arm turns with the swing and eases back to rest: no snap at either end.
+        let rest = 0.1;
+        assert_eq!(reach.angle_at(1.0, rest), Some(rest));
+        let full = reach.angle_at(1.0 + PUNCH_OUT, rest).unwrap();
+        assert!((full - reach.angle).abs() < 1e-4);
+        let last = reach
+            .angle_at(1.0 + PUNCH_OUT + PUNCH_BACK - 0.001, rest)
+            .unwrap();
+        assert!(
+            (last - rest).abs() < 0.05,
+            "back at rest when it ends: {last}"
+        );
+        assert_eq!(reach.weight_at(5.0), 0.0);
     }
 }

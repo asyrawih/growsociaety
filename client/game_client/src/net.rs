@@ -55,6 +55,13 @@ pub fn server_address() -> Option<String> {
 }
 const DEFAULT_WORLD: &str = "START";
 const DEFAULT_TOKEN: &str = "dev";
+/// The server's refusal while the account's previous session is still open (world_server conn.rs).
+const ALREADY_ONLINE: &str = "That account is already online";
+/// How long, and how often, a refused login is retried while that session closes.
+const ONLINE_RETRY: Duration = Duration::from_secs(5);
+const ONLINE_RETRY_EVERY: Duration = Duration::from_millis(250);
+/// `Net::close` waits at most this long for the server to hear the close.
+const CLOSE_WAIT: Duration = Duration::from_secs(1);
 /// How long startup waits for the server's snapshot.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Inputs kept for replay; ~4 s at 60 Hz, far more than any round trip.
@@ -101,6 +108,8 @@ pub struct Net {
     /// The newest voice token (url, token) and world-owner mutes, until `voice.rs` takes them.
     voice_token: Option<(String, String)>,
     voice_muted: Vec<(PlayerId, bool)>,
+    /// The connection's thread; `close` waits for it.
+    session: Option<std::thread::JoinHandle<()>>,
 }
 
 /// What the background thread hands over once joined: id, server clock, world, (names, countries).
@@ -157,8 +166,15 @@ impl Plugin for NetPlugin {
         };
         let world = std::env::var(WORLD_ENV).unwrap_or_else(|_| DEFAULT_WORLD.into());
         // Explicitly asked to play online: failing to connect is fatal, not a silent offline game.
-        let (net, state, me) = connect(&server, &world)
-            .unwrap_or_else(|err| panic!("cannot join {world} on {server}: {err}"));
+        // A refused world already fell back (`JoinRefused`); this is the server unreachable or the
+        // fallback refused too. Logged (a started game has no terminal) and a clean exit, not a panic.
+        let (net, state, me) = match connect(&server, &world) {
+            Ok(joined) => joined,
+            Err(err) => {
+                error!("cannot join {world} on {server}: {err}");
+                std::process::exit(1);
+            }
+        };
         info!("online: player {} in {world} on {server}", me.0);
         let mut net = net;
         if let Some(refused) = net.join_refused.take() {
@@ -266,7 +282,7 @@ fn connect(server: &str, world: &str) -> Result<(Net, WorldState, PlayerId), Str
     let (incoming_tx, from_server) = mpsc::channel::<ServerMsg>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<Joined, String>>();
 
-    std::thread::spawn(move || {
+    let session = std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -283,12 +299,15 @@ fn connect(server: &str, world: &str) -> Result<(Net, WorldState, PlayerId), Str
             } else {
                 "0.0.0.0:0"
             };
-            let session =
-                async {
-                    let mut endpoint =
-                        quinn::Endpoint::client(local.parse().map_err(|_| "bind address")?)
-                            .map_err(|e| e.to_string())?;
-                    endpoint.set_default_client_config(config);
+            let session = async {
+                let mut endpoint =
+                    quinn::Endpoint::client(local.parse().map_err(|_| "bind address")?)
+                        .map_err(|e| e.to_string())?;
+                endpoint.set_default_client_config(config);
+                // A world switch re-starts the game: the old process's session may still be
+                // closing on the server for a moment, so "already online" is retried briefly.
+                let retry_until = tokio::time::Instant::now() + ONLINE_RETRY;
+                let (conn, mut send, mut recv, me, server_time, role) = loop {
                     let conn = endpoint
                         .connect(addr, SERVER_NAME)
                         .map_err(|e| e.to_string())?
@@ -297,55 +316,64 @@ fn connect(server: &str, world: &str) -> Result<(Net, WorldState, PlayerId), Str
                     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
                     let hello = ClientMsg::Hello {
                         protocol: PROTOCOL_VERSION,
-                        auth,
+                        auth: auth.clone(),
                         country: local_country(),
                     };
                     write_msg(&mut send, &hello)
                         .await
                         .map_err(|e| e.to_string())?;
-                    let (me, server_time, role) =
-                        match read_msg::<ServerMsg>(&mut recv, MAX_SERVER_MSG).await {
-                            Ok(ServerMsg::Welcome {
-                                player,
-                                server_time,
-                                role,
-                                ..
-                            }) => (player, server_time, role),
-                            Ok(ServerMsg::Kicked { reason }) => return Err(reason),
-                            other => return Err(format!("unexpected answer to Hello: {other:?}")),
-                        };
-                    let (joined, refused) =
-                        match join(&mut send, &mut recv, &world).await? {
-                            Ok(joined) => (joined, None),
-                            // Refused: join where the player came from, else START, and say why.
-                            Err(reason) => {
-                                let fallback = std::env::var(PREV_WORLD_ENV)
-                                    .ok()
-                                    .map(|name| name.to_ascii_uppercase())
-                                    .filter(|name| *name != world.to_ascii_uppercase())
-                                    .unwrap_or_else(|| DEFAULT_WORLD.to_owned());
-                                warn!("{world} refused the join ({reason:?}), joining {fallback}");
-                                // The server may count us as in the refused world; leaving is harmless if not.
-                                write_msg(&mut send, &ClientMsg::Leave)
-                                    .await
-                                    .map_err(|e| e.to_string())?;
-                                let joined = join(&mut send, &mut recv, &fallback).await?.map_err(
-                                    |again| format!("{fallback} refused the join too: {again:?}"),
-                                )?;
-                                let name = world.to_ascii_uppercase();
-                                (joined, Some(JoinRefused { name, reason }))
-                            }
-                        };
-                    let (state, names) = joined;
-                    Ok((
-                        endpoint,
-                        conn,
-                        send,
-                        recv,
-                        (me, server_time, state, names, role, refused),
-                    ))
+                    match read_msg::<ServerMsg>(&mut recv, MAX_SERVER_MSG).await {
+                        Ok(ServerMsg::Welcome {
+                            player,
+                            server_time,
+                            role,
+                            ..
+                        }) => break (conn, send, recv, player, server_time, role),
+                        Ok(ServerMsg::Kicked { reason })
+                            if reason == ALREADY_ONLINE
+                                && tokio::time::Instant::now() < retry_until =>
+                        {
+                            info!("{reason}: the previous session is still closing, retrying");
+                            tokio::time::sleep(ONLINE_RETRY_EVERY).await;
+                        }
+                        Ok(ServerMsg::Kicked { reason }) => return Err(reason),
+                        other => return Err(format!("unexpected answer to Hello: {other:?}")),
+                    }
                 };
-            let (_endpoint, conn, mut send, mut recv, joined) = match session.await {
+                let (joined, refused) = match join(&mut send, &mut recv, &world).await? {
+                    Ok(joined) => (joined, None),
+                    // Refused: join where the player came from, else START, and say why.
+                    Err(reason) => {
+                        let fallback = std::env::var(PREV_WORLD_ENV)
+                            .ok()
+                            .map(|name| name.to_ascii_uppercase())
+                            .filter(|name| *name != world.to_ascii_uppercase())
+                            .unwrap_or_else(|| DEFAULT_WORLD.to_owned());
+                        warn!("{world} refused the join ({reason:?}), joining {fallback}");
+                        // The server may count us as in the refused world; leaving is harmless if not.
+                        write_msg(&mut send, &ClientMsg::Leave)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        let joined =
+                            join(&mut send, &mut recv, &fallback)
+                                .await?
+                                .map_err(|again| {
+                                    format!("{fallback} refused the join too: {again:?}")
+                                })?;
+                        let name = world.to_ascii_uppercase();
+                        (joined, Some(JoinRefused { name, reason }))
+                    }
+                };
+                let (state, names) = joined;
+                Ok((
+                    endpoint,
+                    conn,
+                    send,
+                    recv,
+                    (me, server_time, state, names, role, refused),
+                ))
+            };
+            let (endpoint, conn, mut send, mut recv, joined) = match session.await {
                 Ok(parts) => parts,
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -385,6 +413,9 @@ fn connect(server: &str, world: &str) -> Result<(Net, WorldState, PlayerId), Str
                 _ = writer => {}
             }
             conn.close(0u32.into(), b"bye");
+            // Deliver the close, so the server frees the account now (`Net::close`), not after
+            // its idle timeout.
+            let _ = tokio::time::timeout(CLOSE_WAIT, endpoint.wait_idle()).await;
         });
     });
 
@@ -418,6 +449,7 @@ fn connect(server: &str, world: &str) -> Result<(Net, WorldState, PlayerId), Str
         token: None,
         voice_token: None,
         voice_muted: Vec::new(),
+        session: Some(session),
     };
     Ok((net, state, me))
 }
@@ -484,6 +516,16 @@ impl Net {
     /// The newest `world_status` answer, once: (name upper-case, status).
     pub fn take_world_status(&mut self) -> Option<(String, WorldStatus)> {
         self.world_status.take()
+    }
+
+    /// Ends the session and waits (at most `CLOSE_WAIT`) until the server has heard it, so it frees
+    /// the account at once. Call it before the process exits for a world switch.
+    pub fn close(&mut self) {
+        // The writer ends once its last sender is gone, which ends the session.
+        self.to_server = tokio_mpsc::unbounded_channel().0;
+        if let Some(session) = self.session.take() {
+            let _ = session.join();
+        }
     }
 
     /// Asks the server for a fresh login token; `take_token` has it a moment later. Call it right
@@ -748,6 +790,7 @@ mod tests {
             token: None,
             voice_token: None,
             voice_muted: Vec::new(),
+            session: None,
         };
         (net, tx, sent)
     }

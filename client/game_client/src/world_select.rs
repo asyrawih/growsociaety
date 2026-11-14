@@ -3,6 +3,7 @@
 //! door (`interact.rs`), the top-bar World button, M, and a refused join (`net::JoinRefused`).
 //! Entering a world restarts the client on it.
 
+use bevy::app::AppExit;
 use bevy::input::ButtonState;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::picking::hover::Hovered;
@@ -170,34 +171,36 @@ fn world_env(
     env
 }
 
-/// Restarts the client on `world`. Returns only on failure.
-// ponytail: re-exec; swap the world mirror in place later (Leave + Join on the same connection).
-fn enter_world(world: &str, current: &str, new: bool, token: Option<&str>) -> std::io::Error {
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(e) => return e,
-    };
+/// Restarts the client on `world`: starts the new process, then ends this one. Not `exec`:
+/// replacing the image skips the QUIC close, so the server keeps the account online until its idle
+/// timeout and refuses the new process ("That account is already online"). The child must start
+/// before the exit: on macOS winit ends the whole process when its event loop stops (lobby.rs).
+// ponytail: re-start; swap the world mirror in place later (Leave + Join on the same connection).
+fn enter_world(
+    world: &str,
+    current: &str,
+    new: bool,
+    token: Option<&str>,
+    exit: &mut MessageWriter<AppExit>,
+) -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let env = world_env(world, current, new, token);
+    // The keys only: the values hold the login token.
+    let keys: Vec<_> = env.iter().map(|(key, _)| *key).collect();
+    info!("restarting on world {world}: {exe:?} {args:?}, setting {keys:?}");
     let mut command = std::process::Command::new(exe);
-    command.args(std::env::args_os().skip(1));
-    for (key, value) in world_env(world, current, new, token) {
+    command.args(args);
+    for (key, value) in env {
         match value {
             Some(value) => command.env(key, value),
             None => command.env_remove(key),
         };
     }
     // The other `GAME_*` variables are inherited as they are.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.exec()
-    }
-    #[cfg(not(unix))]
-    {
-        match command.spawn() {
-            Ok(_) => std::process::exit(0),
-            Err(e) => e,
-        }
-    }
+    command.spawn()?;
+    exit.write(AppExit::Success);
+    Ok(())
 }
 
 /// The menu's state while the game runs.
@@ -279,6 +282,21 @@ impl Plugin for WorldSelectPlugin {
                     .chain()
                     .in_set(Phase::View),
             );
+        #[cfg(debug_assertions)]
+        app.add_systems(Update, debug_warp.before(Phase::Input));
+    }
+}
+
+/// Debug builds: `GAME_DEBUG_WARP=NAME` sends `/warp NAME` once, 5 s after start, to test the
+/// world switch without typing. The restarted game inherits it and ignores it (already there).
+#[cfg(debug_assertions)]
+fn debug_warp(time: Res<Time>, mut done: Local<bool>, mut warps: MessageWriter<WarpTo>) {
+    if *done || time.elapsed_secs() < 5.0 {
+        return;
+    }
+    *done = true;
+    if let Ok(name) = std::env::var("GAME_DEBUG_WARP") {
+        warps.write(WarpTo(name.to_ascii_uppercase()));
     }
 }
 
@@ -495,6 +513,7 @@ fn on_refused(
 /// opens the menu with the refusal); offline it goes at once. A bare `/warp` opens the menu.
 fn on_warp(
     time: Res<Time>,
+    mut exit: MessageWriter<AppExit>,
     game: Res<Game>,
     net: Option<ResMut<Net>>,
     mut warps: MessageReader<WarpTo>,
@@ -525,8 +544,9 @@ fn on_warp(
             menu.warp = Some(time.elapsed_secs());
         }
         None => {
-            let error = enter_world(name, current, false, None);
-            warn!("could not restart on world {name}: {error}");
+            if let Err(error) = enter_world(name, current, false, None, &mut exit) {
+                warn!("could not restart on world {name}: {error}");
+            }
         }
     }
 }
@@ -535,6 +555,7 @@ fn on_warp(
 #[allow(clippy::too_many_arguments)] // a Bevy system
 fn click_menu(
     time: Res<Time>,
+    mut exit: MessageWriter<AppExit>,
     net: Option<ResMut<Net>>,
     mouse: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -594,9 +615,10 @@ fn click_menu(
             menu.switching = Some((world, new, time.elapsed_secs()));
         }
         None => {
-            let error = enter_world(&world, &current, new, None);
-            warn!("could not restart on world {world}: {error}");
-            menu.error = Some(UNREACHABLE_TEXT.to_string());
+            if let Err(error) = enter_world(&world, &current, new, None, &mut exit) {
+                warn!("could not restart on world {world}: {error}");
+                menu.error = Some(UNREACHABLE_TEXT.to_string());
+            }
         }
     }
 }
@@ -613,6 +635,7 @@ fn rand_roll() -> f32 {
 /// typing stops; takes the answers.
 fn talk_to_server(
     time: Res<Time>,
+    mut exit: MessageWriter<AppExit>,
     game: Res<Game>,
     mut open: ResMut<OpenPanel>,
     net: Option<ResMut<Net>>,
@@ -624,9 +647,15 @@ fn talk_to_server(
         let token = net.take_token();
         if token.is_some() || now - asked >= TOKEN_TIMEOUT_SECS {
             menu.switching = None;
-            let error = enter_world(&world, &game.0.world.name, new, token.as_deref());
-            warn!("could not restart on world {world}: {error}");
-            menu.error = Some(UNREACHABLE_TEXT.to_string());
+            let current = &game.0.world.name;
+            match enter_world(&world, current, new, token.as_deref(), &mut exit) {
+                // Free the account now: the new process logs in with it (net.rs retries briefly).
+                Ok(()) => net.close(),
+                Err(error) => {
+                    warn!("could not restart on world {world}: {error}");
+                    menu.error = Some(UNREACHABLE_TEXT.to_string());
+                }
+            }
         }
     }
     if open.is_changed() && *open == OpenPanel::WorldSelect {

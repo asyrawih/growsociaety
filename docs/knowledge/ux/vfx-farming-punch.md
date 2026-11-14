@@ -20,18 +20,21 @@ client-only, driven by the `Event`s the client already receives (`TileDamaged`, 
 | Each punch (`TileDamaged`) | 4 particles from the hit point, sprayed away from the player, in the block's colour, 0.25 s life with gravity |
 | Break (`TileBroken`) | 12 particles in the block's colour plus `fx/block_break_dust.png` tinted to the block colour, centred on the tile |
 
-**Reach-out arm** (owner request): on every punch the front arm stretches to the target and snaps back.
+**Reach-out arm** (owner request, revised 2026-11-14): on every punch the front arm jabs toward the target and snaps
+back.
 
 | Part | Rule |
 |---|---|
-| Direction | From the shoulder toward the target tile's centre, any angle (up, down, diagonal). Length clamped to punch reach |
-| Timing | Out 0.08 s (ease-out), back 0.10 s (ease-in). A new punch during the return restarts from the current length |
-| Drawing | The rig's front arm segment scaled along its own axis (`player/rig.rs`), rotated to the angle; the fist sprite at the tip, not stretched |
-| Contact | The hit particles spawn when the arm reaches full length (at 0.08 s), not when the click happens |
-| Facing | The body flips to face the target before the arm goes out |
-| Placing | The same move at 60 % length and 0.06 s / 0.08 s, with the held item at the tip instead of the fist |
-| Refused punch | The arm still goes out (the player did swing); the refusal feedback (U2/claims) plays as usual |
-| Remote players | Everyone sees everyone's swings. The tile events don't say who acted, so d4 adds `Event::Swing { player, x, y, place }`, sent with each punch/place to the world, which drives the rig for remote players. The local player animates on input (prediction) and ignores its own `Swing` |
+| Held item | Lives on the **back arm** (`ArmBack`), at its hand behind the body, all the time, swings included, resting lifted at −45° so it doesn't look dragged. The reaching front arm is always the bare fist; it never turns a tool to strike |
+| Direction | From the current shoulder toward the target tile, any angle (up, down, diagonal), re-aimed every frame |
+| Length | At most **1 tile beyond the arm's rest length**: a jab, not a pole to the tile. Half that when the tile is out of reach; ×0.6 for a place |
+| Shape | Tapered: outline 4 px at the shoulder widening to 7 px just before the fist, skin 2 → 5 px inside it, in the arm's own outline colour and skin ramp. The fist sprite at the tip is not stretched. An up-punch steeper than ~60° from horizontal is drawn just behind the head, so the face stays visible |
+| Timing | Out 0.08 s (ease-out), back 0.10 s (ease-in); the angle eases out from rest and back to rest (no snap). A new punch during the return restarts from the current length |
+| Contact | `ArmContact` at full extension spawns the hit particles (not the click) |
+| Facing | The body faces the target while the arm is out; walking doesn't flip it mid-swing |
+| Placing | The same jab at 0.6 length and 0.06 s / 0.08 s; the bare fist reaches (the held block stays on the back arm) |
+| Refused punch | The arm still jabs (the player did swing); the refusal feedback (U2/claims) plays as usual |
+| Remote players | Everyone sees everyone's swings, driven by `Event::Swing { player, x, y, place }` from the server; the local player animates on input and ignores its own `Swing` |
 | Reduce effects | Kept: it's core feedback, not decoration |
 
 Block colour: the average opaque colour of the block's sprite, computed once when the sprite loads and cached per item.
