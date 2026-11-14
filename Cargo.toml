@@ -1,0 +1,47 @@
+[workspace]
+resolver = "3"
+members = ["client/game_client", "crates/game_shared", "crates/game_protocol", "server/world_server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+bevy = "0.20"
+game_shared = { path = "crates/game_shared" }
+game_protocol = { path = "crates/game_protocol" }
+# Networking (docs/knowledge/10, decision D4: QUIC via quinn; postcard on the wire).
+bytes = "1"
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+quinn = "0.11"
+rcgen = "0.14"
+argon2 = "0.6"
+axum = "0.8"
+getrandom = "0.4"
+hmac = "0.13"
+serde_json = "1"
+sha2 = "0.11"
+ureq = "3"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "macros", "migrate"] }
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# Voice chat (docs/knowledge/12): LiveKit server SDK (tokens, server API) and client SDK (WebRTC).
+# TLS for wss:// / https:// (prod LiveKit); webpki roots are embedded, so the slim Docker image needs no CA package.
+livekit = { version = "=0.10.0", features = ["rustls-tls-webpki-roots"] }
+livekit-api = { version = "=0.10.0", features = ["rustls-tls-webpki-roots"] }
+# livekit's TLS is rustls without a crypto provider: both binaries install ring (already used by quinn) in main.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# Voice audio devices and stream polling; both already built for bevy_audio / livekit.
+cpal = "0.17"
+futures-util = { version = "0.3", default-features = false }
+
+# Bevy is slow unoptimized; optimize deps in dev, keep own code fast to compile.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+codegen-units = 1
+lto = "thin"

@@ -1,0 +1,5 @@
+# Day-to-day client work: `cargo dev` (no voice, so no LiveKit/WebRTC build; Bevy linked dynamically).
+# `cargo devv` keeps voice. Release and CI use plain `cargo build --release`, which enables neither.
+[alias]
+dev = "run -p game_client --no-default-features --features dev"
+devv = "run -p game_client --features dev,voice"

@@ -1,0 +1,10 @@
+[package]
+name = "game_protocol"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+game_shared = { workspace = true, features = ["serde"] }
+postcard.workspace = true
+quinn.workspace = true
+serde.workspace = true

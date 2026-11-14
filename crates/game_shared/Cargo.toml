@@ -1,0 +1,12 @@
+# No Bevy here: the server must build without the renderer.
+[package]
+name = "game_shared"
+version.workspace = true
+edition.workspace = true
+
+[features]
+# Wire format for the server and the networked client (docs/knowledge/10). Off by default: zero dependencies.
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { workspace = true, optional = true }

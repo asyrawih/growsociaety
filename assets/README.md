@@ -147,3 +147,10 @@ Reference: `ui/settings/_mockup.png`. PixelLab kit `cbfdcc96-9393-4bbc-bf52-0131
   (57×29); `dropdown.png` (100×29, 9-slice 10, arrow on the right); `divider.png` (246×17, 9-slice left/right 8).
 - The settings panel is `ui/panel.png` with tabs (`ui/tab.png`): Audio (music / SFX / voice volume sliders),
   Voice (push-to-talk V and open mic toggles, mic dropdown), Display, Controls, Account (skin tone, language).
+
+## Game icon (`assets/icon/`)
+
+A grass block with a sprout (PixelLab `dba1d15a-f247-47fe-b7eb-0d76d2838d7e`, candidate 1).
+- `icon_{16,32,48,64,128,256,512}.png`. 128 and up are whole-number nearest upscales; 16–64 are smooth downscales.
+- `icon.ico` (Windows exe and window icon) and `icon.icns` (macOS .app bundle).
+- Bevy window icon: load `icon_64.png` (or 32) into a winit `Icon` on the primary window at startup.

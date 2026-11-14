@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Bevy Linux deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: check
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, bin: game_client, name: linux-x86_64 }
+          - { os: windows-latest, bin: game_client.exe, name: windows-x86_64 }
+          - { os: macos-latest, bin: game_client, name: macos-aarch64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Bevy Linux deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+      - run: cargo build --release -p game_client
+      # The client finds `assets/` next to its binary (zip) or in `Contents/Resources` (macOS .app);
+      # see `asset_dir` in client/game_client/src/main.rs. The Windows exe icon is embedded by build.rs.
+      - name: Package (Linux, Windows)
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          mkdir dist
+          cp target/release/${{ matrix.bin }} dist/
+          cp -r assets dist/
+          if [ "$RUNNER_OS" = Linux ]; then
+            printf '%s\n' '[Desktop Entry]' 'Type=Application' 'Name=Growsociety' \
+              'Exec=game_client' 'Icon=growsociety' 'Categories=Game;' > dist/growsociety.desktop
+            cp assets/icon/icon_256.png dist/growsociety.png
+          fi
+          cd dist && 7z a ../growsociety-${{ matrix.name }}.zip .
+      - name: Package (macOS .app)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          app=dist/Growsociety.app/Contents
+          mkdir -p "$app/MacOS" "$app/Resources"
+          cp target/release/game_client "$app/MacOS/"
+          cp -r assets "$app/Resources/"
+          cp assets/icon/icon.icns "$app/Resources/icon.icns"
+          version="${GITHUB_REF_NAME#v}"
+          cat > "$app/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleName</key><string>Growsociety</string>
+            <key>CFBundleDisplayName</key><string>Growsociety</string>
+            <key>CFBundleIdentifier</key><string>app.growsociety.client</string>
+            <key>CFBundleExecutable</key><string>game_client</string>
+            <key>CFBundleIconFile</key><string>icon</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${version}</string>
+            <key>CFBundleVersion</key><string>${version}</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>NSMicrophoneUsageDescription</key><string>Voice chat with players near you.</string>
+          </dict></plist>
+          PLIST
+          # ponytail: unsigned; Gatekeeper asks once (right-click > Open). Sign and notarize when there is a developer ID.
+          cd dist && ditto -c -k --keepParent Growsociety.app ../growsociety-${{ matrix.name }}.zip
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: growsociaety-${{ matrix.name }}.zip

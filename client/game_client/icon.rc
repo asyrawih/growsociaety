@@ -1,0 +1,2 @@
+// Windows exe icon, embedded by build.rs (embed-resource) on Windows targets only.
+1 ICON "../../assets/icon/icon.ico"

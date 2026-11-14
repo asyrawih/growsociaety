@@ -1,0 +1,22 @@
+[package]
+name = "world_server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+game_shared.workspace = true
+game_protocol.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+livekit-api.workspace = true
+argon2.workspace = true
+sqlx.workspace = true
+axum.workspace = true
+getrandom.workspace = true
+hmac.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true

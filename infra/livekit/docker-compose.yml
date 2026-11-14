@@ -1,0 +1,28 @@
+# Local LiveKit server for voice chat development.
+#   cd infra/livekit && docker compose up -d
+# Clients connect to ws://localhost:7880 ; the game server uses the same URL with the key/secret below.
+# Plan: docs/knowledge/12-voice-chat.md
+
+services:
+  livekit:
+    image: livekit/livekit-server:v1.13.10
+    command:
+      - --config=/etc/livekit.yaml
+      # The IP put in ICE candidates. 127.0.0.1 works for clients on this machine.
+      # To test from another device on the LAN: LIVEKIT_NODE_IP=<this machine's LAN IP> docker compose up -d
+      - --node-ip=${LIVEKIT_NODE_IP:-127.0.0.1}
+    environment:
+      # "key: secret". Development values only; production keys never go in this file.
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY:-devkey}: ${LIVEKIT_API_SECRET:-devsecret-change-me-at-least-32-chars}"
+    ports:
+      - "7880:7880/tcp"   # signalling + server API
+      - "7881:7881/tcp"   # ICE/TCP
+      - "7882:7882/udp"   # media (UDP mux)
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:7880 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5

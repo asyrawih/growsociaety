@@ -1,0 +1,17 @@
+# LiveKit server config for local development (docs/knowledge/12-voice-chat.md).
+# API keys come from LIVEKIT_KEYS in docker-compose.yml, not from this file.
+
+port: 7880                # HTTP + WebSocket signalling (clients and the game server's server API)
+
+rtc:
+  tcp_port: 7881          # ICE over TCP, fallback when UDP is blocked
+  udp_port: 7882          # one UDP port for all media (UDP mux); avoids publishing a 10,000-port range
+  use_external_ip: false  # node_ip is passed on the command line instead (see docker-compose.yml)
+
+room:
+  auto_create: true       # the first player to join a world creates its room
+  empty_timeout: 60       # seconds an empty room lives
+  max_participants: 64    # = MAX_PLAYERS_PER_WORLD in docs/knowledge/02-world.md
+
+logging:
+  level: info

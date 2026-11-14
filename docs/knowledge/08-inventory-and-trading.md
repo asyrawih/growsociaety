@@ -181,7 +181,11 @@ before any networking exists.
     `slot_worn.png` and the item's icon; an empty one `slot_equip_empty.png` and `slot_icon_<slot>.png`. Clicking a
     filled slot unequips. Below, a grid of the equipment the player owns; clicking an item equips it.
   - **Escape** or the close button closes the panel (and the store).
-  Known gap: the grids do not scroll, so near the 396-slot maximum they run off a 720 px window.
+  Panels are capped to the window (ending above the hotbar, recomputed on resize and fullscreen). The inventory grid,
+  the wardrobe's owned-equipment grid, the store's equipment grids and the trade picker scroll (mouse wheel, a visible
+  scrollbar with a draggable thumb); headers, tabs, the preview and worn slots stay fixed. Grid columns grow with the
+  window width. The wardrobe grid sits to the right of the preview and worn-slot columns, with a filter row above it
+  ("All" + the 8 slot icons). The mouse wheel over any panel scrolls it and never zooms the camera.
 - **Q** drops one of the selected item on the side the player faces. **X** trashes one; it must be pressed twice
   within 2 s. Equipment is dropped or trashed from the wardrobe grid with the same keys while it is selected there.
 - Clicks on the hotbar or any open panel never reach the world (one shared "pointer is over UI" check).

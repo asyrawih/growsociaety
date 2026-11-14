@@ -1,0 +1,29 @@
+[package]
+name = "game_client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bevy.workspace = true
+game_protocol.workspace = true
+game_shared = { workspace = true, features = ["serde"] }
+quinn.workspace = true
+rustls.workspace = true
+tokio.workspace = true
+livekit = { workspace = true, optional = true }
+cpal = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+# Window icon on Windows/Linux (icon.rs); the same winit Bevy already uses.
+winit = { version = "0.30", default-features = false }
+
+[build-dependencies]
+# The Windows exe icon (build.rs); does nothing on other targets.
+embed-resource = "3"
+
+[features]
+default = ["voice"]
+# Voice chat through LiveKit (links WebRTC). `--no-default-features` builds without it.
+voice = ["dep:livekit", "dep:cpal", "dep:futures-util"]
+# Development only: Bevy as a dynamic library, so changing game code relinks in seconds.
+# Never in `default`, never in release/CI builds; use `cargo dev` (see .cargo/config.toml).
+dev = ["bevy/dynamic_linking"]
