@@ -66,7 +66,13 @@ pub struct Body {
     pub jump_cut_ready: bool,
     /// The ExtraJump mod's one mid-air jump is spent; cleared on landing.
     pub extra_jump_used: bool,
+    /// Ticks left during which hazards are ignored, set by every respawn
+    /// (docs/knowledge/ux/respawn.md: a door next to lava cannot loop).
+    pub hazard_immune: u8,
 }
+
+/// Hazard immunity after a respawn: 0.5 s. Tuning.
+pub const HAZARD_IMMUNE_TICKS: u8 = (TICK_RATE * 0.5) as u8;
 
 /// A body at rest on the main door tile: centred on it, hitbox bottom on the tile's bottom edge.
 pub fn spawn_body(world: &World) -> Body {
@@ -79,7 +85,17 @@ pub fn spawn_body(world: &World) -> Body {
         jump_buffer: 0.0,
         jump_cut_ready: false,
         extra_jump_used: false,
+        hazard_immune: HAZARD_IMMUNE_TICKS,
     }
+}
+
+fn hazard(world: &World, tx: i32, ty: i32) -> bool {
+    let tile = u32::try_from(tx)
+        .ok()
+        .zip(u32::try_from(ty).ok())
+        .and_then(|(x, y)| world.get(x, y));
+    tile.and_then(|tile| item(tile.fg))
+        .is_some_and(|def| def.collision == Collision::Hazard)
 }
 
 fn platform(world: &World, tx: i32, ty: i32) -> bool {
@@ -132,14 +148,15 @@ fn approach(value: f32, target: f32, max_delta: f32) -> f32 {
     value + (target - value).clamp(-max_delta, max_delta)
 }
 
-/// Advances `body` by exactly `1 / TICK_RATE` seconds, with no item mods.
-pub fn step(body: &mut Body, input: Input, world: &World) {
-    step_with(body, input, world, Mods::default());
+/// Advances `body` by exactly `1 / TICK_RATE` seconds, with no item mods. `Some(where)` if it
+/// touched a hazard there and was respawned at the main door.
+pub fn step(body: &mut Body, input: Input, world: &World) -> Option<(f32, f32)> {
+    step_with(body, input, world, Mods::default())
 }
 
 /// `step` with the movement mods of what the player wears (`mods::worn_mods`). The client's
 /// prediction and the server must pass the same mods, so reconciliation stays exact.
-pub fn step_with(body: &mut Body, input: Input, world: &World, mods: Mods) {
+pub fn step_with(body: &mut Body, input: Input, world: &World, mods: Mods) -> Option<(f32, f32)> {
     // 1. Timers.
     body.coyote = (body.coyote - DT).max(0.0);
     body.jump_buffer = (body.jump_buffer - DT).max(0.0);
@@ -265,6 +282,21 @@ pub fn step_with(body: &mut Body, input: Input, world: &World, mods: Mods) {
         body.coyote = COYOTE_TIME;
         body.extra_jump_used = false;
     }
+
+    // 9. Hazards: touching one sends the body back to the main door (docs/knowledge/ux/respawn.md).
+    if body.hazard_immune > 0 {
+        body.hazard_immune -= 1;
+        return None;
+    }
+    let columns = tile_span(body.pos.0 - HALF_W, body.pos.0 + HALF_W);
+    let touched = tile_span(body.pos.1 - HALF_H, body.pos.1 + HALF_H)
+        .any(|ty| columns.clone().any(|tx| hazard(world, tx, ty)));
+    if !touched {
+        return None;
+    }
+    let burned_at = body.pos;
+    *body = spawn_body(world);
+    Some(burned_at)
 }
 
 #[cfg(test)]

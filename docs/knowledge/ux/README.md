@@ -106,6 +106,8 @@ Approved by the owner 2026-11-14; specs owned by the UI/UX session (growsociaety
 5. Not yet specced: U5, U6, U8, U10, U11, U12, U13, U14 (U10/U11 are also in the craft review sent to 1a).
 6. Gap found while implementing: Inventory and Wardrobe grids have no keyboard/gamepad focus yet (store, craft and
    tabs do). Spec it with the gamepad pass.
+7. Later (note only): decorative plant blocks (Fern, flowers) look too much like saplings; give decor a distinct
+   read (e.g. no soil mound, sway animation, or a different base) when the plant art is next touched.
 
 Files: `hud.rs`, `interact.rs`, `world_view.rs` belong to the scripting subagent; `craft_ui.rs`, `trade_ui.rs` to
 whoever wrote them (ask in the README owners table); anything in `net.rs`/server to the coding session.

@@ -254,14 +254,14 @@ const BUY_INSET: f32 = 10.0;
 const TOUCH_MIN: f32 = 44.0;
 
 /// The item tooltip (U3): `ui/tooltip.png` 9-sliced, shown after the pointer rests on a cell.
-const TOOLTIP_IMAGE: &str = "ui/tooltip.png";
-const TOOLTIP_INSET: f32 = 6.0;
-const TOOLTIP_MAX_WIDTH: f32 = 280.0;
-const TOOLTIP_DELAY_SECS: f32 = 0.3;
+pub(crate) const TOOLTIP_IMAGE: &str = "ui/tooltip.png";
+pub(crate) const TOOLTIP_INSET: f32 = 6.0;
+pub(crate) const TOOLTIP_MAX_WIDTH: f32 = 280.0;
+pub(crate) const TOOLTIP_DELAY_SECS: f32 = 0.3;
 /// A store price the player cannot pay, on the tooltip's parchment.
 const SHORT_PRICE_COLOR: Color = Color::srgb(0.7, 0.1, 0.08);
 /// Between the parts of a line: "Block · 6 punches".
-const SEP: &str = " · ";
+pub(crate) const SEP: &str = " · ";
 
 /// Index of the selected inventory slot (an index into `Inventory::slots`). The hotbar and the
 /// inventory grid only offer non-equipment items; equipment is selected in the wardrobe.
@@ -1114,7 +1114,7 @@ fn spawn_hud(
 }
 
 /// Every node of the tooltip: never under the pointer, but counted by `pointer_over_ui` alike.
-fn tip_part() -> (Pickable, Hovered) {
+pub(crate) fn tip_part() -> (Pickable, Hovered) {
     (Pickable::IGNORE, Hovered::default())
 }
 
@@ -2343,7 +2343,7 @@ fn item_info(id: ItemId, count: u16, worn: bool, price: Option<(u32, bool)>) -> 
 }
 
 /// "golden pickaxe" -> "Golden Pickaxe".
-fn title_case(name: &str) -> String {
+pub(crate) fn title_case(name: &str) -> String {
     let word = |w: &str| {
         let mut chars = w.chars();
         chars.next().map_or_else(String::new, |first| {
@@ -2354,7 +2354,8 @@ fn title_case(name: &str) -> String {
 }
 
 /// Seconds as "45s", "3m 20s", "1h 5m" (a zero last part is left out).
-fn duration_text(secs: u64) -> String {
+/// The one duration format: the seed tooltip, the plant toast and the tree card (farming_ui.rs).
+pub(crate) fn duration_text(secs: u64) -> String {
     match (secs / 3600, secs / 60 % 60, secs % 60) {
         (0, 0, s) => format!("{s}s"),
         (0, m, 0) => format!("{m}m"),
@@ -2365,7 +2366,7 @@ fn duration_text(secs: u64) -> String {
 }
 
 /// Tooltip line 3: what the item is, by kind.
-fn kind_line(def: &ItemDef, worn: bool) -> Option<String> {
+pub(crate) fn kind_line(def: &ItemDef, worn: bool) -> Option<String> {
     Some(match def.kind {
         _ if def.id == WORKBENCH => format!("Block{SEP}wrench it to craft"),
         ItemKind::Seed => format!(
@@ -2682,12 +2683,7 @@ pub(crate) fn item_name(id: ItemId) -> &'static str {
 /// What to tell the player about an event, if anything.
 fn toast_for_event(event: &Event) -> Option<String> {
     match *event {
-        Event::TreeSpliced { tree, a, b, .. } => Some(format!(
-            "{} and {} spliced into {}",
-            item_name(a),
-            item_name(b),
-            item_name(tree.item)
-        )),
+        // Plant and splice toasts are the planter's own: `farming_ui.rs`.
         Event::BackpackUpgraded { capacity, .. } => {
             Some(format!("Backpack now holds {capacity} item types"))
         }
@@ -2710,9 +2706,19 @@ fn toast_for_reject(action: &Action, reject: Reject) -> Option<&'static str> {
             _ => {}
         }
     }
+    // A seed on a full tile (a placed fern looks like a plant): say what it needs. Other
+    // `Occupied` stays silent, the tile is visibly full.
+    if let Action::Place { item: placed, .. } = *action
+        && reject == Reject::Occupied
+        && item(placed).is_some_and(|def| def.kind == ItemKind::Seed)
+    {
+        return Some("Seeds need an empty tile or a sapling");
+    }
     match reject {
         Reject::NoRecipe => Some("These two seeds cannot be spliced"),
-        Reject::AlreadySpliced => Some("This tree has already been spliced"),
+        Reject::AlreadySpliced => {
+            Some("This tree has already been spliced. Harvest it and plant a fresh seed")
+        }
         Reject::NeedsGround => Some("Seeds need solid ground below"),
         Reject::DropLimit => Some("This world cannot hold more dropped items"),
         Reject::NotEnoughGems => Some("Not enough gems"),
@@ -2779,30 +2785,7 @@ fn show_toasts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use game_shared::farming::Tree;
-    use game_shared::items::{DIRT, GRAVEL, STONE};
-
-    #[test]
-    fn splice_message_names_both_parents_and_the_result() {
-        let tree = Tree {
-            item: GRAVEL,
-            planted_at: 0.0,
-            fruit: 3,
-            spliced: true,
-        };
-        let spliced = Event::TreeSpliced {
-            x: 1,
-            y: 1,
-            tree,
-            a: DIRT,
-            b: STONE,
-        };
-        assert_eq!(
-            toast_for_event(&spliced).as_deref(),
-            Some("dirt and stone spliced into gravel")
-        );
-        assert_eq!(toast_for_event(&Event::TreeHarvested { x: 1, y: 1 }), None);
-    }
+    use game_shared::items::DIRT;
 
     #[test]
     fn every_mod_reads_in_a_few_words() {
@@ -3004,7 +2987,9 @@ mod tests {
         fn listed(reject: Reject) -> Option<&'static str> {
             match reject {
                 Reject::NoRecipe => Some("These two seeds cannot be spliced"),
-                Reject::AlreadySpliced => Some("This tree has already been spliced"),
+                Reject::AlreadySpliced => {
+                    Some("This tree has already been spliced. Harvest it and plant a fresh seed")
+                }
                 Reject::NeedsGround => Some("Seeds need solid ground below"),
                 Reject::DropLimit => Some("This world cannot hold more dropped items"),
                 Reject::NotEnoughGems => Some("Not enough gems"),
@@ -3055,6 +3040,21 @@ mod tests {
         assert_eq!(
             toast_for_reject(&craft, Reject::NoItem),
             Some("Not enough ingredients")
+        );
+        let seed = ITEMS.iter().find(|d| d.kind == ItemKind::Seed).unwrap().id;
+        let plant = |item| Action::Place { x: 1, y: 1, item };
+        assert_eq!(
+            toast_for_reject(&plant(seed), Reject::Occupied),
+            Some("Seeds need an empty tile or a sapling")
+        );
+        assert_eq!(
+            toast_for_reject(&plant(DIRT), Reject::Occupied),
+            None,
+            "a block: silent"
+        );
+        assert_eq!(
+            toast_for_reject(&plant(seed), Reject::AlreadySpliced),
+            Some("This tree has already been spliced. Harvest it and plant a fresh seed")
         );
         assert_eq!(
             toast_for_reject(&craft, Reject::InventoryFull),

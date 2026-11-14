@@ -247,7 +247,13 @@ fn draw_tile(
             let icon = item(tree.item).map(|def| item_icon(assets, def.sprite));
             if let Some(icon) = icon.filter(|_| stage == GROWN_STAGE) {
                 let above = Transform::from_xyz(cx, cy + TREE_ICON_OFFSET_Y, Z_TREE_ICON);
-                spawned.push(commands.spawn((icon.sprite(TREE_ICON_SIZE), above)).id());
+                // `farming_ui.rs` adds the ready twinkle to it.
+                let ready = crate::farming_ui::ReadyIcon(x, y);
+                spawned.push(
+                    commands
+                        .spawn((icon.sprite(TREE_ICON_SIZE), above, ready))
+                        .id(),
+                );
             }
             continue;
         }
@@ -436,7 +442,8 @@ fn on_game_events(
             | Event::TradeCancelled { .. }
             | Event::XpChanged { .. }
             | Event::LevelUp { .. }
-            | Event::Crafted { .. } => {}
+            | Event::Crafted { .. }
+            | Event::Respawned { .. } => {}
         }
     }
 }

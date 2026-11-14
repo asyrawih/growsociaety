@@ -12,7 +12,9 @@ Extend `toast_for_reject` (claims cases are in [claims.md](claims.md) §4 and wi
 | `Unbreakable` | `This block can't be broken` | Bedrock/main door look like any block |
 | `NoItem` | `You don't have that item` | Happens after a stack runs out mid-click |
 | `Invalid` | `That didn't work` | Catch-all; also `warn!` the action and reject so we can give it a real message later |
-| `Occupied` (place on a full tile) | none | The tile is visibly full |
+| `Occupied` (placing a seed) | `Seeds need an empty tile or a sapling` | Decor plants (Fern, flowers: `Collision::None`) don't look full, so the tile seems free |
+| `Occupied` (place a block on a full tile) | none | The tile is visibly full |
+| `AlreadySpliced` | `This tree has already been spliced. Harvest it and plant a fresh seed` | Says what to do next, not just no |
 | `OutOfRange` | none | The grey hover tint already says it; fires constantly |
 | `Cooldown` | none | Fires constantly while holding punch |
 

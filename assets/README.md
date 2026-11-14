@@ -178,3 +178,18 @@ with a 1 px lighter highlight on the walkable top edge. Two small brackets hang 
 everything else is transparent, so they never read as solid blocks. Adjacent tiles join into one continuous ledge.
 Made from the existing block pixels (no generation). Spec: docs/knowledge/ux/platforms.md. Item ids:
 `WOOD_PLATFORM` = 68, `STONE_PLATFORM` = 69.
+
+### Respawn (spec: docs/knowledge/ux/respawn.md)
+
+Drawn by `docs/art/make_respawn_fx.py` (no generation; rerun it to rebuild).
+- `ui/respawn_ring.png`: the hold-to-go-home ring above the player's head. 8 frames of 24×24 in one strip (192×24),
+  filling clockwise from 12 o'clock (frame k = (k+1)/8). Warm gold with a dark 1 px outline; the unfilled part is a
+  faint dark groove. Readable on sky and on cave walls. Pick the frame from hold progress (0–1 s).
+- `fx/respawn_puff.png` + `fx/respawn_puff.json`: a dust and sparkle puff where the player vanishes and where they
+  appear at the door. 6 frames of 32×32 (192×32 strip), 15 fps, no loop, pivot at the centre. Neutral white/grey,
+  so it works on any background. Same pixelfx/Aseprite sidecar format as `rock-break-coins.json`.
+- `fx/ready_sparkle.png` + `fx/ready_sparkle.json` (spec: docs/knowledge/ux/farming-feedback.md): a "ready to
+  harvest" glint on the item icon above a grown tree. 4 frames of 16×16 (64×16 strip), 10 fps, no loop, centre
+  pivot. A warm white/gold 4-point star that grows, flashes (short diagonal rays) and fades, with a dark 1 px
+  outline. Kept small so a farm playing it every 4 s per tree doesn't look noisy. Made by the same
+  `docs/art/make_respawn_fx.py`.

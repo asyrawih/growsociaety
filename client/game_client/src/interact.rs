@@ -3,6 +3,7 @@
 //! claim panel for a claim clicked with the wrench (`claim_ui.rs`). Decides nothing itself.
 
 use bevy::picking::hover::Hovered;
+use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use game_shared::items::{FIST, ItemId, WORKBENCH, WRENCH, item, slot_of};
@@ -11,6 +12,7 @@ use game_shared::rules::{Action, Event, PUNCH_COOLDOWN, Reject, in_reach_with};
 use game_shared::world::World;
 use game_shared::{TILE_SIZE, tile_to_world, world_to_tile};
 
+use crate::farming_ui::LONG_PRESS_SECS;
 use crate::hud::{
     ItemDrag, Notice, OpenPanel, Selected, WardrobeSelected, discard_target, pointer_over_ui,
     silent_reject,
@@ -117,29 +119,91 @@ fn hover(
 /// Left mouse held: punch with the fist or with equipment selected (equipment is never placed; the
 /// worn pickaxe sets the punch power), otherwise place the selected item. Sent at the punch
 /// cadence; the rules still decide whether each one counts. The wrench sends nothing (see `inspect`).
+/// A touch does the same, except on a tree or sapling: there only a short tap acts, on release,
+/// so a long-press (the tree card, `farming_ui.rs`) never damages or harvests it.
+#[allow(clippy::too_many_arguments)] // a Bevy system: two pointers, the world and the selection
 fn click(
     time: Res<Time>,
     mouse: Res<ButtonInput<MouseButton>>,
+    touches: Res<Touches>,
+    camera: Single<(&Camera, &GlobalTransform)>,
+    ui: Query<&Hovered>,
     game: Res<Game>,
     selected: Res<Selected>,
     hovered: Res<HoveredTile>,
     mut next_at: Local<f64>,
+    mut touch_started: Local<HashMap<u64, f32>>,
     mut actions: MessageWriter<ActionMsg>,
 ) {
     let now = time.elapsed_secs_f64();
-    let (true, Some((x, y)), Some(item)) = (
-        mouse.pressed(MouseButton::Left) && now >= *next_at,
-        hovered.0,
-        selected.item(&game).filter(|&item| item != WRENCH),
-    ) else {
+    let Some(item) = selected.item(&game).filter(|&item| item != WRENCH) else {
+        return;
+    };
+    let act = |x, y| {
+        ActionMsg(if item == FIST || slot_of(item).is_some() {
+            Action::Punch { x, y }
+        } else {
+            Action::Place { x, y, item }
+        })
+    };
+    let cadence_ready = now >= *next_at;
+
+    let touching = touches.iter().next().is_some() || touches.any_just_released();
+    if touching {
+        let (camera, camera_transform) = *camera;
+        let over_ui = pointer_over_ui(&ui);
+        let tile_at = |screen: Vec2| {
+            let point = camera.viewport_to_world_2d(camera_transform, screen).ok()?;
+            world_to_tile(point.x, point.y)
+        };
+        let secs = time.elapsed_secs();
+        for touch in touches.iter_just_pressed() {
+            touch_started.insert(touch.id(), secs);
+        }
+        let mut fired = false;
+        let pressed = touches.iter().map(|touch| (touch, false));
+        let released = touches.iter_just_released().map(|touch| (touch, true));
+        for (touch, released) in pressed.chain(released) {
+            let Some((x, y)) = tile_at(touch.position()).filter(|_| !over_ui) else {
+                continue;
+            };
+            let held = touch_started
+                .get(&touch.id())
+                .map_or(0.0, |&from| secs - from);
+            let on_tree = game.0.world.tree(x, y).is_some();
+            if !fired && touch_fires(on_tree, held, released, cadence_ready) {
+                actions.write(act(x, y));
+                fired = true;
+            }
+        }
+        for touch in touches
+            .iter_just_released()
+            .chain(touches.iter_just_canceled())
+        {
+            touch_started.remove(&touch.id());
+        }
+        if fired {
+            *next_at = now + PUNCH_COOLDOWN;
+        }
+        return;
+    }
+
+    let (true, Some((x, y))) = (mouse.pressed(MouseButton::Left) && cadence_ready, hovered.0)
+    else {
         return;
     };
     *next_at = now + PUNCH_COOLDOWN;
-    actions.write(ActionMsg(if item == FIST || slot_of(item).is_some() {
-        Action::Punch { x, y }
+    actions.write(act(x, y));
+}
+
+/// Whether a touch acts this frame. On a tree or sapling: only when a short tap (under
+/// `LONG_PRESS_SECS`) is released. Elsewhere: while pressed, at the punch cadence, like the mouse.
+fn touch_fires(on_tree: bool, held: f32, released: bool, cadence_ready: bool) -> bool {
+    if on_tree {
+        released && held < LONG_PRESS_SECS
     } else {
-        Action::Place { x, y, item }
-    }));
+        !released && cadence_ready
+    }
 }
 
 /// Wrench + click: open the claim panel for the clicked claim block (anyone's; a stranger gets
@@ -282,5 +346,25 @@ fn blink(time: Res<Time>, mut locks: Query<(&Temporary, &mut Visibility), With<B
             Visibility::Hidden
         };
         visibility.set_if_neq(next);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tree_is_punched_on_a_short_taps_release_only() {
+        // Tree or sapling: nothing while held, a short tap acts on release, a long-press never.
+        assert!(!touch_fires(true, 0.1, false, true));
+        assert!(touch_fires(true, 0.1, true, true));
+        assert!(touch_fires(true, LONG_PRESS_SECS - 0.01, true, false));
+        assert!(!touch_fires(true, LONG_PRESS_SECS, true, true));
+        assert!(!touch_fires(true, 2.0, false, true));
+        // Any other tile: on press and while held at the cadence; the release does nothing.
+        assert!(touch_fires(false, 0.0, false, true));
+        assert!(touch_fires(false, 2.0, false, true));
+        assert!(!touch_fires(false, 0.5, false, false));
+        assert!(!touch_fires(false, 0.1, true, true));
     }
 }

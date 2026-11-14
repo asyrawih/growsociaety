@@ -62,6 +62,21 @@ pub struct Player {
     pub level: u16,
     /// Progress within the current level, `0..xp_to_next(level)`. Private.
     pub xp: u32,
+    /// `now` of the last respawn (home or hazard), for `RESPAWN_COOLDOWN`. Not saved.
+    pub last_respawn: f64,
+}
+
+/// Seconds after any respawn before `Action::Respawn` is accepted again (docs/knowledge/ux/respawn.md).
+pub const RESPAWN_COOLDOWN: f64 = 10.0;
+
+/// Why a player went back to the main door.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum RespawnCause {
+    /// They asked to (`Action::Respawn`).
+    Home,
+    /// They touched a hazard (lava).
+    Hazard,
 }
 
 impl Player {
@@ -134,6 +149,7 @@ impl WorldState {
                 equipped,
                 level: 1,
                 xp: 0,
+                last_respawn: f64::NEG_INFINITY,
             }
         });
     }
@@ -177,6 +193,8 @@ pub enum Action {
     Craft {
         recipe: u16,
     },
+    /// Go back to the main door (once per `RESPAWN_COOLDOWN`). Everything is kept.
+    Respawn,
     /// Wear or hold an item from the inventory in its slot, replacing what was there (it stays in
     /// the inventory).
     Equip {
@@ -265,6 +283,13 @@ pub enum Event {
     Crafted {
         player: PlayerId,
         recipe: u16,
+    },
+    /// The player is back at the main door. Public, so others see them vanish and reappear.
+    Respawned {
+        player: PlayerId,
+        cause: RespawnCause,
+        /// Where the body was just before (world px), for the puff at the old spot.
+        from: (f32, f32),
     },
     /// The player's inventory slot `from` moved to `to` (`Inventory::move_slot`). Private.
     InventoryMoved {
@@ -404,6 +429,21 @@ pub fn apply(
         Action::Buy { item } => buy(state, player, item),
         Action::BuyBackpackUpgrade => buy_backpack_upgrade(state, player),
         Action::Craft { recipe } => craft(state, player, recipe),
+        Action::Respawn => {
+            let door = spawn_body(&state.world);
+            let me = state.players.get_mut(&player).ok_or(Reject::Invalid)?;
+            if now - me.last_respawn < RESPAWN_COOLDOWN {
+                return Err(Reject::Cooldown);
+            }
+            let from = me.body.pos;
+            me.body = door;
+            me.last_respawn = now;
+            Ok(vec![Event::Respawned {
+                player,
+                cause: RespawnCause::Home,
+                from,
+            }])
+        }
         Action::MoveItem { from, to } => {
             let inventory = &mut state
                 .players
@@ -5152,5 +5192,204 @@ mod claim_rule_tests {
             "inside your own claim"
         );
         assert_eq!(state, before);
+    }
+}
+
+#[cfg(test)]
+mod respawn_tests {
+    use super::*;
+    use crate::items::DIRT;
+    use crate::physics::{HAZARD_IMMUNE_TICKS, Input};
+    use crate::worldgen::generate;
+
+    const ME: PlayerId = PlayerId(1);
+
+    #[test]
+    fn going_home_keeps_everything_and_has_a_cooldown() {
+        let mut state = WorldState::new(generate("HOME"), 1);
+        state.join(ME);
+        let player = state.players.get_mut(&ME).expect("joined");
+        player.inventory.add(DIRT, 7);
+        player.gems = 42;
+        player.body.pos.0 += 200.0;
+        player.body.vel = (30.0, -50.0);
+        let inventory = player.inventory.clone();
+
+        let from = state.players[&ME].body.pos;
+        let events = apply(&mut state, ME, Action::Respawn, 100.0).expect("home");
+        assert_eq!(
+            events,
+            vec![Event::Respawned {
+                player: ME,
+                cause: RespawnCause::Home,
+                from,
+            }]
+        );
+        let player = &state.players[&ME];
+        assert_eq!(
+            player.body,
+            spawn_body(&state.world),
+            "at the door, standing still"
+        );
+        assert_eq!(
+            (player.inventory.clone(), player.gems),
+            (inventory, 42),
+            "everything kept"
+        );
+
+        let before = state.clone();
+        assert_eq!(
+            apply(&mut state, ME, Action::Respawn, 109.9),
+            Err(Reject::Cooldown)
+        );
+        assert_eq!(state, before, "refused: nothing changed");
+        assert!(
+            apply(&mut state, ME, Action::Respawn, 110.0).is_ok(),
+            "after 10 s it works again"
+        );
+    }
+
+    #[test]
+    fn lava_sends_you_home_in_the_same_tick_but_not_while_immune() {
+        let mut world = generate("LAVA");
+        let (dx, dy) = world.door;
+        let mut body = spawn_body(&world);
+        // Lava right where the player will be.
+        world.set(
+            dx + 2,
+            dy,
+            Tile {
+                fg: crate::items::LAVA,
+                bg: crate::items::EMPTY,
+            },
+        );
+        body.pos.0 += 2.0 * crate::TILE_SIZE;
+        // Still immune from spawning: no respawn for the first ticks.
+        assert_eq!(body.hazard_immune, HAZARD_IMMUNE_TICKS);
+        let mut immune_steps = 0;
+        let mut twin = body;
+        while body.hazard_immune > 0 {
+            assert!(crate::physics::step(&mut body, Input::default(), &world).is_none());
+            immune_steps += 1;
+        }
+        assert_eq!(immune_steps, usize::from(HAZARD_IMMUNE_TICKS));
+        // The next tick touches lava: back at the door, and the twin (the client) agrees bit for bit.
+        for _ in 0..immune_steps {
+            crate::physics::step(&mut twin, Input::default(), &world);
+        }
+        let burned = crate::physics::step(&mut body, Input::default(), &world);
+        assert!(burned.is_some(), "burned");
+        assert_eq!(
+            crate::physics::step(&mut twin, Input::default(), &world),
+            burned
+        );
+        assert_eq!(body, twin);
+        assert_eq!(body, spawn_body(&world), "at the door with fresh immunity");
+    }
+}
+
+#[cfg(test)]
+mod fern_splice_tests {
+    use super::*;
+    use crate::items::{DIRT, FERN, LOG_END, SAND, seed_of};
+    use crate::worldgen::generate;
+
+    const ME: PlayerId = PlayerId(1);
+
+    /// A sapling of `item` beside the door, on the surface dirt.
+    fn with_sapling(item: ItemId, spliced: bool) -> (WorldState, (u32, u32)) {
+        let mut state = WorldState::new(generate("FERN"), 1);
+        state.join(ME);
+        let (dx, dy) = state.world.door;
+        let at = (dx + 1, dy);
+        let seed = seed_of(item).expect("has a seed");
+        state.world.set(
+            at.0,
+            at.1,
+            Tile {
+                fg: seed,
+                bg: EMPTY,
+            },
+        );
+        let tree = Tree {
+            item,
+            planted_at: 0.0,
+            fruit: 3,
+            spliced,
+        };
+        let key = World::tile_key(at.0, at.1).expect("in world");
+        state.world.extras.insert(key, TileExtra::Tree(tree));
+        let player = state.players.get_mut(&ME).expect("joined");
+        player.inventory.add(seed_of(DIRT).expect("dirt seed"), 5);
+        player.inventory.add(seed_of(SAND).expect("sand seed"), 5);
+        (state, at)
+    }
+
+    fn plant_dirt(state: &mut WorldState, at: (u32, u32)) -> Result<Vec<Event>, Reject> {
+        let item = seed_of(DIRT).expect("dirt seed");
+        apply(
+            state,
+            ME,
+            Action::Place {
+                x: at.0,
+                y: at.1,
+                item,
+            },
+            1.0,
+        )
+    }
+
+    #[test]
+    fn dirt_on_an_unspliced_fern_sapling_makes_log_end() {
+        let (mut state, at) = with_sapling(FERN, false);
+        let events = plant_dirt(&mut state, at).expect("spliced");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::TreeSpliced { tree, .. } if tree.item == LOG_END)),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn dirt_on_a_fern_that_came_from_a_splice_is_already_spliced() {
+        // Dirt + sand splices into a fern sapling; a second splice on it is refused, nothing changes.
+        let (mut state, at) = with_sapling(DIRT, false);
+        let sand = seed_of(SAND).expect("sand seed");
+        apply(
+            &mut state,
+            ME,
+            Action::Place {
+                x: at.0,
+                y: at.1,
+                item: sand,
+            },
+            1.0,
+        )
+        .expect("fern");
+        assert_eq!(
+            state.world.tree(at.0, at.1).map(|t| (t.item, t.spliced)),
+            Some((FERN, true))
+        );
+        let before = state.clone();
+        assert_eq!(plant_dirt(&mut state, at), Err(Reject::AlreadySpliced));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn a_fern_block_is_not_a_sapling() {
+        // A fern *block* (placed decoration, Collision::None) is just an occupied tile.
+        let (mut state, at) = with_sapling(FERN, false);
+        let key = World::tile_key(at.0, at.1).expect("in world");
+        state.world.extras.remove(&key);
+        state.world.set(
+            at.0,
+            at.1,
+            Tile {
+                fg: FERN,
+                bg: EMPTY,
+            },
+        );
+        assert_eq!(plant_dirt(&mut state, at), Err(Reject::Occupied));
     }
 }

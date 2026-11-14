@@ -11,7 +11,7 @@ use game_shared::world::World;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change; a mismatch is refused at `Hello`.
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 pub const DEFAULT_PORT: u16 = 7777;
 /// The name the dev certificate is issued for and the client connects to.
 pub const SERVER_NAME: &str = "localhost";

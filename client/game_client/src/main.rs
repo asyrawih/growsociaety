@@ -5,6 +5,7 @@ mod camera;
 mod chat;
 mod claim_ui;
 mod craft_ui;
+mod farming_ui;
 mod foliage;
 mod hints;
 mod hud;
@@ -14,6 +15,7 @@ mod levels_ui;
 mod lobby;
 mod net;
 mod player;
+mod respawn_ui;
 mod screenshot;
 mod settings;
 mod state;
@@ -91,6 +93,8 @@ fn main() {
         craft_ui::CraftUiPlugin,
         claim_ui::ClaimUiPlugin,
         hints::HintsPlugin,
+        respawn_ui::RespawnUiPlugin,
+        farming_ui::FarmingUiPlugin,
     ));
     app.add_plugins((audio::AudioPlugin, icon::IconPlugin));
     // After `NetPlugin` (voice is online only) and `HudPlugin` (its panel uses the HUD's).

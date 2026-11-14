@@ -254,3 +254,29 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod respawn_tests {
+    use super::*;
+    use crate::items::LAVA;
+
+    /// The respawn point must never burn (docs/knowledge/ux/respawn.md): no lava within two tiles
+    /// of the main door, in any generated world.
+    #[test]
+    fn lava_never_touches_the_door_or_its_spawn_tiles() {
+        for n in 0..200 {
+            let world = generate(&format!("W{n}"));
+            let (dx, dy) = world.door;
+            for y in dy.saturating_sub(2)..=dy + 2 {
+                for x in dx.saturating_sub(2)..=dx + 2 {
+                    let tile = world.get(x, y).map(|t| t.fg);
+                    assert_ne!(
+                        tile,
+                        Some(LAVA),
+                        "W{n}: lava at ({x}, {y}) near the door ({dx}, {dy})"
+                    );
+                }
+            }
+        }
+    }
+}

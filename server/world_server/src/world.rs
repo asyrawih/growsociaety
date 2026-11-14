@@ -372,8 +372,18 @@ impl Room {
                 };
                 // The server's own step is the position; the client only ever predicts it.
                 let mods = game_shared::mods::worn_mods(&player.equipped);
-                step_with(&mut player.body, input, &state.world, mods);
-                let events = collect_drops(state, id);
+                let burned = step_with(&mut player.body, input, &state.world, mods);
+                let mut events = Vec::new();
+                if let Some(from) = burned {
+                    // A hazard respawn ignores the cooldown but starts one (docs/knowledge/ux/respawn.md).
+                    player.last_respawn = now;
+                    events.push(Event::Respawned {
+                        player: id,
+                        cause: game_shared::rules::RespawnCause::Hazard,
+                        from,
+                    });
+                }
+                events.extend(collect_drops(state, id));
                 self.broadcast(&events, None);
             }
             ToWorld::Act { id, seq, action } => {

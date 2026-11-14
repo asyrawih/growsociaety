@@ -75,6 +75,8 @@ pub fn apply_event(state: &mut WorldState, event: &Event, now: f64) {
         }
         // Feedback only; its inventory changes came as their own events.
         Event::Crafted { .. } => {}
+        // The new position arrives with the bodies; the client predicts its own.
+        Event::Respawned { .. } => {}
         &Event::InventoryMoved { player, from, to } => {
             if let Some(player) = state.players.get_mut(&player) {
                 player.inventory.move_slot(from, to);

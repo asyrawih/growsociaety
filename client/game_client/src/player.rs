@@ -150,7 +150,9 @@ impl Plugin for PlayerPlugin {
             .init_resource::<JumpPressed>()
             .add_systems(Startup, spawn_player)
             .add_systems(FixedUpdate, tick_player)
-            .add_systems(Update, latch_jump.in_set(Phase::Input))
+            .init_resource::<HomeHold>()
+            .init_resource::<HomeCooldown>()
+            .add_systems(Update, (latch_jump, hold_home).in_set(Phase::Input))
             .add_systems(
                 Update,
                 (
@@ -173,6 +175,20 @@ impl Plugin for PlayerPlugin {
 }
 
 const JUMP_KEYS: [KeyCode; 3] = [KeyCode::Space, KeyCode::KeyW, KeyCode::ArrowUp];
+/// Hold to go home (docs/knowledge/ux/respawn.md).
+const HOME_KEY: KeyCode = KeyCode::KeyR;
+/// Seconds `HOME_KEY` must be held.
+const HOME_HOLD: f32 = 1.0;
+
+/// How far the go-home hold is, `0..=1` (0 = not holding). The HUD draws the ring from it.
+#[derive(Resource, Default)]
+pub struct HomeHold(pub f32);
+
+/// Seconds until going home is allowed again, 0 when ready: the one client-side cooldown clock
+/// (from our own last `Respawned`). The HUD's "Go home (7s)" label reads it.
+#[derive(Resource, Default)]
+pub struct HomeCooldown(pub f32);
+
 /// Drop through one-way platforms (docs/knowledge/ux/platforms.md).
 const DOWN_KEYS: [KeyCode; 2] = [KeyCode::KeyS, KeyCode::ArrowDown];
 const LEFT_KEYS: [KeyCode; 2] = [KeyCode::KeyA, KeyCode::ArrowLeft];
@@ -277,6 +293,58 @@ fn sync_remotes(
     }
 }
 
+/// Holding `HOME_KEY` for `HOME_HOLD` seconds asks to respawn; releasing early cancels. The
+/// cooldown is the server's (or `apply`'s offline) to enforce.
+#[allow(clippy::too_many_arguments)] // a Bevy system: one parameter per resource/stream
+fn hold_home(
+    time: Res<Time>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut hold: ResMut<HomeHold>,
+    mut sent: Local<bool>,
+    mut actions: MessageWriter<crate::state::ActionMsg>,
+    text_focus: Option<Res<crate::hud::TextFocus>>,
+    game: Res<Game>,
+    mut events: MessageReader<GameEvent>,
+    mut last_home: Local<Option<f32>>,
+    mut cooldown: ResMut<HomeCooldown>,
+) {
+    // The cooldown is counted here too, from our own last respawn, so a hold during it never
+    // sends an action the server would refuse.
+    let now = time.elapsed_secs();
+    for GameEvent(event) in events.read() {
+        if matches!(event, game_shared::rules::Event::Respawned { player, .. } if *player == game.1)
+        {
+            *last_home = Some(now);
+        }
+    }
+    let left = last_home.map_or(0.0, |at| {
+        (game_shared::rules::RESPAWN_COOLDOWN as f32 - (now - at)).max(0.0)
+    });
+    if cooldown.0 != left {
+        cooldown.0 = left;
+    }
+    let cooling = left > 0.0;
+    // Typing an R into a HUD field is not "go home". (An open chat line clears the keyboard, so
+    // R never reads as pressed then.)
+    let typing = text_focus.is_some_and(|focus| focus.0);
+    if typing || cooling || !keys.pressed(HOME_KEY) {
+        *sent = false;
+        if hold.0 != 0.0 {
+            hold.0 = 0.0;
+        }
+        return;
+    }
+    if *sent {
+        return;
+    }
+    hold.0 = (hold.0 + time.delta_secs() / HOME_HOLD).min(1.0);
+    if hold.0 >= 1.0 {
+        actions.write(crate::state::ActionMsg(game_shared::rules::Action::Respawn));
+        *sent = true;
+        hold.0 = 0.0;
+    }
+}
+
 fn latch_jump(keys: Res<ButtonInput<KeyCode>>, mut jump: ResMut<JumpPressed>) {
     jump.0 |= keys.any_just_pressed(JUMP_KEYS);
 }
@@ -284,6 +352,7 @@ fn latch_jump(keys: Res<ButtonInput<KeyCode>>, mut jump: ResMut<JumpPressed>) {
 /// One simulation tick: step the body, then pick up whatever it now touches. Online the step is a
 /// prediction: the input also goes to the server, which steps it for real and decides pickups.
 fn tick_player(
+    time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     mut game: ResMut<Game>,
     net: Option<ResMut<Net>>,
@@ -308,10 +377,23 @@ fn tick_player(
     player.previous = me.body;
     // The same worn mods the server steps with, so the prediction matches.
     let mods = game_shared::mods::worn_mods(&me.equipped);
-    step_with(&mut me.body, input, &state.world, mods);
+    let burned = step_with(&mut me.body, input, &state.world, mods);
+    if burned.is_some() {
+        // Back at the door: no streak across the screen.
+        player.previous = me.body;
+    }
     if let Some(mut net) = net {
+        // Online the server decides and announces the respawn; this is only the prediction.
         net.input(input);
         return;
+    }
+    if let Some(from) = burned {
+        me.last_respawn = time.elapsed_secs_f64();
+        events.write(GameEvent(game_shared::rules::Event::Respawned {
+            player: id,
+            cause: game_shared::rules::RespawnCause::Hazard,
+            from,
+        }));
     }
     for event in collect_drops(state, id) {
         events.write(GameEvent(event));

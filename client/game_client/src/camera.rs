@@ -147,6 +147,8 @@ fn follow_player(
     player: Single<&Player>,
     camera: Single<(&mut FollowCamera, &mut Transform, &mut Projection)>,
     mut view_zoom: ResMut<ViewZoom>,
+    game: Res<crate::state::Game>,
+    mut events: MessageReader<crate::state::GameEvent>,
 ) {
     let (mut follow, mut transform, mut projection) = camera.into_inner();
     // `Window::size` is logical px (Retina-independent), the same unit the projection uses. The
@@ -163,6 +165,13 @@ fn follow_player(
         ortho.scale = 1.0 / zoom;
     }
     let target = player.position;
+    // After our own respawn the camera cuts to the door instead of panning across the world.
+    let respawned = events.read().any(|crate::state::GameEvent(event)| {
+        matches!(event, game_shared::rules::Event::Respawned { player, .. } if *player == game.1)
+    });
+    if respawned {
+        follow.pos = target;
+    }
     let pos =
         follow.pos + (target - follow.pos) * (1.0 - (-CAMERA_STIFFNESS * time.delta_secs()).exp());
     // Clamp every frame, not only on movement, so a window resize or zoom change is handled too.

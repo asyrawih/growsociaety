@@ -18,6 +18,7 @@ use crate::hud::{
 };
 use crate::player::Player;
 use crate::player::{Look, rig::SKIN_RAMPS};
+use crate::respawn_ui::{GoHomeButton, GoHomeIcon, GoHomeLabel};
 use crate::screenshot;
 use crate::state::Phase;
 
@@ -393,6 +394,7 @@ const TAB_PADDING: f32 = 6.0;
 const TITLE_SIZE: f32 = 32.0;
 const TAB_ICON: f32 = 32.0;
 const DIVIDER_IMAGE: &str = "ui/settings/divider.png";
+const HOME_ICON: &str = "ui/settings/icon_home.png";
 const DIVIDER_HEIGHT: f32 = 17.0 * KIT_SCALE;
 const DIVIDER_INSET: f32 = 8.0;
 const TRACK_IMAGE: &str = "ui/settings/slider_track.png";
@@ -566,6 +568,31 @@ pub fn spawn_settings(mut commands: Commands, assets: Res<AssetServer>, tab: Res
                     ..default()
                 },
             ));
+            // Go home: one click, no hold (docs/knowledge/ux/respawn.md); `respawn_ui.rs` handles
+            // the click and the cooldown label.
+            let home = Node {
+                column_gap: px(SLOT_GAP * 2.0),
+                ..row()
+            };
+            panel
+                .spawn((home, GoHomeButton, Hovered::default()))
+                .with_children(|r| {
+                    r.spawn((
+                        Node {
+                            width: px(TAB_ICON),
+                            height: px(TAB_ICON),
+                            ..default()
+                        },
+                        ImageNode::new(assets.load(HOME_ICON)),
+                        GoHomeIcon,
+                    ));
+                    r.spawn((ink("Go home"), GoHomeLabel));
+                    // Pushes the row's content to the left (the row is space-between).
+                    r.spawn(Node {
+                        flex_grow: 1.0,
+                        ..default()
+                    });
+                });
             let tabs = Node {
                 column_gap: px(SLOT_GAP),
                 justify_content: JustifyContent::Center,
