@@ -8,6 +8,7 @@ mod commands;
 mod conn;
 mod http;
 mod leases;
+mod reset;
 mod store;
 mod token;
 mod voice;
@@ -439,5 +440,127 @@ mod tests {
             |m| matches!(m, ServerMsg::PlayerLeft { id } if *id == a_id),
         )
         .await;
+    }
+
+    /// Sends a world-menu request and waits for its answer.
+    async fn ask(client: &mut Client, msg: ClientMsg) -> ServerMsg {
+        write_msg(&mut client.send, &msg).await.expect("send");
+        expect_msg(client, |m| {
+            matches!(m, ServerMsg::WorldStatus { .. } | ServerMsg::Worlds { .. })
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn the_world_menu_sees_status_and_the_busiest_worlds() {
+        let identity = new_identity().expect("identity");
+        let cert = identity.0.clone();
+        let endpoint = listen("127.0.0.1:0".parse().unwrap(), identity).expect("listen");
+        let addr = endpoint.local_addr().expect("bound");
+        tokio::spawn(serve(
+            endpoint,
+            accounts::Accounts::open(None).await.expect("memory"),
+            token::Signer::new(b"test"),
+            None,
+        ));
+        let mut a = join(addr, &cert, PROTOCOL_VERSION)
+            .await
+            .expect("a joins NET");
+        use game_protocol::WorldStatus;
+        let status = |name: &str, status| ServerMsg::WorldStatus {
+            name: name.into(),
+            status,
+        };
+        let world = |name: &str| ClientMsg::WorldStatus { name: name.into() };
+        assert_eq!(
+            ask(&mut a, world("net")).await,
+            status("NET", WorldStatus::Open { players: 1 })
+        );
+        assert_eq!(
+            ask(&mut a, world("admin")).await,
+            status("ADMIN", WorldStatus::NotAllowed)
+        );
+        assert_eq!(
+            ask(&mut a, world("brandnew")).await,
+            status("BRANDNEW", WorldStatus::New)
+        );
+        assert_eq!(
+            ask(&mut a, ClientMsg::ListWorlds).await,
+            ServerMsg::Worlds {
+                active: vec![("NET".into(), 1)]
+            }
+        );
+        // A refused name on Join is answered, not kicked: the connection stays and asks on.
+        write_msg(&mut a.send, &ClientMsg::Leave)
+            .await
+            .expect("leave");
+        let join_denied = ClientMsg::Join {
+            world: "admin".into(),
+        };
+        assert_eq!(
+            ask(&mut a, join_denied).await,
+            status("ADMIN", WorldStatus::NotAllowed)
+        );
+        // Lookups refill at 2/s after a burst of 5; this is the sixth.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        // Still connected. NET is empty and was never built in, so it is not stored: New again.
+        assert_eq!(
+            ask(&mut a, world("net")).await,
+            status("NET", WorldStatus::New)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_logged_in_player_gets_a_fresh_token_on_demand() {
+        let identity = new_identity().expect("identity");
+        let cert = identity.0.clone();
+        let endpoint = listen("127.0.0.1:0".parse().unwrap(), identity).expect("listen");
+        let addr = endpoint.local_addr().expect("bound");
+        tokio::spawn(serve(
+            endpoint,
+            accounts::Accounts::open(None).await.expect("memory"),
+            token::Signer::new(b"test"),
+            None,
+        ));
+        let mut roots = RootCertStore::empty();
+        roots.add(cert).expect("cert");
+        let config = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).expect("config");
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("client");
+        client.set_default_client_config(config);
+        let conn = client
+            .connect(addr, SERVER_NAME)
+            .expect("connect")
+            .await
+            .expect("connected");
+        let (mut send, mut recv) = conn.open_bi().await.expect("stream");
+        let hello = ClientMsg::Hello {
+            protocol: PROTOCOL_VERSION,
+            auth: game_protocol::Auth::Register {
+                name: "Fresh".into(),
+                password: "password1".into(),
+            },
+            country: None,
+        };
+        write_msg(&mut send, &hello).await.expect("hello");
+        let Ok(ServerMsg::Welcome { player, .. }) = read_msg(&mut recv, MAX_SERVER_MSG).await
+        else {
+            panic!("welcome");
+        };
+        write_msg(&mut send, &ClientMsg::RefreshToken)
+            .await
+            .expect("ask");
+        let token = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(ServerMsg::Token { token }) = read_msg(&mut recv, MAX_SERVER_MSG).await {
+                    return token;
+                }
+            }
+        })
+        .await
+        .expect("token in time");
+        let account = token::Signer::new(b"test")
+            .verify(&token)
+            .expect("a valid token");
+        assert_eq!((account.id, account.name.as_str()), (player, "Fresh"));
     }
 }

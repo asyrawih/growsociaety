@@ -13,6 +13,7 @@ Extend `toast_for_reject` (claims cases are in [claims.md](claims.md) §4 and wi
 | `NoItem` | `You don't have that item` | Happens after a stack runs out mid-click |
 | `Invalid` | `That didn't work` | Catch-all; also `warn!` the action and reject so we can give it a real message later |
 | `Occupied` (placing a seed) | `Seeds need an empty tile or a sapling` | Decor plants (Fern, flowers: `Collision::None`) don't look full, so the tile seems free |
+| `Occupied` (non-seed item on a tree/sapling) | `To splice, use a seed (e.g. <Item> seed) on the sapling`; without a seed form: `To splice, use a seed on the sapling` | Players try splicing with the block, not its seed |
 | `Occupied` (place a block on a full tile) | none | The tile is visibly full |
 | `AlreadySpliced` | `This tree has already been spliced. Harvest it and plant a fresh seed` | Says what to do next, not just no |
 | `OutOfRange` | none | The grey hover tint already says it; fires constantly |

@@ -95,6 +95,8 @@ impl Plugin for ChatPlugin {
         app.init_resource::<Chat>()
             .add_message::<OpenChat>()
             .add_message::<ChatReceived>()
+            .add_message::<WarpTo>()
+            .add_message::<OpenWorldMenu>()
             .add_systems(Startup, spawn_chat)
             .add_systems(PreUpdate, type_chat.after(InputSystems))
             .add_systems(
@@ -148,6 +150,64 @@ fn spawn_chat(mut commands: Commands) {
                 BackgroundColor(BACKGROUND),
             ));
         });
+}
+
+/// `/warp <name>`: go to that world (upper-case, already allowed by the deny-list). Read by the
+/// world menu (`world_select.rs`), which switches the same way as its Go button.
+#[derive(Message, Clone, Debug, PartialEq)]
+pub struct WarpTo(pub String);
+
+/// A bare `/warp`: open the World menu (`world_select.rs`).
+#[derive(Message, Clone, Copy, Debug, PartialEq)]
+pub struct OpenWorldMenu;
+
+/// docs/knowledge/ux/world-select.md.
+const NAME_NOT_ALLOWED: &str = "That name isn't allowed";
+
+/// Commands the client runs itself, listed in the launcher and `/help` next to the server's.
+const CLIENT_COMMANDS: &[Spec] = &[Spec {
+    name: "warp",
+    usage: "/warp [world]",
+    summary: "Go to a world, or open the World menu",
+    needs: Requirement::Anyone,
+}];
+
+/// `/help` additions for `CLIENT_COMMANDS`: a bare `/help` still goes to the server (the line is
+/// shown as well); `/help warp` is answered here only. `(line, also send)`.
+fn client_help(text: &str) -> Option<(String, bool)> {
+    let mut words = text.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("/help") {
+        return None;
+    }
+    match words.next() {
+        None => {
+            let names: Vec<String> = CLIENT_COMMANDS
+                .iter()
+                .map(|c| format!("/{}", c.name))
+                .collect();
+            Some((format!("Also: {}", names.join(" ")), true))
+        }
+        Some(topic) => CLIENT_COMMANDS
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(topic.trim_start_matches('/')))
+            .map(|c| (format!("{} - {}", c.usage, c.summary), false)),
+    }
+}
+
+/// `/warp` handled here, never sent: `None` if the line is not a warp, else the world to go to
+/// (`None` = open the menu) or the refusal to show.
+fn warp(text: &str) -> Option<Result<Option<String>, &'static str>> {
+    let mut words = text.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("/warp") {
+        return None;
+    }
+    Some(match (words.next(), words.next()) {
+        (None, _) => Ok(None),
+        (Some(name), None) if game_protocol::world_name_allowed(name) => {
+            Ok(Some(name.to_ascii_uppercase()))
+        }
+        _ => Err(NAME_NOT_ALLOWED),
+    })
 }
 
 /// What pressing Enter on `draft` does. `None`: nothing to send.
@@ -297,6 +357,7 @@ fn hints(draft: &str, role: Role) -> Vec<&'static Spec> {
     let complete = body.len() > typed.len();
     COMMANDS
         .iter()
+        .chain(CLIENT_COMMANDS)
         .filter(|spec| visible(spec, role))
         .filter(|spec| {
             if complete {
@@ -348,6 +409,8 @@ fn type_chat(
     game: Res<Game>,
     mut admins: MessageWriter<AdminMsg>,
     mut open: MessageReader<OpenChat>,
+    mut warps: MessageWriter<WarpTo>,
+    mut menus: MessageWriter<OpenWorldMenu>,
     text_focus: Option<Res<crate::hud::TextFocus>>,
 ) {
     let was_open = chat.open;
@@ -369,6 +432,32 @@ fn type_chat(
                 let draft = std::mem::take(&mut chat.draft);
                 chat.open = false;
                 let now = time.elapsed_secs();
+                let warped = clean_chat(&draft).and_then(|text| warp(&text));
+                match (warped, net.is_some()) {
+                    (Some(Ok(Some(world))), true) => {
+                        warps.write(WarpTo(world));
+                        continue;
+                    }
+                    (Some(Ok(None)), true) => {
+                        menus.write(OpenWorldMenu);
+                        continue;
+                    }
+                    (Some(Ok(_)), false) => {
+                        chat.push("/warp needs the server".into(), ChatKind::System, now);
+                        continue;
+                    }
+                    (Some(Err(reply)), _) => {
+                        chat.push(reply.into(), ChatKind::System, now);
+                        continue;
+                    }
+                    (None, _) => {}
+                }
+                if let Some((line, also_send)) = clean_chat(&draft).and_then(|t| client_help(&t)) {
+                    chat.push(line, ChatKind::System, now);
+                    if !also_send {
+                        continue;
+                    }
+                }
                 match (submit(&draft), net.as_deref_mut()) {
                     (Some(Submit::Say(text) | Submit::Command(text)), Some(net)) => net.chat(text),
                     (Some(Submit::Say(text)), None) => {
@@ -589,9 +678,9 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(names("hello"), Vec::<&str>::new());
-        assert_eq!(names("/w"), ["who", "wban", "wunban"]);
+        assert_eq!(names("/w"), ["who", "wban", "wunban", "warp"]);
         assert_eq!(names("/give Budi"), ["give"]);
-        assert_eq!(names("/").len(), COMMANDS.len());
+        assert_eq!(names("/").len(), COMMANDS.len() + CLIENT_COMMANDS.len());
         // A player is never shown staff commands.
         let player = |draft| {
             hints(draft, Role::Player)
@@ -632,6 +721,25 @@ mod tests {
         assert!(matches!(offline_command("/kick Budi", me), Err(e) if e.contains("server")));
         assert!(offline_command("/help", me).is_err_and(|e| e.starts_with("Commands:")));
         assert!(offline_command("/dance", me).is_err_and(|e| e.contains("Unknown")));
+    }
+
+    #[test]
+    fn warp_is_handled_here_and_checks_the_name() {
+        assert_eq!(warp("/warp myfarm"), Some(Ok(Some("MYFARM".into()))));
+        assert_eq!(warp("/WARP"), Some(Ok(None)), "bare: the menu");
+        assert_eq!(warp("/warp admin"), Some(Err(NAME_NOT_ALLOWED)));
+        assert_eq!(warp("/warp two words"), Some(Err(NAME_NOT_ALLOWED)));
+        assert_eq!(warp("/warpzone"), None, "another command");
+        assert_eq!(warp("hello"), None);
+        assert_eq!(client_help("/help"), Some(("Also: /warp".into(), true)));
+        assert_eq!(
+            client_help("/help warp"),
+            Some((
+                "/warp [world] - Go to a world, or open the World menu".into(),
+                false
+            ))
+        );
+        assert_eq!(client_help("/help give"), None, "the server's");
     }
 
     #[test]

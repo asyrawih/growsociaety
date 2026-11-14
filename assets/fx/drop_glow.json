@@ -1,0 +1,61 @@
+{
+ "frames": [
+  {
+   "filename": "drop_glow 0",
+   "frame": {
+    "x": 0,
+    "y": 0,
+    "w": 16,
+    "h": 16
+   },
+   "rotated": false,
+   "trimmed": false,
+   "spriteSourceSize": {
+    "x": 0,
+    "y": 0,
+    "w": 16,
+    "h": 16
+   },
+   "sourceSize": {
+    "w": 16,
+    "h": 16
+   },
+   "duration": 83
+  }
+ ],
+ "meta": {
+  "app": "growsociaety docs/art/make_respawn_fx.py",
+  "version": "1",
+  "image": "drop_glow.png",
+  "format": "RGBA8888",
+  "size": {
+   "w": 16,
+   "h": 16
+  },
+  "scale": "1",
+  "frameTags": [
+   {
+    "name": "drop_glow",
+    "from": 0,
+    "to": 0,
+    "direction": "forward"
+   }
+  ],
+  "pixelfx": {
+   "id": "spawn/drop_glow",
+   "name": "Drop glow",
+   "fps": 12,
+   "loop": false,
+   "frames": 1,
+   "frameSize": [
+    16,
+    16
+   ],
+   "pivot": [
+    8,
+    8
+   ],
+   "columns": 1
+  }
+ }
+}

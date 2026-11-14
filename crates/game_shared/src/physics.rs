@@ -18,6 +18,10 @@ pub const JUMP_VELOCITY: f32 = 17.5 * TILE_SIZE;
 /// Releasing jump while rising multiplies the upward velocity by this, once per jump.
 pub const JUMP_CUT: f32 = 0.5;
 pub const MAX_FALL_SPEED: f32 = 24.0 * TILE_SIZE;
+/// Ladders (docs/knowledge/ux/ladders.md).
+pub const CLIMB_UP_SPEED: f32 = 4.0 * TILE_SIZE;
+pub const CLIMB_DOWN_SPEED: f32 = 6.0 * TILE_SIZE;
+pub const CLIMB_SIDE_SPEED: f32 = WALK_SPEED / 2.0;
 /// Seconds.
 pub const COYOTE_TIME: f32 = 0.1;
 /// Seconds.
@@ -40,6 +44,8 @@ const _: () = assert!(JUMP_VELOCITY / TICK_RATE < TILE_SIZE);
 const _: () = assert!(WALK_SPEED / TICK_RATE < TILE_SIZE);
 const _: () = assert!(WALK_SPEED * (1.0 + MAX_RUN_PCT / 100.0) / TICK_RATE < TILE_SIZE);
 const _: () = assert!(EXTRA_JUMP_VELOCITY / TICK_RATE < TILE_SIZE);
+const _: () = assert!(CLIMB_DOWN_SPEED / TICK_RATE < TILE_SIZE);
+const _: () = assert!(CLIMB_UP_SPEED / TICK_RATE < TILE_SIZE);
 
 #[derive(Clone, Copy, Default, PartialEq, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -51,6 +57,8 @@ pub struct Input {
     /// Held: fall through every one-way platform; pressed on one, drop through it
     /// (docs/knowledge/ux/platforms.md).
     pub down: bool,
+    /// Held: climb up a ladder (docs/knowledge/ux/ladders.md).
+    pub up: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -69,6 +77,8 @@ pub struct Body {
     /// Ticks left during which hazards are ignored, set by every respawn
     /// (docs/knowledge/ux/respawn.md: a door next to lava cannot loop).
     pub hazard_immune: u8,
+    /// Holding on to a ladder: no gravity, moved by up/down (docs/knowledge/ux/ladders.md).
+    pub climbing: bool,
 }
 
 /// Hazard immunity after a respawn: 0.5 s. Tuning.
@@ -86,6 +96,7 @@ pub fn spawn_body(world: &World) -> Body {
         jump_cut_ready: false,
         extra_jump_used: false,
         hazard_immune: HAZARD_IMMUNE_TICKS,
+        climbing: false,
     }
 }
 
@@ -105,6 +116,35 @@ fn platform(world: &World, tx: i32, ty: i32) -> bool {
         .and_then(|(x, y)| world.get(x, y));
     tile.and_then(|tile| item(tile.fg))
         .is_some_and(|def| def.collision == Collision::Platform)
+}
+
+fn ladder(world: &World, tx: i32, ty: i32) -> bool {
+    let tile = u32::try_from(tx)
+        .ok()
+        .zip(u32::try_from(ty).ok())
+        .and_then(|(x, y)| world.get(x, y));
+    tile.and_then(|tile| item(tile.fg))
+        .is_some_and(|def| def.collision == Collision::Ladder)
+}
+
+/// The topmost tile of a ladder: its top edge holds feet like a one-way platform.
+fn ladder_top(world: &World, tx: i32, ty: i32) -> bool {
+    ladder(world, tx, ty) && !ladder(world, tx, ty + 1)
+}
+
+fn tile_index(px: f32) -> i32 {
+    (px / TILE_SIZE).floor() as i32
+}
+
+/// Whether the hitbox centre is inside a ladder tile: where a body can grab one.
+pub fn on_ladder(world: &World, pos: (f32, f32)) -> bool {
+    ladder(world, tile_index(pos.0), tile_index(pos.1))
+}
+
+/// Whether a ladder tile in the centre's column overlaps the hitbox: where a climber holds on.
+fn holds_ladder(world: &World, pos: (f32, f32)) -> bool {
+    let column = tile_index(pos.0);
+    tile_span(pos.1 - HALF_H, pos.1 + HALF_H).any(|ty| ladder(world, column, ty))
 }
 
 fn solid(world: &World, tx: i32, ty: i32) -> bool {
@@ -164,6 +204,43 @@ pub fn step_with(body: &mut Body, input: Input, world: &World, mods: Mods) -> Op
         body.jump_buffer = JUMP_BUFFER;
     }
 
+    // Ladders. Grab: up with the centre in a ladder, or down with a ladder under the feet (so
+    // down on the top climbs down, and down at the bottom, on the ground, does not grab). Grabbing
+    // stops the body and refills the extra jump, like landing. A jump lets go with a normal jump.
+    if body.climbing && !holds_ladder(world, body.pos) {
+        body.climbing = false;
+    }
+    let below_feet = tile_index(body.pos.1 - HALF_H - COLLISION_EPSILON);
+    if !body.climbing
+        && ((input.up && on_ladder(world, body.pos))
+            || (input.down && ladder(world, tile_index(body.pos.0), below_feet)))
+    {
+        body.climbing = true;
+        body.vel = (0.0, 0.0);
+        body.extra_jump_used = false;
+        body.jump_cut_ready = false;
+    }
+    if body.climbing && body.jump_buffer > 0.0 {
+        body.climbing = false;
+        body.vel.1 = JUMP_VELOCITY;
+        body.jump_buffer = 0.0;
+        body.jump_cut_ready = true;
+    }
+    if body.climbing {
+        body.vel.0 = f32::from(input.move_x.signum()) * CLIMB_SIDE_SPEED;
+        body.vel.1 = match (input.up, input.down) {
+            (true, false) => CLIMB_UP_SPEED,
+            (false, true) => -CLIMB_DOWN_SPEED,
+            _ => 0.0,
+        };
+    } else {
+        fall(body, input, mods);
+    }
+    move_and_collide(body, input, world)
+}
+
+/// Walking, jumping and gravity: steps 2 to 5 of `step_with`, skipped while climbing.
+fn fall(body: &mut Body, input: Input, mods: Mods) {
     // 2. Horizontal velocity.
     let accel = if body.on_ground {
         GROUND_ACCEL
@@ -202,7 +279,10 @@ pub fn step_with(body: &mut Body, input: Input, world: &World, mods: Mods) -> Op
         MAX_FALL_SPEED
     };
     body.vel.1 = (body.vel.1 - GRAVITY * DT).max(-max_fall);
+}
 
+/// Steps 6 to 9 of `step_with`: move by the velocity, collide, bounds, hazards.
+fn move_and_collide(body: &mut Body, input: Input, world: &World) -> Option<(f32, f32)> {
     // 6. Move X, resolve.
     body.pos.0 += body.vel.0 * DT;
     let hit = if body.vel.0 > 0.0 {
@@ -233,12 +313,17 @@ pub fn step_with(body: &mut Body, input: Input, world: &World, mods: Mods) -> Op
         let solid_floor = overlapped_solids(world, body.pos)
             .map(|(_, ty)| (ty + 1) as f32 * TILE_SIZE + HALF_H)
             .reduce(f32::max);
-        let platform_floor = if input.down {
+        // Climbers pass through platforms and ladder tops (a ladder can run through a floor).
+        let platform_floor = if input.down || body.climbing {
             None
         } else {
             let columns = tile_span(body.pos.0 - HALF_W, body.pos.0 + HALF_W);
             tile_span(feet, body.pos.1 + HALF_H)
-                .filter(|&ty| columns.clone().any(|tx| platform(world, tx, ty)))
+                .filter(|&ty| {
+                    columns
+                        .clone()
+                        .any(|tx| platform(world, tx, ty) || ladder_top(world, tx, ty))
+                })
                 .map(|ty| (ty + 1) as f32 * TILE_SIZE)
                 .filter(|&top| feet_before >= top - COLLISION_EPSILON && feet < top)
                 .map(|top| top + HALF_H)
@@ -278,6 +363,10 @@ pub fn step_with(body: &mut Body, input: Input, world: &World, mods: Mods) -> Op
         body.vel.1 = 0.0;
     }
 
+    // Climbing down onto the ground ends the climb: the body stands.
+    if body.on_ground && !input.up {
+        body.climbing = false;
+    }
     if body.on_ground {
         body.coyote = COYOTE_TIME;
         body.extra_jump_used = false;
@@ -313,12 +402,14 @@ mod tests {
         jump_held: false,
         jump_pressed: false,
         down: false,
+        up: false,
     };
     const HOLD_JUMP: Input = Input {
         move_x: 0,
         jump_held: true,
         jump_pressed: false,
         down: false,
+        up: false,
     };
 
     fn put(world: &mut World, x: u32, y: u32) {
@@ -555,6 +646,7 @@ mod tests {
                 jump_held: true,
                 jump_pressed: true,
                 down: false,
+                up: false,
             };
             for _ in 0..300 {
                 step(&mut body, input, &world);
@@ -603,6 +695,7 @@ mod tests {
                     jump_held: rng.chance(0.5),
                     jump_pressed: rng.chance(0.05),
                     down: rng.chance(0.1),
+                    up: false,
                 };
                 step(&mut body, input, &world);
                 trace.push((
@@ -664,6 +757,7 @@ mod mod_tests {
                 move_x: 1,
                 jump_pressed: jump,
                 down: false,
+                up: false,
                 jump_held: true,
             };
             step_with(&mut body, input, &world, m);
@@ -770,6 +864,7 @@ mod mod_tests {
                 move_x: if tick % 90 < 45 { 1 } else { -1 },
                 jump_pressed: tick % 37 == 0,
                 down: tick % 53 < 3,
+                up: tick % 41 < 5,
                 jump_held: tick % 37 < 20,
             };
             step_with(&mut a, input, &world, m);
@@ -928,5 +1023,165 @@ mod platform_tests {
         let still = body;
         settle(&mut body, &inside, Input::default(), 30);
         assert_eq!(body.pos, still.pos, "not pushed");
+    }
+}
+
+#[cfg(test)]
+mod ladder_tests {
+    use super::*;
+    use crate::items::{DIRT, EMPTY, LADDER};
+    use crate::world::Tile;
+    use crate::worldgen::generate;
+
+    const COLUMN: u32 = 52;
+    /// Ladder rows 1..=TOP; its top edge is at row TOP + 1.
+    const TOP: u32 = 6;
+    const UP: Input = Input {
+        move_x: 0,
+        jump_held: false,
+        jump_pressed: false,
+        down: false,
+        up: true,
+    };
+    const DOWN: Input = Input {
+        up: false,
+        down: true,
+        ..UP
+    };
+
+    /// Flat ground at row 0, one ladder in `COLUMN`, rows 1..=TOP.
+    fn ladder_world() -> World {
+        let mut world = generate("LADDERS");
+        for y in 0..crate::WORLD_HEIGHT {
+            for x in 0..crate::WORLD_WIDTH {
+                let fg = match (x, y) {
+                    (_, 0) => DIRT,
+                    (COLUMN, 1..=TOP) => LADDER,
+                    _ => EMPTY,
+                };
+                world.set(x, y, Tile { fg, bg: EMPTY });
+            }
+        }
+        world.door = (50, 1);
+        world
+    }
+
+    /// Standing on the ground at the foot of the ladder.
+    fn at_ladder(world: &World) -> Body {
+        let mut body = spawn_body(world);
+        body.pos.0 = (COLUMN as f32 + 0.5) * TILE_SIZE;
+        settle(&mut body, world, Input::default(), 30);
+        assert!(body.on_ground && !body.climbing);
+        body
+    }
+
+    fn settle(body: &mut Body, world: &World, input: Input, ticks: u32) {
+        for _ in 0..ticks {
+            step(body, input, world);
+        }
+    }
+
+    fn feet(body: &Body) -> f32 {
+        body.pos.1 - HALF_H
+    }
+
+    #[test]
+    fn up_climbs_at_the_climb_speed_and_no_input_hangs_still() {
+        let world = ladder_world();
+        let mut body = at_ladder(&world);
+        let start = body.pos.1;
+        settle(&mut body, &world, UP, 10);
+        assert!(body.climbing);
+        assert!(
+            (body.pos.1 - start - 10.0 * CLIMB_UP_SPEED * DT).abs() < 0.01,
+            "{body:?}"
+        );
+        let hanging = body.pos.1;
+        settle(&mut body, &world, Input::default(), 60);
+        assert!(body.climbing && body.pos.1 == hanging, "{body:?}");
+        // Down to the bottom: the climb ends standing on the ground.
+        settle(&mut body, &world, DOWN, 60);
+        assert!(
+            body.on_ground && !body.climbing && feet(&body) == TILE_SIZE,
+            "{body:?}"
+        );
+    }
+
+    #[test]
+    fn walking_through_a_ladder_does_not_grab() {
+        let world = ladder_world();
+        let mut body = spawn_body(&world);
+        settle(&mut body, &world, Input::default(), 30);
+        let right = Input {
+            move_x: 1,
+            ..Input::default()
+        };
+        for _ in 0..40 {
+            step(&mut body, right, &world);
+            assert!(!body.climbing, "{body:?}");
+        }
+        assert!(body.pos.0 > (COLUMN + 1) as f32 * TILE_SIZE, "walked past");
+    }
+
+    #[test]
+    fn grabbing_mid_fall_stops_the_fall_in_the_same_tick() {
+        let world = ladder_world();
+        let mut body = at_ladder(&world);
+        body.pos.1 = 4.5 * TILE_SIZE;
+        body.vel.1 = -MAX_FALL_SPEED;
+        body.on_ground = false;
+        body.extra_jump_used = true;
+        let before = body.pos.1;
+        step(&mut body, UP, &world);
+        assert!(body.climbing && body.vel.1 == CLIMB_UP_SPEED && body.pos.1 > before);
+        assert!(!body.extra_jump_used, "a grab refills the extra jump");
+    }
+
+    #[test]
+    fn climbing_past_the_top_lands_on_it_and_down_climbs_back() {
+        let world = ladder_world();
+        let mut body = at_ladder(&world);
+        let top = (TOP + 1) as f32 * TILE_SIZE;
+        settle(&mut body, &world, UP, 180);
+        assert!(
+            body.on_ground && !body.climbing && feet(&body) == top,
+            "{body:?}"
+        );
+        settle(&mut body, &world, Input::default(), 30);
+        assert_eq!(feet(&body), top, "the top holds like a platform");
+        settle(&mut body, &world, DOWN, 10);
+        assert!(body.climbing && feet(&body) < top, "{body:?}");
+    }
+
+    #[test]
+    fn jump_lets_go_with_a_normal_jump() {
+        let world = ladder_world();
+        let mut body = at_ladder(&world);
+        settle(&mut body, &world, UP, 20);
+        let jump = Input {
+            jump_pressed: true,
+            jump_held: true,
+            ..Input::default()
+        };
+        step(&mut body, jump, &world);
+        assert!(!body.climbing);
+        assert_eq!(body.vel.1, JUMP_VELOCITY - GRAVITY * DT);
+    }
+
+    #[test]
+    fn climbing_steps_are_deterministic() {
+        let world = ladder_world();
+        let script = [UP, UP, Input::default(), DOWN, UP, DOWN, DOWN];
+        let run = || {
+            let mut body = at_ladder(&world);
+            for &input in script.iter().cycle().take(300) {
+                step(&mut body, input, &world);
+            }
+            body
+        };
+        let (a, b) = (run(), run());
+        assert_eq!(a, b);
+        assert_eq!(a.pos.0.to_bits(), b.pos.0.to_bits());
+        assert_eq!(a.pos.1.to_bits(), b.pos.1.to_bits());
     }
 }

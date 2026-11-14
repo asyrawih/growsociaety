@@ -251,7 +251,16 @@ impl Plugin for FoliagePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FoliageSprites>()
             .add_systems(Startup, draw_all)
-            .add_systems(Update, on_tile_changed.in_set(Phase::View));
+            .add_systems(
+                Update,
+                (
+                    // A whole new world: `redraw` compares every tile, so this replaces what changed.
+                    draw_all.run_if(on_message::<crate::state::WorldReplaced>),
+                    on_tile_changed,
+                )
+                    .chain()
+                    .in_set(Phase::View),
+            );
     }
 }
 

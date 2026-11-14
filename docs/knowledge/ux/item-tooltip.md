@@ -28,7 +28,7 @@ line, so the text logic exists; this spec moves it next to the pointer and adds 
 |---|---|
 | Seed | `Plant on soil · grows in <t>` (`farming::grow_seconds(rarity)`, as `45s`, `3m 20s`, `1h 5m`) |
 | Block | `Block · <hits> punches` (fist hits from `ItemDef::hits`) |
-| Workbench | `Block · wrench it to craft` |
+| Workbench | `Crafting station · press C nearby` (workbench.md) |
 | Background | `Background` |
 | Claim | the store line from [claims.md](claims.md) §6, e.g. `Protects the 10 tiles nearest it` |
 | Tool | Wrench: `Click your claim or a Workbench` · Fist: `Punch blocks, harvest trees` |

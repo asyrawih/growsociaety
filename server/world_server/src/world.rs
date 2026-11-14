@@ -4,10 +4,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use game_protocol::{ChatKind, ServerMsg, WorldSnapshot};
+use game_protocol::{ChatKind, ServerMsg, WORLD_CAPACITY, WorldSnapshot, WorldStatus};
 use game_shared::commands::Role;
 use game_shared::physics::{Input, step_with};
 use game_shared::rules::{
@@ -19,7 +20,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::accounts::Accounts;
 use crate::conn::Server;
 use crate::leases::Identity;
-use crate::store::{PlayerSave, encode_world};
+use crate::store::{PlayerSave, SaveExtras, encode_world};
 
 /// How often a world with players is saved even if nothing asked for it. Tuning: the most a crash
 /// can roll back.
@@ -32,7 +33,14 @@ const WORLD_QUEUE: usize = 1024;
 pub const OUTBOX: usize = 512;
 
 /// Loaded worlds by name. The lock guards the map only, never a world.
-pub type Registry = Arc<Mutex<HashMap<String, mpsc::Sender<ToWorld>>>>;
+pub type Registry = Arc<Mutex<HashMap<String, Loaded>>>;
+
+/// A loaded world: its queue, and how many players are in it (kept by the world, read by the
+/// world menu's `WorldStatus` and `ListWorlds`).
+pub struct Loaded {
+    pub tx: mpsc::Sender<ToWorld>,
+    pub players: Arc<AtomicU8>,
+}
 
 pub enum ToWorld {
     Join {
@@ -105,7 +113,7 @@ pub fn send_to(server: &Server, name: &str, msg: ToWorld) -> bool {
     let Ok(mut worlds) = server.registry.lock() else {
         return false;
     };
-    let tx = worlds.entry(name.to_owned()).or_insert_with(|| {
+    let loaded = worlds.entry(name.to_owned()).or_insert_with(|| {
         spawn_world(
             server.registry.clone(),
             server.clock,
@@ -114,7 +122,7 @@ pub fn send_to(server: &Server, name: &str, msg: ToWorld) -> bool {
             name.to_owned(),
         )
     });
-    tx.try_send(msg).is_ok()
+    loaded.tx.try_send(msg).is_ok()
 }
 
 fn spawn_world(
@@ -123,8 +131,10 @@ fn spawn_world(
     store: Arc<Accounts>,
     me: Identity,
     name: String,
-) -> mpsc::Sender<ToWorld> {
+) -> Loaded {
     let (tx, mut rx) = mpsc::channel(WORLD_QUEUE);
+    let players = Arc::new(AtomicU8::new(0));
+    let population = players.clone();
     // Messages queue in `rx` while the world loads.
     tokio::spawn(async move {
         if let Some(holder) = store.claim_world(&me, &name).await {
@@ -148,18 +158,24 @@ fn spawn_world(
                 }
             }
         }
-        let state = match store.load_world(&name).await {
-            Some(state) => state,
+        let (state, fresh) = match store.load_world(&name).await {
+            Some(state) => (state, false),
             None => {
                 // A new world gets a random seed for its rules; the seed is saved with it.
                 let mut seed = [0u8; 8];
                 let _ = getrandom::fill(&mut seed);
-                WorldState::new(generate(&name), u64::from_le_bytes(seed))
+                (
+                    WorldState::new(generate(&name), u64::from_le_bytes(seed)),
+                    true,
+                )
             }
         };
-        run_world(registry, clock, store, me, name, state, rx).await;
+        let mut room = Room::new(state);
+        room.population = population;
+        room.fresh = fresh;
+        run_world(registry, clock, store, me, name, room, rx).await;
     });
-    tx
+    Loaded { tx, players }
 }
 
 /// Events only their own player may see: inventories and gems are private.
@@ -220,6 +236,21 @@ pub struct Room {
     pub(crate) trade_parties: HashMap<u32, [PlayerId; 2]>,
     /// This world's voice room; `None` when voice is off (docs/knowledge/12, `voice.rs`).
     pub(crate) voice: Option<crate::voice::Voice>,
+    /// A `/resetworld` waiting for its confirm (`reset.rs`).
+    pub(crate) reset_pending: Option<crate::reset::Pending>,
+    /// The world blob before a reset, for the next save's `world_backup`.
+    pub(crate) backup: Option<Vec<u8>>,
+    /// Claims a reset returned to owners who are not here, stored by the next save.
+    pub(crate) returned: Vec<crate::store::Returned>,
+    /// Members now, for the registry (`Loaded::players`).
+    pub(crate) population: Arc<AtomicU8>,
+    /// Generated here and never saved: an untouched new world is not stored, since `worldgen`
+    /// makes the same one from its name (docs/knowledge/ux/world-select.md).
+    pub(crate) fresh: bool,
+    /// Something changed in the world since it loaded (an accepted Act or admin command).
+    pub(crate) touched: bool,
+    /// Who entered a fresh world first: its first save counts towards their creation limit.
+    pub(crate) opener: Option<PlayerId>,
 }
 
 impl Room {
@@ -235,6 +266,13 @@ impl Room {
             bans: HashMap::new(),
             audit: None,
             save_due: false,
+            reset_pending: None,
+            backup: None,
+            returned: Vec::new(),
+            population: Arc::default(),
+            fresh: false,
+            touched: false,
+            opener: None,
             acks: Vec::new(),
             leavers: Vec::new(),
             trade_parties: HashMap::new(),
@@ -303,10 +341,24 @@ impl Room {
                     let _ = out.try_send(Out::Reliable(ServerMsg::Kicked { reason }));
                     return;
                 }
+                if self.members.len() >= usize::from(WORLD_CAPACITY) {
+                    // Answered like the world menu's lookup; the client falls back and says why.
+                    let name = self.state.world.name.clone();
+                    let status = WorldStatus::Full;
+                    let _ = out.try_send(Out::Reliable(ServerMsg::WorldStatus { name, status }));
+                    return;
+                }
+                if self.fresh && self.opener.is_none() {
+                    self.opener = Some(id);
+                }
                 self.roles.insert(id, role);
                 self.state.join(id);
-                if let (Some(save), Some(player)) = (save, self.state.players.get_mut(&id)) {
-                    save.apply_to(player);
+                let mut notices = Vec::new();
+                if let Some(save) = save {
+                    if let Some(player) = self.state.players.get_mut(&id) {
+                        save.apply_to(player);
+                    }
+                    notices = save.notices;
                 }
                 self.names.insert(id, name.clone());
                 if let Some(code) = &country {
@@ -344,7 +396,11 @@ impl Room {
                     let _ = member.out.try_send(Out::Reliable(joined.clone()));
                 }
                 self.members.insert(id, Member { out, ack_seq: 0 });
+                self.count_members();
                 self.voice_joined(id);
+                for notice in notices {
+                    self.system(id, notice);
+                }
             }
             ToWorld::Leave { id } => self.remove(id),
             ToWorld::Flush { done } => {
@@ -390,7 +446,9 @@ impl Room {
                 if !self.members.contains_key(&id) {
                     return;
                 }
+                self.send_swing(id, action);
                 let result = apply(&mut self.state, id, action, now);
+                self.touched |= result.is_ok();
                 let traded = result.as_ref().is_ok_and(|events| {
                     events
                         .iter()
@@ -434,10 +492,42 @@ impl Room {
         }
     }
 
+    /// The blob a save writes, or `None` for a new world nobody has changed yet.
+    pub(crate) fn world_to_store(&self) -> Option<Vec<u8>> {
+        (!self.fresh || self.touched).then(|| encode_world(&self.state))
+    }
+
+    /// Tells the other members that `id` swung at a tile, so their rig reaches out. Refused
+    /// punches swing too. Nobody else here: nothing is sent.
+    fn send_swing(&mut self, id: PlayerId, action: Action) {
+        let (x, y, place) = match action {
+            Action::Punch { x, y } => (x, y, false),
+            Action::Place { x, y, .. } => (x, y, true),
+            _ => return,
+        };
+        let swing = ServerMsg::Swing {
+            player: id,
+            x,
+            y,
+            place,
+        };
+        for (&member, seat) in &self.members {
+            if member != id {
+                let _ = seat.out.try_send(Out::Datagram(swing.clone()));
+            }
+        }
+    }
+
+    fn count_members(&self) {
+        let count = u8::try_from(self.members.len()).unwrap_or(u8::MAX);
+        self.population.store(count, Ordering::Relaxed);
+    }
+
     pub(crate) fn remove(&mut self, id: PlayerId) {
         if self.members.remove(&id).is_none() {
             return;
         }
+        self.count_members();
         // An open trade with them ends (nothing has moved yet); the other party is told.
         let ended = end_trades_of(&mut self.state, id);
         self.broadcast(&ended, Some(id));
@@ -487,8 +577,22 @@ impl Room {
 async fn save(room: &mut Room, store: &Accounts, name: &str) {
     let mut players: Vec<PlayerSave> = room.state.players.values().map(PlayerSave::of).collect();
     players.append(&mut room.leavers);
-    if let Err(error) = store.save(name, &encode_world(&room.state), &players).await {
-        eprintln!("world {name}: save failed, the last save stays current: {error}");
+    // An untouched new world is not stored: worldgen makes the same one from its name. Its
+    // first stored save counts towards the opener's creation limit.
+    let world = room.world_to_store();
+    let extras = SaveExtras {
+        backup: room.backup.as_deref(),
+        returned: &room.returned,
+        created_by: room.opener.filter(|_| room.fresh && world.is_some()),
+    };
+    match store.save(name, world.as_deref(), &players, extras).await {
+        // Kept for the next try on failure: a returned claim is never lost.
+        Ok(()) => {
+            room.fresh &= world.is_none();
+            room.backup = None;
+            room.returned.clear();
+        }
+        Err(error) => eprintln!("world {name}: save failed, the last save stays current: {error}"),
     }
     room.save_due = false;
     for ack in room.acks.drain(..) {
@@ -502,10 +606,9 @@ async fn run_world(
     store: Arc<Accounts>,
     me: Identity,
     name: String,
-    state: WorldState,
+    mut room: Room,
     mut rx: mpsc::Receiver<ToWorld>,
 ) {
-    let mut room = Room::new(state);
     room.audit = Some(
         std::env::var("GAME_AUDIT_LOG")
             .unwrap_or_else(|_| "audit.log".into())
@@ -761,5 +864,83 @@ mod tests {
         assert!(!room.state.players.contains_key(&PlayerId(2)));
         let msgs = drain(&mut rx_a);
         assert!(msgs.contains(&ServerMsg::PlayerLeft { id: PlayerId(2) }));
+    }
+
+    #[test]
+    fn a_full_world_refuses_the_next_player_and_counts_its_members() {
+        let mut room = Room::new(WorldState::new(generate("CROWD"), 1));
+        let mut seats: Vec<_> = (1..=u32::from(WORLD_CAPACITY))
+            .map(|id| join(&mut room, id))
+            .collect();
+        assert_eq!(room.population.load(Ordering::Relaxed), WORLD_CAPACITY);
+        let mut late = join(&mut room, 1000);
+        let refused = std::iter::from_fn(|| late.try_recv().ok()).any(|out| {
+            matches!(out, Out::Reliable(ServerMsg::WorldStatus { name, status: WorldStatus::Full })
+                if name == "CROWD")
+        });
+        assert!(refused && !room.state.players.contains_key(&PlayerId(1000)));
+        room.handle(ToWorld::Leave { id: PlayerId(1) }, 1.0);
+        assert_eq!(room.population.load(Ordering::Relaxed), WORLD_CAPACITY - 1);
+        seats.clear();
+    }
+
+    #[test]
+    fn an_untouched_new_world_is_not_stored() {
+        let mut room = Room::new(WorldState::new(generate("FRESH"), 1));
+        room.fresh = true;
+        let _rx = join(&mut room, 1);
+        assert_eq!(room.opener, Some(PlayerId(1)));
+        assert!(room.world_to_store().is_none(), "visiting costs nothing");
+        if let Some(player) = room.state.players.get_mut(&PlayerId(1)) {
+            player.inventory.add(DIRT, 1);
+        }
+        let door = room.state.world.door;
+        let place = Action::Place {
+            x: door.0 + 1,
+            y: door.1,
+            item: DIRT,
+        };
+        room.handle(
+            ToWorld::Act {
+                id: PlayerId(1),
+                seq: 1,
+                action: place,
+            },
+            1.0,
+        );
+        assert!(room.touched);
+        assert!(
+            room.world_to_store().is_some(),
+            "built in: stored from now on"
+        );
+        room.fresh = false;
+        room.touched = false;
+        assert!(
+            room.world_to_store().is_some(),
+            "a stored world is always saved"
+        );
+    }
+
+    #[test]
+    fn a_swing_reaches_the_others_only_and_nobody_when_alone() {
+        let mut room = Room::new(WorldState::new(generate("SWING"), 1));
+        let mut a = join(&mut room, 1);
+        let punch = |x| ToWorld::Act {
+            id: PlayerId(1),
+            seq: x,
+            action: Action::Punch { x, y: 3 },
+        };
+        let swings = |rx: &mut mpsc::Receiver<Out>| {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|out| matches!(out, Out::Datagram(ServerMsg::Swing { .. })))
+                .count()
+        };
+        room.handle(punch(1), 1.0);
+        assert_eq!(swings(&mut a), 0, "alone: nothing sent");
+        let mut b = join(&mut room, 2);
+        swings(&mut a);
+        room.handle(punch(2), 2.0); // refused or not, the arm swings
+        assert_eq!(swings(&mut a), 0, "never back to the swinger");
+        assert_eq!(swings(&mut b), 1);
     }
 }

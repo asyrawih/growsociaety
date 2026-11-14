@@ -12,7 +12,7 @@ use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use game_protocol::MAX_NAME_LEN;
 use game_shared::claims::{Claim, MAX_CLAIM_ACCESS, claim_area, claim_kind};
-use game_shared::items::{ItemKind, WRENCH, item};
+use game_shared::items::{ItemKind, WORKBENCH, WRENCH, item};
 use game_shared::mods::worn_mods;
 use game_shared::rules::{Action, Event, PlayerId, Reject, in_reach_with};
 use game_shared::world::{TileExtra, World};
@@ -20,9 +20,9 @@ use game_shared::{TILE_SIZE, tile_to_world};
 
 use crate::audio::Sfx;
 use crate::hud::{
-    CLOSE_IMAGE, HUD_MARGIN, INK_COLOR, Notice, OpenPanel, PANEL_IMAGE, PANEL_INSET, PANEL_PADDING,
-    SLOT_GAP, SLOT_SELECTED_IMAGE, Selected, TOPBAR_HEIGHT, TextFocus, icon_node, ink, label,
-    sliced,
+    CLOSE_IMAGE, CRAFT_PANEL_KEY, HUD_MARGIN, INK_COLOR, Notice, OpenPanel, PANEL_IMAGE,
+    PANEL_INSET, PANEL_PADDING, SEP, SLOT_GAP, SLOT_SELECTED_IMAGE, Selected, TOPBAR_HEIGHT,
+    TextFocus, icon_node, ink, key_name, label, sliced,
 };
 use crate::interact::{HoveredTile, InspectedClaim};
 use crate::net::Net;
@@ -129,6 +129,11 @@ fn owner_at(world: &World, x: u32, y: u32) -> Option<PlayerId> {
 /// A name to show: the known one, else `Player #<id>` until the lookup answers.
 fn display_name(known: Option<&str>, id: PlayerId) -> String {
     known.map_or_else(|| format!("Player #{}", id.0), str::to_owned)
+}
+
+/// The tag over a placed Workbench (docs/knowledge/ux/workbench.md).
+fn workbench_tag() -> String {
+    format!("Workbench{SEP}press {} to craft", key_name(CRAFT_PANEL_KEY))
 }
 
 /// What holding `held` over `(x, y)` would do, for `me`. `None` for a non-claim item.
@@ -530,15 +535,26 @@ fn draw_preview(
             }
             world_look.set_if_neq(WorldPreview(None));
         }
-        // The name tag over a claim block.
+        // The name tag over a claim block, or over a Workbench how to use it.
         let block = hovered
             .0
             .and_then(|(x, y)| Some(((x, y), world.claim(World::tile_key(x, y)?)?.owner)));
-        if let Some(((x, y), owner)) = block {
-            if let Some(net) = net.as_deref_mut() {
-                net.lookup_names([owner]);
+        let tagged = match block {
+            Some((tile, owner)) => {
+                if let Some(net) = net.as_deref_mut() {
+                    net.lookup_names([owner]);
+                }
+                Some((
+                    tile,
+                    format!("{}'s claim", name_of(net.as_deref(), me, owner)),
+                ))
             }
-            let tag = format!("{}'s claim", name_of(net.as_deref(), me, owner));
+            None => hovered
+                .0
+                .filter(|&(x, y)| world.get(x, y).is_some_and(|t| t.fg == WORKBENCH))
+                .map(|tile| (tile, workbench_tag())),
+        };
+        if let Some(((x, y), tag)) = tagged {
             if text.0 != tag {
                 text.0 = tag;
             }
@@ -1137,6 +1153,7 @@ fn refresh_panel(
     mut net: Option<ResMut<Net>>,
     mut state: ResMut<PanelState>,
     mut text_focus: ResMut<TextFocus>,
+    search: Res<crate::inventory_filter::InventoryView>,
     panel: Single<&mut Node, With<ClaimPanel>>,
     body: Single<Entity, With<PanelBody>>,
     mut shown: Local<PanelView>,
@@ -1149,12 +1166,15 @@ fn refresh_panel(
             *state = PanelState::default();
             *shown = PanelView::default();
         }
-        // The one writer of `TextFocus`: the craft panel and the store keep Enter too (it crafts
-        // or buys there). One panel is open at a time.
-        text_focus.set_if_neq(TextFocus(matches!(
-            *open,
-            OpenPanel::Craft | OpenPanel::Store
-        )));
+        // The one writer of `TextFocus`: the craft panel, the store and the almanac keep Enter too
+        // (it crafts, buys or searches there), and so does the inventory's search field. One panel
+        // is open at a time.
+        text_focus.set_if_neq(TextFocus(
+            matches!(
+                *open,
+                OpenPanel::Craft | OpenPanel::Store | OpenPanel::Almanac | OpenPanel::WorldSelect
+            ) || search.focused,
+        ));
         return;
     };
     if panel.display != Display::Flex {
@@ -1480,6 +1500,11 @@ mod tests {
             "a tile of its area"
         );
         assert_eq!(wrench_target(&world, 40, 10), None, "free ground");
+    }
+
+    #[test]
+    fn a_workbench_says_how_to_craft() {
+        assert_eq!(workbench_tag(), "Workbench · press C to craft");
     }
 
     #[test]

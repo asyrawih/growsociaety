@@ -14,7 +14,7 @@ use std::time::Duration;
 use bevy::prelude::*;
 use game_protocol::{
     Auth, ChatKind, ClientMsg, DEFAULT_PORT, MAX_SERVER_MSG, PROTOCOL_VERSION, SERVER_NAME,
-    ServerMsg, decode, read_msg, write_msg,
+    ServerMsg, WorldStatus, decode, read_msg, write_msg,
 };
 use game_shared::commands::Role;
 use game_shared::mirror::apply_event;
@@ -89,6 +89,15 @@ pub struct Net {
     asked: std::collections::HashSet<PlayerId>,
     /// Answers to `find_player` (name asked, account found), until taken.
     found: Vec<(String, Option<(PlayerId, String)>)>,
+    /// The newest `WorldStatus` and `Worlds` answers, until the world menu takes them.
+    world_status: Option<(String, WorldStatus)>,
+    worlds: Option<Vec<(String, u8)>>,
+    /// Set when `connect` had to fall back; `NetPlugin` turns it into the resource.
+    join_refused: Option<JoinRefused>,
+    /// Other players' swings (player, x, y, place) until `player.rs` takes them.
+    swings: Vec<(PlayerId, u32, u32, bool)>,
+    /// The answer to `refresh_token`, until taken.
+    token: Option<String>,
     /// The newest voice token (url, token) and world-owner mutes, until `voice.rs` takes them.
     voice_token: Option<(String, String)>,
     voice_muted: Vec<(PlayerId, bool)>,
@@ -101,7 +110,27 @@ type Joined = (
     WorldState,
     (HashMap<PlayerId, String>, HashMap<PlayerId, String>),
     Role,
+    Option<JoinRefused>,
 );
+
+/// The world asked for (`GAME_WORLD`) refused the join, so the game joined a fallback world
+/// instead (`GAME_PREV_WORLD`, else START): never a "no world" state. Inserted once at startup;
+/// the world menu shows why and removes it (docs/knowledge/ux/world-select.md).
+#[derive(Resource, Clone, Debug, PartialEq)]
+pub struct JoinRefused {
+    /// The refused world, upper-case.
+    pub name: String,
+    pub reason: Refusal,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Refusal {
+    Status(WorldStatus),
+    Kicked(String),
+}
+
+/// The world a re-exec came from, for the fallback join.
+const PREV_WORLD_ENV: &str = "GAME_PREV_WORLD";
 
 /// The local player's country code: `GAME_COUNTRY`, else the region of the system locale
 /// (`LANG=id_ID.UTF-8` gives `id`). `None` if neither gives a valid code.
@@ -131,6 +160,10 @@ impl Plugin for NetPlugin {
         let (net, state, me) = connect(&server, &world)
             .unwrap_or_else(|err| panic!("cannot join {world} on {server}: {err}"));
         info!("online: player {} in {world} on {server}", me.0);
+        let mut net = net;
+        if let Some(refused) = net.join_refused.take() {
+            app.insert_resource(refused);
+        }
         app.insert_resource(Game(state, me)).insert_resource(net);
     }
 }
@@ -185,6 +218,35 @@ pub fn quic_target(server: &str) -> Result<(SocketAddr, quinn::ClientConfig), St
 }
 
 /// Blocks until the server has sent the world, then leaves the connection to a background thread.
+/// What a joined world hands over: its state and (names, countries).
+type JoinedWorld = (
+    WorldState,
+    (HashMap<PlayerId, String>, HashMap<PlayerId, String>),
+);
+
+/// Asks to join `world`. `Ok(Err(refusal))` when the server says no (a world status or a kick);
+/// `Err` when the connection itself fails.
+async fn join(
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    world: &str,
+) -> Result<Result<JoinedWorld, Refusal>, String> {
+    let world = world.to_owned();
+    write_msg(send, &ClientMsg::Join { world })
+        .await
+        .map_err(|e| e.to_string())?;
+    match read_msg::<ServerMsg>(recv, MAX_SERVER_MSG).await {
+        Ok(ServerMsg::Joined { snapshot }) => {
+            let names: HashMap<_, _> = snapshot.names.iter().cloned().collect();
+            let countries = snapshot.countries.iter().cloned().collect();
+            Ok(Ok((snapshot.into_state(), (names, countries))))
+        }
+        Ok(ServerMsg::WorldStatus { status, .. }) => Ok(Err(Refusal::Status(status))),
+        Ok(ServerMsg::Kicked { reason }) => Ok(Err(Refusal::Kicked(reason))),
+        other => Err(format!("unexpected answer to Join: {other:?}")),
+    }
+}
+
 fn connect(server: &str, world: &str) -> Result<(Net, WorldState, PlayerId), String> {
     let (addr, config) = quic_target(server)?;
     let auth = if let Ok(token) = std::env::var(AUTH_TOKEN_ENV) {
@@ -221,56 +283,68 @@ fn connect(server: &str, world: &str) -> Result<(Net, WorldState, PlayerId), Str
             } else {
                 "0.0.0.0:0"
             };
-            let session = async {
-                let mut endpoint =
-                    quinn::Endpoint::client(local.parse().map_err(|_| "bind address")?)
+            let session =
+                async {
+                    let mut endpoint =
+                        quinn::Endpoint::client(local.parse().map_err(|_| "bind address")?)
+                            .map_err(|e| e.to_string())?;
+                    endpoint.set_default_client_config(config);
+                    let conn = endpoint
+                        .connect(addr, SERVER_NAME)
+                        .map_err(|e| e.to_string())?
+                        .await
                         .map_err(|e| e.to_string())?;
-                endpoint.set_default_client_config(config);
-                let conn = endpoint
-                    .connect(addr, SERVER_NAME)
-                    .map_err(|e| e.to_string())?
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let (mut send, mut recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
-                let hello = ClientMsg::Hello {
-                    protocol: PROTOCOL_VERSION,
-                    auth,
-                    country: local_country(),
-                };
-                write_msg(&mut send, &hello)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let (me, server_time, role) =
-                    match read_msg::<ServerMsg>(&mut recv, MAX_SERVER_MSG).await {
-                        Ok(ServerMsg::Welcome {
-                            player,
-                            server_time,
-                            role,
-                            ..
-                        }) => (player, server_time, role),
-                        Ok(ServerMsg::Kicked { reason }) => return Err(reason),
-                        other => return Err(format!("unexpected answer to Hello: {other:?}")),
+                    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
+                    let hello = ClientMsg::Hello {
+                        protocol: PROTOCOL_VERSION,
+                        auth,
+                        country: local_country(),
                     };
-                write_msg(&mut send, &ClientMsg::Join { world })
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let (state, names) = match read_msg::<ServerMsg>(&mut recv, MAX_SERVER_MSG).await {
-                    Ok(ServerMsg::Joined { snapshot }) => {
-                        let names: HashMap<_, _> = snapshot.names.iter().cloned().collect();
-                        let countries = snapshot.countries.iter().cloned().collect();
-                        (snapshot.into_state(), (names, countries))
-                    }
-                    Ok(ServerMsg::Kicked { reason }) => return Err(reason),
-                    other => return Err(format!("unexpected answer to Join: {other:?}")),
+                    write_msg(&mut send, &hello)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let (me, server_time, role) =
+                        match read_msg::<ServerMsg>(&mut recv, MAX_SERVER_MSG).await {
+                            Ok(ServerMsg::Welcome {
+                                player,
+                                server_time,
+                                role,
+                                ..
+                            }) => (player, server_time, role),
+                            Ok(ServerMsg::Kicked { reason }) => return Err(reason),
+                            other => return Err(format!("unexpected answer to Hello: {other:?}")),
+                        };
+                    let (joined, refused) =
+                        match join(&mut send, &mut recv, &world).await? {
+                            Ok(joined) => (joined, None),
+                            // Refused: join where the player came from, else START, and say why.
+                            Err(reason) => {
+                                let fallback = std::env::var(PREV_WORLD_ENV)
+                                    .ok()
+                                    .map(|name| name.to_ascii_uppercase())
+                                    .filter(|name| *name != world.to_ascii_uppercase())
+                                    .unwrap_or_else(|| DEFAULT_WORLD.to_owned());
+                                warn!("{world} refused the join ({reason:?}), joining {fallback}");
+                                // The server may count us as in the refused world; leaving is harmless if not.
+                                write_msg(&mut send, &ClientMsg::Leave)
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+                                let joined = join(&mut send, &mut recv, &fallback).await?.map_err(
+                                    |again| format!("{fallback} refused the join too: {again:?}"),
+                                )?;
+                                let name = world.to_ascii_uppercase();
+                                (joined, Some(JoinRefused { name, reason }))
+                            }
+                        };
+                    let (state, names) = joined;
+                    Ok((
+                        endpoint,
+                        conn,
+                        send,
+                        recv,
+                        (me, server_time, state, names, role, refused),
+                    ))
                 };
-                Ok((
-                    endpoint,
-                    conn,
-                    send,
-                    recv,
-                    (me, server_time, state, names, role),
-                ))
-            };
             let (_endpoint, conn, mut send, mut recv, joined) = match session.await {
                 Ok(parts) => parts,
                 Err(e) => {
@@ -314,7 +388,7 @@ fn connect(server: &str, world: &str) -> Result<(Net, WorldState, PlayerId), Str
         });
     });
 
-    let (me, server_time, mut state, (names, countries), role) = ready_rx
+    let (me, server_time, mut state, (names, countries), role, join_refused) = ready_rx
         .recv_timeout(JOIN_TIMEOUT)
         .map_err(|_| "timed out waiting for the server".to_owned())??;
     // The local clock is ~0 at startup.
@@ -337,6 +411,11 @@ fn connect(server: &str, world: &str) -> Result<(Net, WorldState, PlayerId), Str
         known_names: HashMap::new(),
         asked: Default::default(),
         found: Vec::new(),
+        world_status: None,
+        worlds: None,
+        join_refused,
+        swings: Vec::new(),
+        token: None,
         voice_token: None,
         voice_muted: Vec::new(),
     };
@@ -396,6 +475,43 @@ impl Net {
         std::mem::take(&mut self.found)
     }
 
+    /// Asks what entering world `name` would do (docs/knowledge/ux/world-select.md). Debounce
+    /// it: the server rate-limits lookups and drops what is over the limit.
+    pub fn world_status(&mut self, name: String) {
+        let _ = self.to_server.send(ClientMsg::WorldStatus { name });
+    }
+
+    /// The newest `world_status` answer, once: (name upper-case, status).
+    pub fn take_world_status(&mut self) -> Option<(String, WorldStatus)> {
+        self.world_status.take()
+    }
+
+    /// Asks the server for a fresh login token; `take_token` has it a moment later. Call it right
+    /// before re-starting the game for a world switch and pass it on as `GAME_AUTH_TOKEN`.
+    pub fn refresh_token(&mut self) {
+        let _ = self.to_server.send(ClientMsg::RefreshToken);
+    }
+
+    /// The fresh token from `refresh_token`, once (empty on development logins).
+    pub fn take_token(&mut self) -> Option<String> {
+        self.token.take()
+    }
+
+    /// Other players' swings since the last call: (player, x, y, place).
+    pub fn take_swings(&mut self) -> Vec<(PlayerId, u32, u32, bool)> {
+        std::mem::take(&mut self.swings)
+    }
+
+    /// Asks for the busiest loaded worlds.
+    pub fn list_worlds(&mut self) {
+        let _ = self.to_server.send(ClientMsg::ListWorlds);
+    }
+
+    /// The newest `list_worlds` answer, once: (name, players), most players first.
+    pub fn take_worlds(&mut self) -> Option<Vec<(String, u8)>> {
+        self.worlds.take()
+    }
+
     #[allow(dead_code)] // the claim panel (hud.rs, growsociaety-1a) calls it; not wired yet
     pub fn lookup_names(&mut self, ids: impl IntoIterator<Item = PlayerId>) {
         let new: Vec<PlayerId> = ids
@@ -449,13 +565,15 @@ impl Net {
     }
 
     /// Applies everything the server sent since the last frame.
+    /// Applies what the server sent. `true` when it replaced the whole world (`/resetworld`).
     pub fn pump(
         &mut self,
         game: &mut Game,
         now: f64,
         events: &mut MessageWriter<GameEvent>,
         results: &mut MessageWriter<ActionResult>,
-    ) {
+    ) -> bool {
+        let mut replaced = false;
         let received: Vec<ServerMsg> = match self.from_server.lock() {
             Ok(rx) => std::iter::from_fn(|| rx.try_recv().ok()).collect(),
             Err(_) => Vec::new(),
@@ -482,6 +600,7 @@ impl Net {
                     if let Ok(list) = &mut result {
                         record(game, list);
                     }
+                    crate::state::log_result(action, &result);
                     results.write(ActionResult { action, result });
                 }
                 ServerMsg::PlayerJoined {
@@ -537,11 +656,37 @@ impl Net {
                     }
                     self.found.push((asked, found));
                 }
+                ServerMsg::WorldStatus { name, status } => self.world_status = Some((name, status)),
+                ServerMsg::Worlds { active } => self.worlds = Some(active),
+                ServerMsg::Token { token } => self.token = Some(token),
+                ServerMsg::Swing {
+                    player,
+                    x,
+                    y,
+                    place,
+                } => self.swings.push((player, x, y, place)),
                 ServerMsg::VoiceToken { url, token, .. } => self.voice_token = Some((url, token)),
                 ServerMsg::VoiceMuted { player, muted } => self.voice_muted.push((player, muted)),
-                ServerMsg::Welcome { .. } | ServerMsg::Joined { .. } => {}
+                // Joined again in the same world: it was reset. Swap the world in whole; the old
+                // drops leave as `DropTaken` by nobody (no pickup sound).
+                ServerMsg::Joined { snapshot } => {
+                    self.names.extend(snapshot.names.iter().cloned());
+                    self.countries.extend(snapshot.countries.iter().cloned());
+                    let mut gone: Vec<Event> = (game.0.world.drops.iter())
+                        .map(|drop| Event::DropTaken {
+                            drop_id: drop.id,
+                            by: PlayerId(u32::MAX),
+                            count: 0,
+                        })
+                        .collect();
+                    game.0 = snapshot.into_state();
+                    record(game, &mut gone);
+                    replaced = true;
+                }
+                ServerMsg::Welcome { .. } => {}
             }
         }
+        replaced
     }
 
     /// Snap to the server's body and replay the inputs it has not stepped yet. Both sides run the
@@ -596,6 +741,11 @@ mod tests {
             known_names: HashMap::new(),
             asked: Default::default(),
             found: Vec::new(),
+            world_status: None,
+            worlds: None,
+            join_refused: None,
+            swings: Vec::new(),
+            token: None,
             voice_token: None,
             voice_muted: Vec::new(),
         };

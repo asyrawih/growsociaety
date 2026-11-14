@@ -24,6 +24,9 @@ pub const LAVA_CHANCE: f32 = 0.10;
 
 pub const MAX_WORLD_NAME_LEN: usize = 24;
 
+/// Every item `generate` places (fg or bg, `EMPTY` left out); the almanac's "found in the world".
+pub const GENERATED: &[ItemId] = &[BEDROCK, DIRT, CAVE_WALL, STONE, SAND, LAVA, MAIN_DOOR];
+
 const _: () = assert!(SURFACE_ROW + 1 < WORLD_HEIGHT && LAVA_ROWS < GROUND_ROWS);
 const _: () = assert!(2 * DOOR_EDGE_MARGIN < WORLD_WIDTH);
 
@@ -64,9 +67,14 @@ fn scatter(
 }
 
 pub fn generate(name: &str) -> World {
+    generate_seeded(name, None)
+}
+
+/// `generate` with another seed (`/resetworld seed=n`); `None` is the name's own seed.
+pub fn generate_seeded(name: &str, seed: Option<u64>) -> World {
     let name = name.to_ascii_uppercase();
     // 1. Seed.
-    let mut rng = Rng::new(fnv1a(name.as_bytes()));
+    let mut rng = Rng::new(seed.unwrap_or_else(|| fnv1a(name.as_bytes())));
     let mut world = World::empty(name);
     let ground_bottom = BEDROCK_ROWS;
 
@@ -145,6 +153,18 @@ mod tests {
         (0..WORLD_HEIGHT).flat_map(move |y| {
             (0..WORLD_WIDTH).map(move |x| (x, y, world.get(x, y).expect("in bounds")))
         })
+    }
+
+    #[test]
+    fn generated_lists_every_item_worldgen_places() {
+        for name in ["START", "FARM", "W7"] {
+            let world = generate(name);
+            for (x, y, tile) in tiles(&world) {
+                for id in [tile.fg, tile.bg].into_iter().filter(|&id| id != EMPTY) {
+                    assert!(GENERATED.contains(&id), "{name} ({x},{y}): {id:?}");
+                }
+            }
+        }
     }
 
     #[test]

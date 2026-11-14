@@ -16,6 +16,7 @@ use crate::hud::{
     HUD_MARGIN, HudText, INK_COLOR, KIT_SCALE, OpenPanel, SLOT_GAP, ink, label, sliced,
     spawn_centre_panel, tab_node,
 };
+use crate::inventory_filter::Sort;
 use crate::player::Player;
 use crate::player::{Look, rig::SKIN_RAMPS};
 use crate::respawn_ui::{GoHomeButton, GoHomeIcon, GoHomeLabel};
@@ -60,6 +61,18 @@ pub struct Settings {
     pub hints: u8,
     /// The claim tip ("hold the wrench and click your claim") was shown once; `claim_ui.rs`.
     pub claim_tip_seen: bool,
+    /// The Workbench hint ("press C to craft") was shown once; `craft_ui.rs`.
+    pub workbench_tip_seen: bool,
+    /// The ladder hint ("W / S to climb") was shown once; `hud.rs`.
+    pub ladder_tip_seen: bool,
+    /// Fewer particles, no shake, still drops (`vfx.rs`).
+    pub reduce_effects: bool,
+    /// 2 px on a block break; off by default (`vfx.rs`).
+    pub screen_shake: bool,
+    /// The inventory grid's order (`inventory_filter.rs`).
+    pub inventory_sort: Sort,
+    /// Worlds entered, newest first, at most 5 (`world_select.rs`).
+    pub recent_worlds: Vec<String>,
 }
 
 impl Default for Settings {
@@ -78,6 +91,12 @@ impl Default for Settings {
             language: 0,
             hints: 0,
             claim_tip_seen: false,
+            workbench_tip_seen: false,
+            ladder_tip_seen: false,
+            reduce_effects: false,
+            screen_shake: false,
+            inventory_sort: Sort::Slot,
+            recent_worlds: Vec::new(),
         }
     }
 }
@@ -115,6 +134,21 @@ impl Settings {
                 "skin" => s.skin = index(value, SKIN_RAMPS.len()).unwrap_or(s.skin),
                 "hints" => s.hints = value.parse().unwrap_or(s.hints),
                 "claim_tip_seen" => s.claim_tip_seen = yes,
+                "workbench_tip_seen" => s.workbench_tip_seen = yes,
+                "ladder_tip_seen" => s.ladder_tip_seen = yes,
+                "reduce_effects" => s.reduce_effects = yes,
+                "recent_worlds" => {
+                    s.recent_worlds = value
+                        .split(',')
+                        .map(|name| name.trim().to_ascii_uppercase())
+                        .filter(|name| game_shared::worldgen::validate_world_name(name))
+                        .take(crate::world_select::MAX_RECENT)
+                        .collect();
+                }
+                "screen_shake" => s.screen_shake = yes,
+                "inventory_sort" => {
+                    s.inventory_sort = Sort::parse(value).unwrap_or(s.inventory_sort)
+                }
                 "language" => {
                     s.language = LANGUAGES.iter().position(|&l| l == value).unwrap_or(0);
                 }
@@ -149,7 +183,9 @@ impl Settings {
     pub fn to_text(&self) -> String {
         format!(
             "music={}\nsfx={}\nvoice_volume={}\nvoice={}\nopen_mic={}\nself_muted={}\nmic={}\n\
-             fullscreen={}\nzoom={}\nskin={}\nlanguage={}\nhints={}\nclaim_tip_seen={}\n",
+             fullscreen={}\nzoom={}\nskin={}\nlanguage={}\nhints={}\nclaim_tip_seen={}\n\
+             workbench_tip_seen={}\nladder_tip_seen={}\nreduce_effects={}\nscreen_shake={}\n\
+             inventory_sort={}\nrecent_worlds={}\n",
             self.music,
             self.sfx,
             self.voice_volume,
@@ -163,6 +199,12 @@ impl Settings {
             LANGUAGES[self.language.min(LANGUAGES.len() - 1)],
             self.hints,
             self.claim_tip_seen,
+            self.workbench_tip_seen,
+            self.ladder_tip_seen,
+            self.reduce_effects,
+            self.screen_shake,
+            self.inventory_sort.key(),
+            self.recent_worlds.join(","),
         )
     }
 
@@ -212,6 +254,8 @@ impl Settings {
             Field::PushToTalk => !self.open_mic,
             Field::OpenMic => self.open_mic,
             Field::SelfMute => self.self_muted,
+            Field::ReduceEffects => self.reduce_effects,
+            Field::ScreenShake => self.screen_shake,
             _ => self.fullscreen,
         }
     }
@@ -224,6 +268,8 @@ impl Settings {
             Field::PushToTalk => self.open_mic = !on,
             Field::OpenMic => self.open_mic = on,
             Field::SelfMute => self.self_muted = on,
+            Field::ReduceEffects => self.reduce_effects = on,
+            Field::ScreenShake => self.screen_shake = on,
             _ => self.fullscreen = on,
         }
     }
@@ -302,13 +348,16 @@ const TABS: [(SettingsTab, &str, &str); 5] = [
 
 /// Read-only list for the Keys tab. ponytail: copied from the key constants in hud, interact,
 /// player, camera, chat and voice; derive it from them when rebinding arrives.
-const BINDINGS: [(&str, &str); 13] = [
+pub(crate) const BINDINGS: [(&str, &str); 16] = [
     ("Move", "A / D or Left / Right"),
     ("Jump", "Space, W or Up"),
     ("Punch / place", "Left mouse (hold)"),
     ("Select hotbar slot", "1 - 8"),
     ("Drop one", "Q"),
+    ("Drop stack", "Shift+Q"),
     ("Trash one", "X twice"),
+    ("Trash stack", "Shift+X twice"),
+    ("Search inventory", "Ctrl+F"),
     ("Inventory / wardrobe", "E or I"),
     ("Store", "B"),
     ("Voice settings", "N"),
@@ -330,6 +379,8 @@ pub enum Field {
     SelfMute,
     Mic,
     Fullscreen,
+    ReduceEffects,
+    ScreenShake,
     Zoom,
     Skin,
     Language,
@@ -665,6 +716,8 @@ pub fn spawn_settings(mut commands: Commands, assets: Res<AssetServer>, tab: Res
                         SettingsTab::Display => {
                             toggle_row(p, &assets, "Fullscreen", Field::Fullscreen);
                             dropdown_row(p, &assets, "Default zoom", Field::Zoom);
+                            toggle_row(p, &assets, "Reduce effects", Field::ReduceEffects);
+                            toggle_row(p, &assets, "Screen shake", Field::ScreenShake);
                         }
                         SettingsTab::Keys => {
                             for (action, keys) in BINDINGS {
@@ -984,6 +1037,12 @@ mod tests {
             language: 0,
             hints: 2,
             claim_tip_seen: true,
+            workbench_tip_seen: true,
+            ladder_tip_seen: true,
+            reduce_effects: true,
+            screen_shake: true,
+            inventory_sort: Sort::Count,
+            recent_worlds: vec!["MYFARM".into(), "START".into()],
         };
         assert_eq!(Settings::parse(&s.to_text()), s);
         let dir = temp_dir("roundtrip");
@@ -994,6 +1053,16 @@ mod tests {
         assert_eq!(odd.music, MAX_VOLUME);
         assert_eq!((odd.skin, odd.zoom, odd.language), (0, 0, 0));
         assert!(odd.mic.is_none());
+        let fresh = Settings::parse("inventory_sort=Sideways");
+        assert!(!fresh.reduce_effects && !fresh.screen_shake);
+        assert_eq!(fresh.inventory_sort, Sort::Slot);
+        assert!(fresh.recent_worlds.is_empty());
+        let recent = Settings::parse("recent_worlds=a,B B,c!,D");
+        assert_eq!(recent.recent_worlds, vec!["A".to_string(), "D".to_string()]);
+        assert_eq!(
+            Settings::parse("inventory_sort=type").inventory_sort,
+            Sort::Type
+        );
     }
 
     #[test]

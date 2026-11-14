@@ -170,6 +170,8 @@ PixelLab object `3603a442-5b78-4601-902b-07c57f56cd41` (frames 0, 3, 4, 6–11);
 - Mod icons for tooltips, `ui/mods/mod_<name>.png` (32×32): `extra_jump`, `glide`, `run_boost`, `reach`,
   `dig_boost`, `gem_finder`.
 - `audio/sfx/craft.ogg` (0.8 s): item crafted, a wood knock and metal clink.
+- `audio/sfx/splice.ogg` (0.8 s): two seeds spliced into a new tree, a leafy shimmer and chime (PixelLab sound
+  `4cc3ba80-c22b-43d4-ade3-ab7c6716607d`). Meant to feel more special than `plant.ogg`.
 
 ### One-way platforms (`blocks/68_wood_platform.png`, `blocks/69_stone_platform.png`)
 
@@ -193,3 +195,19 @@ Drawn by `docs/art/make_respawn_fx.py` (no generation; rerun it to rebuild).
   pivot. A warm white/gold 4-point star that grows, flashes (short diagonal rays) and fades, with a dark 1 px
   outline. Kept small so a farm playing it every 4 s per tree doesn't look noisy. Made by the same
   `docs/art/make_respawn_fx.py`.
+
+### Farming, punch and inventory feedback (specs: docs/knowledge/ux/vfx-farming-punch.md, inventory-categories.md)
+
+Drawn by `docs/art/make_respawn_fx.py` (no generation). The fx strips use 12 fps, no loop, a centre pivot and the
+same JSON sidecar as `respawn_puff`.
+- `fx/block_break_dust.png` (+ `.json`): 6 × 32×32. Near-white dust plus grey chips bursting out with gravity.
+  Value contrast only, so tint it with the broken block's colour at runtime.
+- `fx/soil_puff.png` (+ `.json`): 5 × 32×32. A low, wide brown soil puff on the ground line (bottom of the frame),
+  for a planted seed.
+- `fx/splice_swirl.png` (+ `.json`): 8 × 32×32. Green leaves and violet sparks spiralling inward, ending in a small
+  pop at the centre. It reads clearly unlike the soil puff.
+- `fx/drop_glow.png` (+ `.json`): 1 × 16×16. A soft warm ring with a transparent centre, drawn under seed drops;
+  the code pulses its alpha.
+- `ui/chip.png` / `ui/chip_active.png`: 40×20 wood pill, 9-slice inset 6, inventory category filter chips styled
+  like `tab.png`. The active one has a parchment fill.
+- `ui/icon_search.png`: 16×16 magnifier (gold rim, cream glass, wood handle).

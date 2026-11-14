@@ -15,7 +15,8 @@ use game_shared::crafting::recipe;
 use game_shared::farming::grow_seconds;
 use game_shared::inventory::{MAX_UPGRADES, SLOTS_PER_UPGRADE, upgrade_cost};
 use game_shared::items::{
-    FIST, ITEMS, ItemDef, ItemId, ItemKind, Slot, WORKBENCH, WRENCH, equip_price, item, slot_of,
+    FIST, ITEMS, ItemDef, ItemId, ItemKind, LADDER, Slot, WORKBENCH, WRENCH, equip_price, item,
+    seed_of, slot_of,
 };
 use game_shared::levels::{MAX_LEVEL, xp_to_next};
 use game_shared::mods::{FIST_DAMAGE, Mod, mods_of};
@@ -46,6 +47,9 @@ const CLOSE_KEY: KeyCode = KeyCode::Escape;
 /// chat.rs opens the chat line on Enter and has no constant of its own; named here for the
 /// top bar's label only.
 const CHAT_KEY: KeyCode = KeyCode::Enter;
+/// Opens and closes the craft panel from anywhere (docs/knowledge/ux/workbench.md); Y on a gamepad.
+pub(crate) const CRAFT_PANEL_KEY: KeyCode = KeyCode::KeyC;
+const CRAFT_PANEL_PAD: GamepadButton = GamepadButton::North;
 
 // The UI kit (assets/ui/). Sizes and insets are in the art's own pixels; it is drawn at
 // `KIT_SCALE` logical px per art px.
@@ -136,7 +140,7 @@ const WARDROBE_GRID: GridPanel = GridPanel {
     columns: (3, 10),
 };
 /// assets/README.md, "Font": glyphs sit on a 16 px grid, so only multiples of 16 stay crisp.
-const FONT: &str = "fonts/growsociaety_pixel.ttf";
+pub(crate) const FONT: &str = "fonts/growsociaety_pixel.ttf";
 const TEXT_FONT_SIZE: f32 = 16.0;
 const GEM_ICON: &str = "blocks/45_gem.png";
 /// Top bar, top-right corner (assets/README.md, "Top bar and settings"): the strip at its art's
@@ -149,14 +153,18 @@ const TOP_BUTTON_ART: f32 = 41.0;
 const TOP_BUTTON_SIZE: f32 = 44.0;
 const TOP_ICON_SIZE: f32 = 32.0;
 pub(crate) const TOPBAR_HEIGHT: f32 = TOP_BUTTON_SIZE + 2.0 * TOPBAR_PADDING;
+/// The almanac's key, for its top-bar label only (J / F1 are read in `almanac.rs`).
 const MIC_ON_ICON: &str = "ui/voice_mic_on.png";
 const MIC_MUTED_ICON: &str = "ui/voice_mic_muted.png";
 /// Top-bar buttons, left to right, with their icons.
-const TOP_BUTTONS: [(TopButton, &str); 6] = [
+const TOP_BUTTONS: [(TopButton, &str); 9] = [
     (TopButton::Store, "ui/settings/icon_shop.png"),
     (TopButton::Inventory, "ui/settings/icon_inventory.png"),
     (TopButton::Wardrobe, "ui/settings/icon_wardrobe.png"),
+    (TopButton::Craft, CRAFT_ICON),
     (TopButton::Chat, "ui/settings/icon_chat.png"),
+    (TopButton::Almanac, "ui/settings/icon_help.png"),
+    (TopButton::World, "ui/settings/icon_world.png"),
     (TopButton::Voice, MIC_MUTED_ICON),
     (TopButton::Settings, "ui/settings_gear.png"),
 ];
@@ -297,7 +305,7 @@ struct StoreFocus(usize);
 
 /// Tab keys: -1 previous, +1 next, taken while a tabbed panel is open.
 #[derive(Resource, Default)]
-struct TabKeys(i32);
+pub(crate) struct TabKeys(i32);
 
 /// Store keys, read before the player's movement sees them.
 #[derive(Resource, Default)]
@@ -369,6 +377,10 @@ pub enum OpenPanel {
     Craft,
     /// The claim panel of the claim inspected with the wrench (`claim_ui.rs`).
     Claim,
+    /// The almanac (`almanac.rs`).
+    Almanac,
+    /// The World menu (`world_select.rs`).
+    WorldSelect,
 }
 
 /// The item Q (drop) and X (trash) act on: the one selected in the wardrobe grid while the
@@ -439,7 +451,12 @@ enum TopButton {
     Store,
     Inventory,
     Wardrobe,
+    Craft,
     Chat,
+    /// The almanac (`almanac.rs`).
+    Almanac,
+    /// The World menu (`world_select.rs`).
+    World,
     /// The settings on the Voice tab; its icon shows whether the mic can be on.
     Voice,
     Settings,
@@ -579,6 +596,7 @@ impl Plugin for HudPlugin {
                     show_toasts,
                     show_tooltip,
                     skin_armed,
+                    ladder_tip,
                 )
                     .in_set(Phase::View),
             );
@@ -924,6 +942,7 @@ fn spawn_hud(
             .with_children(|line| {
                 line.spawn((label(""), SelectedName));
                 line.spawn((row(HUD_MARGIN), ModLine));
+                crate::inventory_filter::spawn_strip_buttons(line, &assets);
             });
         column.spawn((row(SLOT_GAP), HotbarRow));
     });
@@ -937,6 +956,7 @@ fn spawn_hud(
         INVENTORY_GRID.width_for(0.0),
         |panel| {
             bag_tabs(panel, &assets, OpenPanel::Inventory);
+            crate::inventory_filter::spawn_filter_bar(panel, &assets);
             scroll_grid(panel, InventoryGrid);
         },
     );
@@ -1128,10 +1148,12 @@ pub(crate) fn button_node() -> Node {
     }
 }
 
-/// E/I opens the inventory or closes the inventory/wardrobe window, B the store; Escape closes
-/// (an armed store purchase is disarmed first).
+/// E/I opens the inventory or closes the inventory/wardrobe window, B the store, C (gamepad Y)
+/// the craft panel; Escape closes (an armed store purchase is disarmed first). A focused text field
+/// has already taken the keys (`claim_ui::take_panel_keys`), so typing a C never toggles.
 fn toggle_panels(
     keys: Res<ButtonInput<KeyCode>>,
+    pads: Query<&Gamepad>,
     mut open: ResMut<OpenPanel>,
     mut armed: ResMut<ArmedBuy>,
 ) {
@@ -1149,6 +1171,14 @@ fn toggle_panels(
             OpenPanel::None
         } else {
             OpenPanel::Store
+        }
+    } else if keys.just_pressed(CRAFT_PANEL_KEY)
+        || pads.iter().any(|pad| pad.just_pressed(CRAFT_PANEL_PAD))
+    {
+        if *open == OpenPanel::Craft {
+            OpenPanel::None
+        } else {
+            OpenPanel::Craft
         }
     } else if keys.just_pressed(CLOSE_KEY) {
         OpenPanel::None
@@ -1293,6 +1323,9 @@ fn click_buttons(
                 TopButton::Store => (OpenPanel::Store, None),
                 TopButton::Inventory => (OpenPanel::Inventory, None),
                 TopButton::Wardrobe => (OpenPanel::Wardrobe, None),
+                TopButton::Craft => (OpenPanel::Craft, None),
+                TopButton::Almanac => (OpenPanel::Almanac, None),
+                TopButton::World => (OpenPanel::WorldSelect, None),
                 TopButton::Voice => (OpenPanel::Settings, Some(SettingsTab::Voice)),
                 TopButton::Settings => (OpenPanel::Settings, None),
                 TopButton::Chat => {
@@ -1400,6 +1433,8 @@ fn drag_items(
     game: Res<Game>,
     open: Res<OpenPanel>,
     cells: Query<(&CarriedCell, &Hovered, Option<&UiButton>)>,
+    ui: Query<&Hovered>,
+    local: Single<&crate::player::Player>,
     mut drag: ResMut<ItemDrag>,
     ghost: Single<(Entity, &mut Node), With<DragGhost>>,
     mut actions: MessageWriter<ActionMsg>,
@@ -1423,6 +1458,18 @@ fn drag_items(
                 let len = me.inventory.slots().len();
                 if let Some(action) = drop_action(current, position, &carried_slots(me), len) {
                     actions.write(ActionMsg(action));
+                } else if let ItemDrag::Dragging { from } = current
+                    && *open == OpenPanel::Inventory
+                    && crate::interact::drags_out(position.is_some(), pointer_over_ui(&ui))
+                    && let Some(&(id, held)) = me.inventory.slots().get(from)
+                    && crate::interact::discardable(id)
+                {
+                    // Carried out of the panel onto the world: the whole stack drops.
+                    actions.write(ActionMsg(Action::Drop {
+                        item: id,
+                        count: crate::interact::stack_count(held),
+                        left: local.facing_west,
+                    }));
                 }
             }
             ItemDrag::Idle
@@ -1480,18 +1527,24 @@ fn spawn_inventory_slot(
             if let Some(icon) = item_icon_node(assets, id) {
                 cell.spawn(icon);
             }
+            if let Some(badge) = crate::vfx::seed_badge(assets, id) {
+                cell.spawn(badge);
+            }
             if let Some(count) = count_text(count) {
                 cell.spawn(count);
             }
         });
 }
 
-/// Rebuilds the hotbar and the inventory grid from the player.
+/// Rebuilds the hotbar and the inventory grid from the player. The grid shows the chip, search and
+/// sort view (`inventory_filter.rs`); its cells keep their real place for dragging.
+#[allow(clippy::too_many_arguments)] // a Bevy system
 fn refresh_slots(
     mut commands: Commands,
     assets: Res<AssetServer>,
     game: Res<Game>,
     selected: Res<Selected>,
+    view: Res<crate::inventory_filter::InventoryView>,
     mut events: MessageReader<GameEvent>,
     hotbar: Single<Entity, With<HotbarRow>>,
     grid: Single<Entity, With<InventoryGrid>>,
@@ -1503,7 +1556,7 @@ fn refresh_slots(
         _ => false,
     });
     // `selected` also reads as changed on the first run, which fills the HUD once at startup.
-    if !inventory_changed && !selected.is_changed() {
+    if !inventory_changed && !selected.is_changed() && !view.is_changed() {
         return;
     }
     let Some(me) = game.me() else { return };
@@ -1516,16 +1569,21 @@ fn refresh_slots(
                 spawn_inventory_slot(row, &assets, me, n, carried.get(n).copied(), selected.0);
             }
         });
-    // Free backpack slots are shown empty after the items.
+    // Free backpack slots are shown empty after the items, unless a filter is on.
     let free = usize::from(me.inventory.capacity).saturating_sub(me.inventory.slots().len());
-    let cells = carried.iter().map(|&index| Some(index));
-    let cells = cells.chain(std::iter::repeat_n(None, free));
+    let (positions, show_free) = view.cells(me, &carried);
+    let free = (carried.len()..carried.len() + free).filter(|_| show_free);
+    let cells = positions.iter().map(|&p| (p, Some(carried[p])));
+    let cells = cells.chain(free.map(|p| (p, None)));
     commands
         .entity(*grid)
         .despawn_children()
         .with_children(|grid| {
-            for (position, index) in cells.enumerate() {
+            for (position, index) in cells {
                 spawn_inventory_slot(grid, &assets, me, position, index, selected.0);
+            }
+            if positions.is_empty() {
+                crate::inventory_filter::spawn_empty(grid, &view);
             }
         });
 }
@@ -2040,7 +2098,7 @@ fn take_store_keys(
 }
 
 /// The `[` / `]` keys and LB / RB while a tabbed panel is open, kept from the game and the chat.
-fn take_tab_keys(
+pub(crate) fn take_tab_keys(
     open: Res<OpenPanel>,
     mut keys: ResMut<ButtonInput<KeyCode>>,
     pads: Query<&Gamepad>,
@@ -2325,6 +2383,8 @@ struct ItemInfo {
     kind: Option<String>,
     /// Store only: the price and whether the player can pay it.
     price: Option<(u32, bool)>,
+    /// Owned and droppable: `Q drop · Shift+Q drop stack`.
+    hint: Option<String>,
 }
 
 fn item_info(id: ItemId, count: u16, worn: bool, price: Option<(u32, bool)>) -> Option<ItemInfo> {
@@ -2339,7 +2399,14 @@ fn item_info(id: ItemId, count: u16, worn: bool, price: Option<(u32, bool)>) -> 
         mods: mods_of(id).collect(),
         kind: kind_line(def, worn),
         price,
+        hint: (price.is_none() && crate::interact::discardable(id)).then(drop_hint),
     })
+}
+
+/// The drop keys, from the constant.
+fn drop_hint() -> String {
+    let key = key_name(crate::interact::DROP_KEY);
+    format!("{key} drop{SEP}Shift+{key} drop stack")
 }
 
 /// "golden pickaxe" -> "Golden Pickaxe".
@@ -2365,12 +2432,27 @@ pub(crate) fn duration_text(secs: u64) -> String {
     }
 }
 
-/// Tooltip line 3: what the item is, by kind.
+/// Tooltip line 3: what the item is, by kind; `· Farmable` when it has a seed form.
 pub(crate) fn kind_line(def: &ItemDef, worn: bool) -> Option<String> {
+    let line = kind_text(def, worn)?;
+    Some(match seed_of(def.id) {
+        Some(_) => format!("{line}{SEP}Farmable"),
+        None => line,
+    })
+}
+
+fn kind_text(def: &ItemDef, worn: bool) -> Option<String> {
     Some(match def.kind {
-        _ if def.id == WORKBENCH => format!("Block{SEP}wrench it to craft"),
+        _ if def.id == LADDER => format!("Ladder{SEP}climb with W / S"),
+        _ if def.id == WORKBENCH => {
+            format!(
+                "Crafting station{SEP}press {} nearby",
+                key_name(CRAFT_PANEL_KEY)
+            )
+        }
         ItemKind::Seed => format!(
-            "Plant on soil{SEP}grows in {}",
+            "Grows: {}{SEP}{}",
+            title_case(game_shared::items::seed_parent(def.id).map_or("?", item_name)),
             duration_text(grow_seconds(def.rarity))
         ),
         ItemKind::Block => match def.hits {
@@ -2410,7 +2492,10 @@ fn top_label(button: TopButton) -> String {
         TopButton::Store => format!("Store ({})", key_name(STORE_KEY)),
         TopButton::Inventory => format!("Inventory ({})", key_name(INVENTORY_KEYS[0])),
         TopButton::Wardrobe => "Wardrobe".to_string(),
+        TopButton::Craft => format!("Craft ({})", key_name(CRAFT_PANEL_KEY)),
         TopButton::Chat => format!("Chat ({})", key_name(CHAT_KEY)),
+        TopButton::Almanac => format!("Almanac ({})", key_name(crate::almanac::ALMANAC_KEY)),
+        TopButton::World => format!("Worlds ({})", key_name(crate::world_select::WORLD_KEY)),
         TopButton::Voice => format!("Voice ({})", key_name(VOICE_KEY)),
         TopButton::Settings => "Settings".to_string(),
     }
@@ -2578,6 +2663,9 @@ fn spawn_tip_lines(tip: &mut ChildSpawnerCommands, assets: &AssetServer, content
     if let Some(kind) = &info.kind {
         tip.spawn((ink(kind.clone()), tip_part()));
     }
+    if let Some(hint) = &info.hint {
+        tip.spawn((ink(hint.clone()), tip_part()));
+    }
     if let Some((price, affordable)) = info.price {
         let colour = if affordable {
             INK_COLOR
@@ -2672,6 +2760,10 @@ fn refresh_item_info(
                 row.spawn(label(STRIP_SEP));
                 row.spawn(label(kind.clone()));
             }
+            if let Some(hint) = &info.hint {
+                row.spawn(label(STRIP_SEP));
+                row.spawn(label(hint.clone()));
+            }
         });
     *shown = Some(view);
 }
@@ -2692,6 +2784,24 @@ fn toast_for_event(event: &Event) -> Option<String> {
             recipe(number).map(|r| format!("Crafted {}", item_name(r.output.0)))
         }
         _ => None,
+    }
+}
+
+/// The one-time ladder hint (docs/knowledge/ux/ladders.md).
+const LADDER_TIP: &str = "W / S to climb · Space to jump off";
+
+/// Once ever (`Settings::ladder_tip_seen`): the first time the local player is on a ladder tile
+/// (read from the mirrored world), the message line says how to climb.
+fn ladder_tip(game: Res<Game>, mut settings: ResMut<Settings>, mut notices: MessageWriter<Notice>) {
+    if settings.ladder_tip_seen {
+        return;
+    }
+    if game
+        .me()
+        .is_some_and(|me| game_shared::physics::on_ladder(&game.0.world, me.body.pos))
+    {
+        settings.ladder_tip_seen = true;
+        notices.write(Notice(LADDER_TIP.to_string()));
     }
 }
 
@@ -2741,17 +2851,41 @@ pub(crate) fn silent_reject(reject: Reject) -> bool {
 
 /// Whether a refusal text may show at `now`: not the same text as the last one within
 /// `REJECT_REPEAT_SECS`.
-fn may_repeat(last: Option<(&'static str, f32)>, text: &str, now: f32) -> bool {
+fn may_repeat(last: Option<(&str, f32)>, text: &str, now: f32) -> bool {
     last.is_none_or(|(shown, at)| shown != text || now >= at + REJECT_REPEAT_SECS)
+}
+
+/// A non-seed item placed on a sapling or tree (refused `Occupied`): how splicing works instead.
+/// `tree_at` says whether a tile holds one (the mirrored world).
+fn splice_hint(
+    action: &Action,
+    reject: Reject,
+    tree_at: impl Fn(u32, u32) -> bool,
+) -> Option<String> {
+    let Action::Place { x, y, item: placed } = *action else {
+        return None;
+    };
+    let seed = item(placed).is_some_and(|def| def.kind == ItemKind::Seed);
+    if reject != Reject::Occupied || seed || !tree_at(x, y) {
+        return None;
+    }
+    Some(match seed_of(placed).and(item(placed)) {
+        Some(def) => format!(
+            "To splice, use a seed (e.g. {} seed) on the sapling",
+            title_case(def.name)
+        ),
+        None => "To splice, use a seed on the sapling".to_string(),
+    })
 }
 
 fn show_toasts(
     time: Res<Time>,
+    game: Res<Game>,
     mut events: MessageReader<GameEvent>,
     mut results: MessageReader<ActionResult>,
     mut notices: MessageReader<Notice>,
     toast: Single<(&mut Text, &mut Toast)>,
-    mut last_reject: Local<Option<(&'static str, f32)>>,
+    mut last_reject: Local<Option<(String, f32)>>,
 ) {
     let (mut text, mut toast) = toast.into_inner();
     let now = time.elapsed_secs();
@@ -2766,11 +2900,18 @@ fn show_toasts(
             // The catch-all: logged so it can get a real message later.
             warn!("{action:?} rejected: {reject:?}");
         }
-        if let Some(message) = toast_for_reject(action, reject)
-            && may_repeat(*last_reject, message, now)
+        let tree_at = |x, y| game.0.world.tree(x, y).is_some();
+        let message = splice_hint(action, reject, tree_at)
+            .or_else(|| toast_for_reject(action, reject).map(String::from));
+        if let Some(message) = message
+            && may_repeat(
+                last_reject.as_ref().map(|(t, at)| (t.as_str(), *at)),
+                &message,
+                now,
+            )
         {
-            *last_reject = Some((message, now));
-            from_rejects.push(message.to_string());
+            *last_reject = Some((message.clone(), now));
+            from_rejects.push(message);
         }
     }
     let from_notices = notices.read().map(|Notice(text)| text.clone());
@@ -3071,6 +3212,36 @@ mod tests {
     }
 
     #[test]
+    fn a_block_on_a_sapling_explains_splicing() {
+        let on = |item| Action::Place { x: 3, y: 4, item };
+        let tree = |x, y| (x, y) == (3, 4);
+        assert!(seed_of(DIRT).is_some());
+        assert_eq!(
+            splice_hint(&on(DIRT), Reject::Occupied, tree).as_deref(),
+            Some("To splice, use a seed (e.g. Dirt seed) on the sapling")
+        );
+        assert!(seed_of(WORKBENCH).is_none());
+        assert_eq!(
+            splice_hint(&on(WORKBENCH), Reject::Occupied, tree).as_deref(),
+            Some("To splice, use a seed on the sapling")
+        );
+        let no_tree = |_, _| false;
+        assert_eq!(
+            splice_hint(&on(DIRT), Reject::Occupied, no_tree),
+            None,
+            "a full tile: silent"
+        );
+        assert_eq!(toast_for_reject(&on(DIRT), Reject::Occupied), None);
+        let seed = seed_of(DIRT).unwrap();
+        assert_eq!(
+            splice_hint(&on(seed), Reject::Occupied, tree),
+            None,
+            "a seed has its own text"
+        );
+        assert_eq!(splice_hint(&on(DIRT), Reject::NoItem, tree), None);
+    }
+
+    #[test]
     fn the_same_refusal_waits_two_seconds() {
         assert!(may_repeat(None, "a", 0.0));
         assert!(!may_repeat(Some(("a", 1.0)), "a", 2.9));
@@ -3090,6 +3261,15 @@ mod tests {
         assert_eq!(CONFIRM_PRICE, 1000);
     }
 
+    /// `" · Farmable"` for an item with a seed form.
+    fn farmable(id: ItemId) -> &'static str {
+        if seed_of(id).is_some() {
+            " · Farmable"
+        } else {
+            ""
+        }
+    }
+
     #[test]
     fn the_tooltip_says_name_mods_and_what_it_is() {
         let find = |kind: ItemKind| ITEMS.iter().find(|d| d.kind == kind).unwrap();
@@ -3098,8 +3278,15 @@ mod tests {
         let info = item_info(DIRT, 5, false, None).unwrap();
         assert_eq!(info.title, "Dirt ×5");
         assert!(info.mods.is_empty());
-        assert_eq!(info.kind, Some(format!("Block · {} punches", dirt.hits)));
+        assert_eq!(
+            info.kind,
+            Some(format!("Block · {} punches{}", dirt.hits, farmable(DIRT)))
+        );
         assert_eq!(info.price, None);
+        assert_eq!(info.hint.as_deref(), Some("Q drop · Shift+Q drop stack"));
+        // The fist and the wrench never leave: no hint.
+        assert_eq!(item_info(FIST, 1, false, None).unwrap().hint, None);
+        assert_eq!(item_info(WRENCH, 1, false, None).unwrap().hint, None);
         assert_eq!(item_info(DIRT, 1, false, None).unwrap().title, "Dirt");
         // Workbench, tools, background, resource, claim.
         assert_eq!(
@@ -3107,7 +3294,11 @@ mod tests {
                 .unwrap()
                 .kind
                 .as_deref(),
-            Some("Block · wrench it to craft")
+            Some(format!("Crafting station · press C nearby{}", farmable(WORKBENCH)).as_str())
+        );
+        assert_eq!(
+            item_info(LADDER, 1, false, None).unwrap().kind.as_deref(),
+            Some(format!("Ladder · climb with W / S{}", farmable(LADDER)).as_str())
         );
         assert_eq!(
             item_info(WRENCH, 1, false, None).unwrap().kind.as_deref(),
@@ -3118,15 +3309,18 @@ mod tests {
             Some("Punch blocks, harvest trees")
         );
         let wall = find(ItemKind::Background);
-        assert_eq!(kind_line(wall, false).as_deref(), Some("Background"));
+        assert_eq!(
+            kind_line(wall, false),
+            Some(format!("Background{}", farmable(wall.id)))
+        );
         // No resource item yet: a made-up one.
         let resource = ItemDef {
             kind: ItemKind::Resource,
             ..*dirt
         };
         assert_eq!(
-            kind_line(&resource, false).as_deref(),
-            Some("Used in crafting")
+            kind_line(&resource, false),
+            Some(format!("Used in crafting{}", farmable(DIRT)))
         );
         let small = &CLAIMS[0];
         assert_eq!(
@@ -3136,14 +3330,15 @@ mod tests {
                 mods: Vec::new(),
                 kind: Some(claim_coverage(small.tiles)),
                 price: Some((small.price, true)),
+                hint: None,
             }
         );
-        // Seed: its grow time.
-        let seed = find(ItemKind::Seed);
+        // Seed: what it grows and how long (farming: docs/knowledge/ux/vfx-farming-punch.md §d).
+        let seed = item(seed_of(DIRT).unwrap()).unwrap();
         assert_eq!(
             kind_line(seed, false),
             Some(format!(
-                "Plant on soil · grows in {}",
+                "Grows: Dirt · {}",
                 duration_text(grow_seconds(seed.rarity))
             ))
         );
@@ -3176,7 +3371,10 @@ mod tests {
         assert_eq!(top_label(TopButton::Store), "Store (B)");
         assert_eq!(top_label(TopButton::Inventory), "Inventory (E)");
         assert_eq!(top_label(TopButton::Wardrobe), "Wardrobe");
+        assert_eq!(top_label(TopButton::Craft), "Craft (C)");
         assert_eq!(top_label(TopButton::Chat), "Chat (Enter)");
+        assert_eq!(top_label(TopButton::Almanac), "Almanac (J)");
+        assert_eq!(top_label(TopButton::World), "Worlds (M)");
         assert_eq!(top_label(TopButton::Voice), "Voice (N)");
         assert_eq!(top_label(TopButton::Settings), "Settings");
         assert_eq!(key_name(KeyCode::KeyC), "C");

@@ -4,7 +4,8 @@
 //! `Hello` with `Auth::Login` / `Auth::Register` checks the account (the reply is `Welcome` or a
 //! `Kicked` reason shown in the panel). `Welcome` carries a signed 15-minute token; the connection
 //! closes, the game starts as a new process with `GAME_AUTH_TOKEN` set (so its plugins start online
-//! exactly as with that env variable), and the lobby exits. Offline and dev runs (`GAME_TOKEN` /
+//! exactly as with that env variable), and the lobby exits. Between the two, a World step picks the
+//! world (typed, a recent one, or `Continue` to the last) and passes it as `GAME_WORLD`. Offline and dev runs (`GAME_TOKEN` /
 //! `GAME_USER` set) never see it. ponytail: the window closes and a new one opens; move the game
 //! behind an `AppState` if that flash matters.
 
@@ -19,14 +20,21 @@ use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
 use game_protocol::{
     Auth, ClientMsg, MAX_SERVER_MSG, PROTOCOL_VERSION, SERVER_NAME, ServerMsg, read_msg,
-    valid_name, valid_password, write_msg,
+    valid_name, valid_password, world_name_allowed, write_msg,
 };
 
 use crate::hud::{INK_COLOR, sliced};
+use game_shared::worldgen::MAX_WORLD_NAME_LEN;
+
 use crate::net::{AUTH_TOKEN_ENV, PASSWORD_ENV, USER_ENV};
 
 /// How long one login attempt may take.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// The world the game joins (net.rs); set from the World step.
+const WORLD_ENV: &str = "GAME_WORLD";
+/// Where a player with no recent worlds goes (net.rs's default).
+const HUB_WORLD: &str = "START";
+const NOT_ALLOWED: &str = "That name isn't allowed. Use 1-24 letters or digits";
 /// The remembered name, in the settings folder.
 const REMEMBER_FILE: &str = "lobby_name.txt";
 
@@ -73,14 +81,27 @@ pub fn run(plugins: impl PluginGroup) {
 /// Starts the game as a new process with the token. It must start before the lobby exits:
 /// on macOS winit ends the whole process when its event loop stops, so nothing after
 /// `app.run()` would run.
-fn start_game(token: &str) -> std::io::Result<()> {
+fn start_game(token: &str, world: &str) -> std::io::Result<()> {
     std::process::Command::new(std::env::current_exe()?)
         .args(std::env::args_os().skip(1))
         .env_remove(USER_ENV)
         .env_remove(PASSWORD_ENV)
         .env(AUTH_TOKEN_ENV, token)
+        .env(WORLD_ENV, world)
         .spawn()
         .map(drop)
+}
+
+/// The world `Continue` enters: the typed name, else the last one visited, else the hub.
+fn chosen_world(typed: &str, recent: &[String]) -> String {
+    if typed.is_empty() {
+        recent
+            .first()
+            .cloned()
+            .unwrap_or_else(|| HUB_WORLD.to_string())
+    } else {
+        typed.to_string()
+    }
 }
 
 struct LobbyPlugin;
@@ -91,9 +112,13 @@ impl Plugin for LobbyPlugin {
             .and_then(|dir| std::fs::read_to_string(dir.join(REMEMBER_FILE)).ok())
             .map(|name| name.trim().to_owned())
             .unwrap_or_default();
+        let recent = crate::settings::config_dir()
+            .map(|dir| crate::settings::Settings::load_from(&dir).0.recent_worlds)
+            .unwrap_or_default();
         app.insert_resource(Form {
             remember: !name.is_empty(),
             name,
+            recent,
             ..default()
         })
         .add_systems(Startup, spawn)
@@ -106,6 +131,8 @@ enum Screen {
     #[default]
     Login,
     Register,
+    /// After a successful login: which world to enter.
+    World,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -113,6 +140,7 @@ enum Field {
     Name,
     Password,
     Confirm,
+    World,
 }
 
 impl Screen {
@@ -120,6 +148,7 @@ impl Screen {
         match self {
             Screen::Login => &[Field::Name, Field::Password],
             Screen::Register => &[Field::Name, Field::Password, Field::Confirm],
+            Screen::World => &[Field::World],
         }
     }
 }
@@ -136,6 +165,14 @@ struct Form {
     error: String,
     /// The answer of the request in flight.
     pending: Option<Mutex<Receiver<Result<String, String>>>>,
+    /// The login token, kept for the World step.
+    token: Option<String>,
+    /// The world name being typed on the World step.
+    world: String,
+    /// Recent worlds from the settings, newest first.
+    recent: Vec<String>,
+    /// A world picked on the World step; `finish` starts the game with it.
+    launch: Option<String>,
 }
 
 impl Form {
@@ -144,6 +181,7 @@ impl Form {
             Field::Name => &mut self.name,
             Field::Password => &mut self.password,
             Field::Confirm => &mut self.confirm,
+            Field::World => &mut self.world,
         }
     }
 
@@ -177,6 +215,8 @@ enum Control {
     Switch,
     Eye,
     Remember,
+    /// One of the recent worlds on the World step.
+    Recent(usize),
 }
 
 /// A button image with `_hover` / `_pressed` versions.
@@ -194,6 +234,10 @@ struct ErrorText;
 
 #[derive(Component)]
 struct RememberBox;
+
+/// The World step's main button text: `Continue: <world>` or `Go`.
+#[derive(Component)]
+struct SubmitLabel;
 
 fn spawn(mut commands: Commands, assets: Res<AssetServer>, form: Res<Form>) {
     let font = assets.load(FONT);
@@ -228,7 +272,7 @@ fn spawn(mut commands: Commands, assets: Res<AssetServer>, form: Res<Form>) {
                 TextColor(LOGO_COLOR),
                 TextShadow::default(),
             ));
-            for screen in [Screen::Login, Screen::Register] {
+            for screen in [Screen::Login, Screen::Register, Screen::World] {
                 let panel = Node {
                     width: px(WIDTH),
                     padding: UiRect::all(px(32)),
@@ -251,6 +295,7 @@ fn spawn(mut commands: Commands, assets: Res<AssetServer>, form: Res<Form>) {
                     let title = match screen {
                         Screen::Login => "Login",
                         Screen::Register => "Create Account",
+                        Screen::World => "Choose a World",
                     };
                     panel.spawn((
                         Text::new(title),
@@ -285,6 +330,40 @@ fn spawn(mut commands: Commands, assets: Res<AssetServer>, form: Res<Form>) {
                             row.spawn((Text::new("Remember me"), text(BIG), TextColor(INK_COLOR)));
                         });
                     }
+                    if screen == Screen::World && !form.recent.is_empty() {
+                        panel.spawn((Text::new("Recent"), text(SMALL), TextColor(INK_COLOR)));
+                        let row = Node {
+                            flex_wrap: FlexWrap::Wrap,
+                            column_gap: px(8),
+                            row_gap: px(8),
+                            ..default()
+                        };
+                        panel.spawn(row).with_children(|row| {
+                            for (i, world) in form.recent.iter().enumerate() {
+                                let skin = "ui/lobby/button_secondary";
+                                let node = Node {
+                                    height: px(44),
+                                    padding: UiRect::horizontal(px(14)),
+                                    justify_content: JustifyContent::Center,
+                                    align_items: AlignItems::Center,
+                                    ..default()
+                                };
+                                row.spawn((
+                                    node,
+                                    sliced(&assets, png(skin), BUTTON_INSET),
+                                    Skin(skin),
+                                    Control::Recent(i),
+                                    Hovered::default(),
+                                ))
+                                .with_child((
+                                    Text::new(world.clone()),
+                                    text(SMALL),
+                                    TextColor(Color::WHITE),
+                                    TextShadow::default(),
+                                ));
+                            }
+                        });
+                    }
                     panel.spawn((Text::new(""), text(SMALL), TextColor(ERROR), ErrorText));
                     let buttons = Node {
                         justify_content: JustifyContent::SpaceBetween,
@@ -293,32 +372,42 @@ fn spawn(mut commands: Commands, assets: Res<AssetServer>, form: Res<Form>) {
                     let (submit, switch) = match screen {
                         Screen::Login => ("Login", "Register"),
                         Screen::Register => ("Register", "Back"),
+                        Screen::World => ("Go", "Log out"),
                     };
                     panel.spawn(buttons).with_children(|row| {
                         for (label, skin, control) in [
                             (submit, "ui/lobby/button_primary", Control::Submit),
                             (switch, "ui/lobby/button_secondary", Control::Switch),
                         ] {
+                            // `Continue: <world>` can be long: the World step's main button grows.
+                            let grows = screen == Screen::World && control == Control::Submit;
                             let node = Node {
-                                width: px(BUTTON_SIZE.x),
+                                width: if grows { Val::Auto } else { px(BUTTON_SIZE.x) },
+                                min_width: px(BUTTON_SIZE.x),
                                 height: px(BUTTON_SIZE.y),
+                                padding: UiRect::horizontal(px(16)),
                                 justify_content: JustifyContent::Center,
                                 align_items: AlignItems::Center,
                                 ..default()
                             };
-                            row.spawn((
+                            let mut button = row.spawn((
                                 node,
                                 sliced(&assets, png(skin), BUTTON_INSET),
                                 Skin(skin),
                                 control,
                                 Hovered::default(),
-                            ))
-                            .with_child((
-                                Text::new(label),
-                                text(BIG),
-                                TextColor(Color::WHITE),
-                                TextShadow::default(),
                             ));
+                            button.with_children(|button| {
+                                let mut label = button.spawn((
+                                    Text::new(label),
+                                    text(BIG),
+                                    TextColor(Color::WHITE),
+                                    TextShadow::default(),
+                                ));
+                                if grows {
+                                    label.insert(SubmitLabel);
+                                }
+                            });
                         }
                     });
                 });
@@ -416,10 +505,17 @@ fn click(
         Control::Switch => {
             form.screen = match form.screen {
                 Screen::Login => Screen::Register,
-                Screen::Register => Screen::Login,
+                // Back, or Log out from the World step.
+                Screen::Register | Screen::World => Screen::Login,
             };
+            form.token = None;
             form.focus = 0;
             form.error.clear();
+        }
+        Control::Recent(i) => {
+            if let Some(world) = form.recent.get(i).cloned() {
+                form.launch = Some(world);
+            }
         }
         Control::Submit => submit(&mut commands, &assets, &mut form),
     }
@@ -445,6 +541,15 @@ fn type_keys(
             Key::Backspace => {
                 form.value(field).pop();
             }
+            _ if field == Field::World => {
+                let Some(text) = &key.text else { continue };
+                // Upper-case letters and digits only, as the server stores names.
+                for c in text.chars().filter(char::is_ascii_alphanumeric) {
+                    if form.world.len() < MAX_WORLD_NAME_LEN {
+                        form.world.push(c.to_ascii_uppercase());
+                    }
+                }
+            }
             _ => {
                 let Some(text) = &key.text else { continue };
                 let limit = if field == Field::Name {
@@ -467,6 +572,15 @@ fn submit(commands: &mut Commands, assets: &AssetServer, form: &mut Form) {
     if form.pending.is_some() {
         return;
     }
+    if form.screen == Screen::World {
+        let world = chosen_world(&form.world, &form.recent);
+        if world_name_allowed(&world) {
+            form.launch = Some(world);
+        } else {
+            refuse(commands, assets, form, NOT_ALLOWED.into());
+        }
+        return;
+    }
     if let Err(error) = form.check() {
         refuse(commands, assets, form, error.into());
         return;
@@ -475,9 +589,10 @@ fn submit(commands: &mut Commands, assets: &AssetServer, form: &mut Form) {
         return;
     };
     let (name, password) = (form.name.clone(), form.password.clone());
+    // The World step returned above.
     let auth = match form.screen {
-        Screen::Login => Auth::Login { name, password },
         Screen::Register => Auth::Register { name, password },
+        Screen::Login | Screen::World => Auth::Login { name, password },
     };
     let (tx, rx) = channel();
     std::thread::spawn(move || {
@@ -502,6 +617,21 @@ fn finish(
     mut form: ResMut<Form>,
     mut exit: MessageWriter<AppExit>,
 ) {
+    if let Some(world) = form.launch.take() {
+        let token = form.token.clone().unwrap_or_default();
+        match start_game(&token, &world) {
+            Ok(()) => {
+                exit.write(AppExit::Success);
+            }
+            Err(e) => refuse(
+                &mut commands,
+                &assets,
+                &mut form,
+                format!("Cannot start the game: {e}"),
+            ),
+        }
+        return;
+    }
     let Some(answer) = form
         .pending
         .as_ref()
@@ -520,17 +650,11 @@ fn finish(
                     std::fs::remove_file(path)
                 };
             }
-            match start_game(&token) {
-                Ok(()) => {
-                    exit.write(AppExit::Success);
-                }
-                Err(e) => refuse(
-                    &mut commands,
-                    &assets,
-                    &mut form,
-                    format!("Cannot start the game: {e}"),
-                ),
-            }
+            // The token lives 15 minutes: plenty for picking a world.
+            form.token = Some(token);
+            form.screen = Screen::World;
+            form.focus = 0;
+            form.error.clear();
         }
         Err(error) => refuse(&mut commands, &assets, &mut form, error),
     }
@@ -544,8 +668,12 @@ fn show(
     assets: Res<AssetServer>,
     mouse: Res<ButtonInput<MouseButton>>,
     mut screens: Query<(&ScreenRoot, &mut Node)>,
-    mut fields: Query<(&FieldText, &mut Text, &mut TextColor), Without<ErrorText>>,
-    mut errors: Query<&mut Text, With<ErrorText>>,
+    mut fields: Query<
+        (&FieldText, &mut Text, &mut TextColor),
+        (Without<ErrorText>, Without<SubmitLabel>),
+    >,
+    mut errors: Query<&mut Text, (With<ErrorText>, Without<SubmitLabel>)>,
+    mut submit_label: Query<&mut Text, (With<SubmitLabel>, Without<ErrorText>, Without<FieldText>)>,
     mut boxes: Query<&mut ImageNode, (With<RememberBox>, Without<Skin>)>,
     mut skins: Query<(&Skin, &Hovered, &mut ImageNode)>,
 ) {
@@ -565,11 +693,13 @@ fn show(
             Field::Password if form.show_password => form.password.clone(),
             Field::Password => "*".repeat(form.password.chars().count()),
             Field::Confirm => "*".repeat(form.confirm.chars().count()),
+            Field::World => form.world.clone(),
         };
         let placeholder = match field.0 {
             Field::Name => "Username",
             Field::Password => "Password",
             Field::Confirm => "Confirm Password",
+            Field::World => "Enter world name",
         };
         let shown = match (value.is_empty(), field.0 == focused && caret) {
             (true, false) => placeholder.to_owned(),
@@ -584,6 +714,16 @@ fn show(
         };
         if text.0 != shown {
             text.0 = shown;
+        }
+    }
+    let go = if form.world.is_empty() {
+        format!("Continue: {}", chosen_world("", &form.recent))
+    } else {
+        "Go".to_string()
+    };
+    for mut text in &mut submit_label {
+        if text.0 != go {
+            text.0.clone_from(&go);
         }
     }
     for mut text in &mut errors {
@@ -660,6 +800,14 @@ fn check_account(server: &str, auth: Auth) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continue_goes_to_the_typed_then_last_then_hub_world() {
+        let recent = vec!["MYFARM".to_string(), "START".to_string()];
+        assert_eq!(chosen_world("", &recent), "MYFARM");
+        assert_eq!(chosen_world("NEWONE", &recent), "NEWONE");
+        assert_eq!(chosen_world("", &[]), HUB_WORLD);
+    }
 
     #[test]
     fn form_checks_before_sending() {

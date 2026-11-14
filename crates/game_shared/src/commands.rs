@@ -134,7 +134,24 @@ pub enum Command {
         who: Target,
         reason: String,
     },
+    /// Owner only: regenerate a world, returning its claims (docs/knowledge/ux/reset-world.md).
+    ResetWorld(Reset),
 }
+
+/// The steps of `/resetworld`: prepare, then confirm within `RESET_CONFIRM_SECS`, or cancel.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Reset {
+    /// `world`: upper-case, `None` = the caller's world. `seed`: `None` = the world's own.
+    Prepare {
+        world: Option<String>,
+        seed: Option<u64>,
+    },
+    Confirm,
+    Cancel,
+}
+
+/// Seconds a prepared `/resetworld` waits for its confirm.
+pub const RESET_CONFIRM_SECS: f64 = 15.0;
 
 /// A world-changing admin command with its players resolved: what `rules::apply_admin` takes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -230,6 +247,7 @@ impl Command {
             Command::ClearBlock { .. } => "clearblock",
             Command::GiveAll { .. } => "giveall",
             Command::ClearInv { .. } => "clearinv",
+            Command::ResetWorld(_) => "resetworld",
         }
     }
 }
@@ -376,6 +394,12 @@ pub const COMMANDS: &[Spec] = &[
         "clearinv",
         "/clearinv <player> <reason>",
         "Remove every item but the fist and wrench",
+        OWNER,
+    ),
+    spec(
+        "resetworld",
+        "/resetworld [world] [seed=n] | confirm | cancel",
+        "Regenerate a world; claims go back to their owners",
         OWNER,
     ),
 ];
@@ -627,6 +651,19 @@ pub fn parse(line: &str) -> Result<Command, ParseError> {
             Command::ClearBlock { x, y }
         }
         ("giveall", [who]) => Command::GiveAll { who: target(who) },
+        ("resetworld", ["confirm"]) => Command::ResetWorld(Reset::Confirm),
+        ("resetworld", ["cancel"]) => Command::ResetWorld(Reset::Cancel),
+        ("resetworld", words) if words.len() <= 2 => {
+            let (mut world, mut seed) = (None, None);
+            for word in words {
+                match word.strip_prefix("seed=") {
+                    Some(n) if seed.is_none() => seed = Some(n.parse().map_err(|_| usage.clone())?),
+                    None if world.is_none() => world = Some(word.to_ascii_uppercase()),
+                    _ => return Err(usage),
+                }
+            }
+            Command::ResetWorld(Reset::Prepare { world, seed })
+        }
         ("clearinv", [who, words @ ..]) => Command::ClearInv {
             who: target(who),
             reason: reason(words).ok_or(usage)?,
@@ -861,6 +898,22 @@ mod tests {
                 },
             ),
             ("/clearblock 3 4", Command::ClearBlock { x: 3, y: 4 }),
+            (
+                "/resetworld",
+                Command::ResetWorld(Reset::Prepare {
+                    world: None,
+                    seed: None,
+                }),
+            ),
+            (
+                "/resetworld start seed=7",
+                Command::ResetWorld(Reset::Prepare {
+                    world: Some("START".into()),
+                    seed: Some(7),
+                }),
+            ),
+            ("/resetworld confirm", Command::ResetWorld(Reset::Confirm)),
+            ("/resetworld cancel", Command::ResetWorld(Reset::Cancel)),
         ];
         for (line, expected) in cases {
             assert_eq!(parse(line), Ok(expected), "{line}");
@@ -951,6 +1004,7 @@ mod tests {
             ("/clearblock 1 1", ADMIN),
             ("/giveall a", OWNER),
             ("/clearinv a why", OWNER),
+            ("/resetworld", OWNER),
         ];
         assert_eq!(cases.len(), COMMANDS.len());
         for (line, needs) in cases {

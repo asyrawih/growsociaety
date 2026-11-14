@@ -24,7 +24,7 @@ cargo build -p game_client   # default features (voice on); never `--features de
 app=dist/Growsociety.app/Contents
 rm -rf dist/Growsociety.app
 mkdir -p "$app/MacOS" "$app/Resources"
-cp target/debug/game_client "$app/MacOS/"
+cp "${CARGO_TARGET_DIR:-target}/debug/game_client" "$app/MacOS/"
 cp -R assets "$app/Resources/"
 cp assets/icon/icon.icns "$app/Resources/icon.icns"
 cat > "$app/Info.plist" <<PLIST

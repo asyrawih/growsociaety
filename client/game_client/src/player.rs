@@ -8,12 +8,12 @@ use bevy::render::render_resource::TextureFormat;
 use bevy::sprite::{Anchor, Text2dShadow};
 use bevy::text::TextLayoutInfo;
 use game_shared::items::{SLOT_COUNT, item};
-use game_shared::physics::{Body, HITBOX_HEIGHT, Input, TICK_RATE, step_with};
-use game_shared::rules::{Action, PUNCH_COOLDOWN, PlayerId, collect_drops};
+use game_shared::physics::{Body, HITBOX_HEIGHT, Input, TICK_RATE, on_ladder, step_with};
+use game_shared::rules::{Action, PlayerId, collect_drops};
 use game_shared::tile_to_world;
 
 use crate::net::Net;
-use crate::state::{ActionResult, Game, GameEvent, Phase};
+use crate::state::{ActionMsg, Game, GameEvent, Phase};
 use crate::world_view::Z_PLAYER;
 use rig::{CANVAS, FEET_Y, Motion, Part, Slot};
 
@@ -21,8 +21,6 @@ use rig::{CANVAS, FEET_Y, Motion, Part, Slot};
 const SPRITE_OFFSET_Y: f32 = CANVAS / 2.0 - (CANVAS - FEET_Y) - HITBOX_HEIGHT / 2.0;
 /// Px/s. Slower than this on the ground counts as standing still.
 const IDLE_SPEED: f32 = 5.0;
-/// A swing lasts one punch interval, so holding the button loops it.
-const SWING_SECS: f32 = PUNCH_COOLDOWN as f32;
 /// Z step between body parts; item layers sit between a part and the next one.
 const PART_Z: f32 = 0.01;
 const ITEM_Z: f32 = 0.001;
@@ -43,8 +41,8 @@ pub struct Player {
     /// Interpolated hitbox centre, world px. What the camera follows.
     pub position: Vec2,
     pub facing_west: bool,
-    /// When the swing being played started (`Time::elapsed_secs`).
-    swing: Option<f32>,
+    /// The front arm reaching out to a tile (punch or place), started on input.
+    reach: Option<rig::Reach>,
 }
 
 /// What a rig wears: one `assets/items` folder name per slot (index = `Slot as usize`), copied
@@ -112,7 +110,25 @@ struct RemotePlayer {
     /// Smoothed towards the latest server body, world px.
     position: Vec2,
     facing_west: bool,
+    /// Their front arm reaching out, from the server's `Swing`.
+    reach: Option<rig::Reach>,
 }
+
+/// A rig's front arm is fully out at tile `(x, y)`: the moment of contact. Hit particles
+/// (`vfx.rs`) can spawn on it so they line up with the fist; `player` is whose arm it is.
+#[derive(Message, Clone, Copy, Debug, PartialEq)]
+pub struct ArmContact {
+    pub player: PlayerId,
+    pub x: u32,
+    pub y: u32,
+    pub place: bool,
+}
+
+/// The skin-coloured strip from the shoulder to the reached-out arm, child of the rig root.
+#[derive(Component)]
+struct ArmFill;
+/// Px.
+const ARM_FILL_WIDTH: f32 = 3.0;
 
 /// Per second, like the camera: `pos += (target - pos) * (1 - exp(-REMOTE_STIFFNESS * dt))`.
 const REMOTE_STIFFNESS: f32 = 15.0;
@@ -123,8 +139,9 @@ struct RigPart(Part);
 
 /// This frame's pose of a rig, on its root: per part (rotation, dy) and the wing flap.
 /// `pose_parts` moves the parts and wings to it.
+/// The third field is how far (px) the front arm is pushed out along itself (`rig::Reach`).
 #[derive(Component, Default)]
-struct RigPose([(f32, f32); 6], f32);
+struct RigPose([(f32, f32); 6], f32, f32);
 
 /// Body layers as loaded (light skin) and the recoloured copies the sprites draw, indexed like `Part::ALL`.
 /// Other views (e.g. the wardrobe preview) draw `skinned` to show the local player's skin tone.
@@ -138,9 +155,13 @@ pub struct RigImages {
     name_font: Handle<Font>,
 }
 
-/// A jump press seen in `Update`, kept until exactly one fixed tick has consumed it.
+/// Jump presses seen in `Update`, kept until exactly one fixed tick has consumed them: Space, and
+/// W / ↑ (a jump only off a ladder; on one they climb).
 #[derive(Resource, Default)]
-struct JumpPressed(bool);
+struct JumpPressed {
+    space: bool,
+    up_key: bool,
+}
 
 pub struct PlayerPlugin;
 
@@ -148,6 +169,7 @@ impl Plugin for PlayerPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(Time::<Fixed>::from_hz(f64::from(TICK_RATE)))
             .init_resource::<JumpPressed>()
+            .add_message::<ArmContact>()
             .add_systems(Startup, spawn_player)
             .add_systems(FixedUpdate, tick_player)
             .init_resource::<HomeHold>()
@@ -156,7 +178,7 @@ impl Plugin for PlayerPlugin {
             .add_systems(
                 Update,
                 (
-                    start_swing,
+                    start_reach,
                     sync_remotes,
                     follow_equipment,
                     dress_rig,
@@ -174,7 +196,9 @@ impl Plugin for PlayerPlugin {
     }
 }
 
-const JUMP_KEYS: [KeyCode; 3] = [KeyCode::Space, KeyCode::KeyW, KeyCode::ArrowUp];
+const JUMP_KEY: KeyCode = KeyCode::Space;
+/// Climb up a ladder; off a ladder they jump too (docs/knowledge/ux/ladders.md).
+const UP_KEYS: [KeyCode; 2] = [KeyCode::KeyW, KeyCode::ArrowUp];
 /// Hold to go home (docs/knowledge/ux/respawn.md).
 const HOME_KEY: KeyCode = KeyCode::KeyR;
 /// Seconds `HOME_KEY` must be held.
@@ -189,7 +213,7 @@ pub struct HomeHold(pub f32);
 #[derive(Resource, Default)]
 pub struct HomeCooldown(pub f32);
 
-/// Drop through one-way platforms (docs/knowledge/ux/platforms.md).
+/// Drop through one-way platforms (docs/knowledge/ux/platforms.md); climb down a ladder.
 const DOWN_KEYS: [KeyCode; 2] = [KeyCode::KeyS, KeyCode::ArrowDown];
 const LEFT_KEYS: [KeyCode; 2] = [KeyCode::KeyA, KeyCode::ArrowLeft];
 const RIGHT_KEYS: [KeyCode; 2] = [KeyCode::KeyD, KeyCode::ArrowRight];
@@ -218,7 +242,7 @@ pub fn spawn_player(
         previous: me.body,
         position,
         facing_west: false,
-        swing: None,
+        reach: None,
     };
     spawn_rig(&mut commands, &rig, position, (player, Look::default()));
     commands.insert_resource(rig);
@@ -261,6 +285,15 @@ fn spawn_rig(commands: &mut Commands, rig: &RigImages, position: Vec2, root: imp
                     Transform::from_translation(pivot_offset(part).extend(i as f32 * PART_Z)),
                 ));
             }
+            // Just under the front arm, over everything of the part below it.
+            let z = arm_front_index() as f32 * PART_Z - ITEM_Z;
+            root.spawn((
+                ArmFill,
+                Sprite::from_color(Color::WHITE, Vec2::ZERO),
+                Anchor::TOP_CENTER,
+                Transform::from_translation(pivot_offset(Part::ArmFront).extend(z)),
+                Visibility::Hidden,
+            ));
         });
 }
 
@@ -288,6 +321,7 @@ fn sync_remotes(
             id: player.id,
             position,
             facing_west: false,
+            reach: None,
         };
         spawn_rig(&mut commands, &rig, position, (remote, Look::default()));
     }
@@ -346,7 +380,8 @@ fn hold_home(
 }
 
 fn latch_jump(keys: Res<ButtonInput<KeyCode>>, mut jump: ResMut<JumpPressed>) {
-    jump.0 |= keys.any_just_pressed(JUMP_KEYS);
+    jump.space |= keys.just_pressed(JUMP_KEY);
+    jump.up_key |= keys.any_just_pressed(UP_KEYS);
 }
 
 /// One simulation tick: step the body, then pick up whatever it now touches. Online the step is a
@@ -360,20 +395,25 @@ fn tick_player(
     mut player: Single<&mut Player>,
     mut events: MessageWriter<GameEvent>,
 ) {
-    let input = Input {
-        move_x: i8::from(keys.any_pressed(RIGHT_KEYS)) - i8::from(keys.any_pressed(LEFT_KEYS)),
-        jump_held: keys.any_pressed(JUMP_KEYS),
-        jump_pressed: std::mem::take(&mut jump.0),
-        down: keys.any_pressed(DOWN_KEYS),
-    };
-    if input.move_x != 0 {
-        player.facing_west = input.move_x < 0;
-    }
     let id = game.1;
     let state = &mut game.0;
     let Some(me) = state.players.get_mut(&id) else {
         return;
     };
+    let pressed = std::mem::take(&mut *jump);
+    // On a ladder W / ↑ climb and only Space jumps; elsewhere W / ↑ jump as before.
+    let ladder = me.body.climbing || on_ladder(&state.world, me.body.pos);
+    let up = keys.any_pressed(UP_KEYS);
+    let input = Input {
+        move_x: i8::from(keys.any_pressed(RIGHT_KEYS)) - i8::from(keys.any_pressed(LEFT_KEYS)),
+        jump_held: keys.pressed(JUMP_KEY) || (up && !ladder),
+        jump_pressed: pressed.space || (pressed.up_key && !ladder),
+        down: keys.any_pressed(DOWN_KEYS),
+        up,
+    };
+    if input.move_x != 0 {
+        player.facing_west = input.move_x < 0;
+    }
     player.previous = me.body;
     // The same worn mods the server steps with, so the prediction matches.
     let mods = game_shared::mods::worn_mods(&me.equipped);
@@ -400,23 +440,120 @@ fn tick_player(
     }
 }
 
-/// An accepted punch (hit or miss) starts a swing and turns the player towards the target tile.
-fn start_swing(
-    time: Res<Time>,
-    game: Res<Game>,
-    mut results: MessageReader<ActionResult>,
-    mut player: Single<&mut Player>,
+fn arm_front_index() -> usize {
+    Part::ALL
+        .iter()
+        .position(|&p| p == Part::ArmFront)
+        .unwrap_or(0)
+}
+
+/// The shoulder in world px for a rig drawn at `position` (hitbox centre).
+fn shoulder(position: Vec2, facing_west: bool) -> [f32; 2] {
+    let side = if facing_west { -1.0 } else { 1.0 };
+    let pivot = pivot_offset(Part::ArmFront);
+    let root = position + Vec2::Y * SPRITE_OFFSET_Y;
+    [root.x + side * pivot.x, root.y + pivot.y]
+}
+
+/// The tile a punch or place swings at, and whether it is a place.
+fn swing_target(action: Action) -> Option<(u32, u32, bool)> {
+    match action {
+        Action::Punch { x, y } => Some((x, y, false)),
+        Action::Place { x, y, .. } => Some((x, y, true)),
+        _ => None,
+    }
+}
+
+/// Starts a reach-out: turn towards the tile first, then the arm goes out from wherever it is.
+fn reach_towards(
+    reach: &mut Option<rig::Reach>,
+    facing_west: &mut bool,
+    position: Vec2,
+    (x, y, place): (u32, u32, bool),
+    now: f32,
 ) {
-    for result in results.read() {
-        let (Action::Punch { x, y }, Ok(_)) = (result.action, &result.result) else {
-            continue;
-        };
-        player.swing = Some(time.elapsed_secs());
-        let target_x = tile_to_world(x, y).0;
-        if let Some(me) = game.me()
-            && target_x != me.body.pos.0
-        {
-            player.facing_west = target_x < me.body.pos.0;
+    let target = tile_to_world(x, y);
+    if target.0 != position.x {
+        *facing_west = target.0 < position.x;
+    }
+    let from = reach.and_then(|r| r.length_at(now)).unwrap_or(rig::ARM_LEN);
+    *reach = Some(rig::Reach::new(
+        now,
+        from,
+        shoulder(position, *facing_west),
+        [target.0, target.1],
+        (x, y),
+        place,
+        *facing_west,
+    ));
+}
+
+/// Every punch or place reaches out: the local player's on input (prediction, refused or
+/// not), other players' from the server's `Swing`.
+fn start_reach(
+    time: Res<Time>,
+    net: Option<ResMut<Net>>,
+    mut actions: MessageReader<ActionMsg>,
+    mut player: Single<&mut Player>,
+    mut remotes: Query<&mut RemotePlayer>,
+) {
+    let now = time.elapsed_secs();
+    let player: &mut Player = &mut player;
+    for &ActionMsg(action) in actions.read() {
+        if let Some(target) = swing_target(action) {
+            let position = player.position;
+            reach_towards(
+                &mut player.reach,
+                &mut player.facing_west,
+                position,
+                target,
+                now,
+            );
+        }
+    }
+    let Some(mut net) = net else { return };
+    for (id, x, y, place) in net.take_swings() {
+        if let Some(mut remote) = remotes.iter_mut().find(|remote| remote.id == id) {
+            let remote = &mut *remote;
+            let position = remote.position;
+            reach_towards(
+                &mut remote.reach,
+                &mut remote.facing_west,
+                position,
+                (x, y, place),
+                now,
+            );
+        }
+    }
+}
+
+/// The reach at `now`: (px the arm is pushed out, its angle). Sends `ArmContact` once at full
+/// extension and clears the reach when the arm is back.
+fn reach_now(
+    reach: &mut Option<rig::Reach>,
+    now: f32,
+    player: PlayerId,
+    contacts: &mut MessageWriter<ArmContact>,
+) -> (f32, Option<f32>) {
+    let Some(current) = reach.as_mut() else {
+        return (0.0, None);
+    };
+    if !current.contacted && now >= current.contact() {
+        current.contacted = true;
+        let (x, y) = current.tile;
+        let place = current.place;
+        contacts.write(ArmContact {
+            player,
+            x,
+            y,
+            place,
+        });
+    }
+    match current.length_at(now) {
+        Some(length) => ((length - rig::ARM_LEN).max(0.0), Some(current.angle)),
+        None => {
+            *reach = None;
+            (0.0, None)
         }
     }
 }
@@ -546,7 +683,11 @@ fn skin_rig(
 }
 
 fn motion(body: &Body) -> Motion {
-    if !body.on_ground {
+    if body.climbing {
+        Motion::Climb {
+            moving: body.vel != (0.0, 0.0),
+        }
+    } else if !body.on_ground {
         Motion::Air
     } else if body.vel.0.abs() < IDLE_SPEED {
         Motion::Idle
@@ -560,6 +701,7 @@ fn draw_player(
     fixed: Res<Time<Fixed>>,
     game: Res<Game>,
     player: Single<(&mut Player, &mut Transform, &mut RigPose)>,
+    mut contacts: MessageWriter<ArmContact>,
 ) {
     let Some(me) = game.me() else { return };
     let (mut player, mut transform, mut pose) = player.into_inner();
@@ -567,13 +709,7 @@ fn draw_player(
     player.position = from.lerp(to, fixed.overstep_fraction());
 
     let now = time.elapsed_secs();
-    let swing = player
-        .swing
-        .map(|started| (now - started) / SWING_SECS)
-        .filter(|&progress| progress < 1.0);
-    if swing.is_none() {
-        player.swing = None;
-    }
+    let (pushed, angle) = reach_now(&mut player.reach, now, game.1, &mut contacts);
 
     // The layers face east; mirroring the root mirrors every part and its rotation.
     let side = if player.facing_west { -1.0 } else { 1.0 };
@@ -581,13 +717,18 @@ fn draw_player(
     transform.scale.x = side;
 
     let motion = motion(&me.body);
-    *pose = RigPose(rig::pose(motion, now, swing), rig::flap(motion, now));
+    let mut parts = rig::pose(motion, now, None);
+    if let Some(angle) = angle {
+        parts[arm_front_index()].0 = angle;
+    }
+    *pose = RigPose(parts, rig::flap(motion, now), pushed);
 }
 
 fn draw_remotes(
     time: Res<Time>,
     game: Res<Game>,
     mut remotes: Query<(&mut RemotePlayer, &mut Transform, &mut RigPose)>,
+    mut contacts: MessageWriter<ArmContact>,
 ) {
     let blend = 1.0 - (-REMOTE_STIFFNESS * time.delta_secs()).exp();
     for (mut remote, mut transform, mut pose) in &mut remotes {
@@ -598,15 +739,21 @@ fn draw_remotes(
         let target = Vec2::from(body.pos);
         let position = remote.position;
         remote.position = position + (target - position) * blend;
-        if body.vel.0.abs() >= IDLE_SPEED {
+        // While reaching out they keep facing the tile.
+        if body.vel.0.abs() >= IDLE_SPEED && remote.reach.is_none() {
             remote.facing_west = body.vel.0 < 0.0;
         }
         let side = if remote.facing_west { -1.0 } else { 1.0 };
         transform.translation = (remote.position + Vec2::Y * SPRITE_OFFSET_Y).extend(Z_PLAYER);
         transform.scale.x = side;
-        // ponytail: other players' punches are not sent, so their arms never swing.
         let (motion, now) = (motion(&body), time.elapsed_secs());
-        *pose = RigPose(rig::pose(motion, now, None), rig::flap(motion, now));
+        let id = remote.id;
+        let (pushed, angle) = reach_now(&mut remote.reach, now, id, &mut contacts);
+        let mut parts = rig::pose(motion, now, None);
+        if let Some(angle) = angle {
+            parts[arm_front_index()].0 = angle;
+        }
+        *pose = RigPose(parts, rig::flap(motion, now), pushed);
     }
 }
 
@@ -735,8 +882,13 @@ fn place_names(
 /// Moves every body part, and the wings on the torso, to its rig's pose.
 fn pose_parts(
     poses: Query<&RigPose>,
+    rig: Res<RigImages>,
     mut parts: Query<(&RigPart, &ChildOf, &mut Transform), Without<Wings>>,
-    mut wings: Query<(&ChildOf, &mut Transform), With<Wings>>,
+    mut wings: Query<(&ChildOf, &mut Transform), (With<Wings>, Without<RigPart>)>,
+    mut fills: Query<
+        (&ChildOf, &mut Transform, &mut Sprite, &mut Visibility),
+        (With<ArmFill>, Without<RigPart>, Without<Wings>),
+    >,
 ) {
     for (&RigPart(part), child_of, mut transform) in &mut parts {
         let Ok(pose) = poses.get(child_of.parent()) else {
@@ -744,9 +896,33 @@ fn pose_parts(
         };
         let i = Part::ALL.iter().position(|&p| p == part).unwrap_or(0);
         let (angle, dy) = pose.0[i];
-        let at = pivot_offset(part) + Vec2::Y * dy;
+        let mut at = pivot_offset(part) + Vec2::Y * dy;
+        if part == Part::ArmFront {
+            // Reaching out: the whole arm slides along itself, so the fist and the held item stay
+            // crisp; `ArmFill` covers the gap from the shoulder.
+            at += Vec2::new(angle.sin(), -angle.cos()) * pose.2;
+        }
         transform.translation = at.extend(transform.translation.z);
         transform.rotation = Quat::from_rotation_z(angle);
+    }
+    let [r, g, b] = rig::SKIN_RAMPS[rig.skin.unwrap_or(0)].1[1].to_be_bytes()[1..] else {
+        return;
+    };
+    for (root, mut transform, mut sprite, mut visibility) in &mut fills {
+        let Ok(pose) = poses.get(root.parent()) else {
+            continue;
+        };
+        let shown = pose.2 > 0.5;
+        visibility.set_if_neq(if shown {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        });
+        if shown {
+            transform.rotation = Quat::from_rotation_z(pose.0[arm_front_index()].0);
+            sprite.custom_size = Some(Vec2::new(ARM_FILL_WIDTH, pose.2 + 2.0));
+            sprite.color = Color::srgb_u8(r, g, b);
+        }
     }
     for (torso, mut transform) in &mut wings {
         let flap = parts
@@ -781,5 +957,9 @@ mod tests {
         assert_eq!(motion(&body), Motion::Walk);
         body.on_ground = false;
         assert_eq!(motion(&body), Motion::Air);
+        body.climbing = true;
+        assert_eq!(motion(&body), Motion::Climb { moving: true });
+        body.vel = (0.0, 0.0);
+        assert_eq!(motion(&body), Motion::Climb { moving: false });
     }
 }

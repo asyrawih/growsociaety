@@ -467,7 +467,7 @@ mod tests {
         assert_eq!(seed.kind, ItemKind::Seed);
         let time = duration_text(grow_seconds(seed.rarity));
         let tip = crate::hud::kind_line(seed, false).unwrap();
-        assert!(tip.ends_with(&format!("grows in {time}")), "{tip}");
+        assert!(tip.ends_with(&format!(" · {time}")), "{tip}");
         let toast = farm_toast(&Event::TreePlanted {
             x: 0,
             y: 0,

@@ -1,0 +1,215 @@
+{
+ "frames": [
+  {
+   "filename": "splice_swirl 0",
+   "frame": {
+    "x": 0,
+    "y": 0,
+    "w": 32,
+    "h": 32
+   },
+   "rotated": false,
+   "trimmed": false,
+   "spriteSourceSize": {
+    "x": 0,
+    "y": 0,
+    "w": 32,
+    "h": 32
+   },
+   "sourceSize": {
+    "w": 32,
+    "h": 32
+   },
+   "duration": 83
+  },
+  {
+   "filename": "splice_swirl 1",
+   "frame": {
+    "x": 32,
+    "y": 0,
+    "w": 32,
+    "h": 32
+   },
+   "rotated": false,
+   "trimmed": false,
+   "spriteSourceSize": {
+    "x": 0,
+    "y": 0,
+    "w": 32,
+    "h": 32
+   },
+   "sourceSize": {
+    "w": 32,
+    "h": 32
+   },
+   "duration": 83
+  },
+  {
+   "filename": "splice_swirl 2",
+   "frame": {
+    "x": 64,
+    "y": 0,
+    "w": 32,
+    "h": 32
+   },
+   "rotated": false,
+   "trimmed": false,
+   "spriteSourceSize": {
+    "x": 0,
+    "y": 0,
+    "w": 32,
+    "h": 32
+   },
+   "sourceSize": {
+    "w": 32,
+    "h": 32
+   },
+   "duration": 83
+  },
+  {
+   "filename": "splice_swirl 3",
+   "frame": {
+    "x": 96,
+    "y": 0,
+    "w": 32,
+    "h": 32
+   },
+   "rotated": false,
+   "trimmed": false,
+   "spriteSourceSize": {
+    "x": 0,
+    "y": 0,
+    "w": 32,
+    "h": 32
+   },
+   "sourceSize": {
+    "w": 32,
+    "h": 32
+   },
+   "duration": 83
+  },
+  {
+   "filename": "splice_swirl 4",
+   "frame": {
+    "x": 128,
+    "y": 0,
+    "w": 32,
+    "h": 32
+   },
+   "rotated": false,
+   "trimmed": false,
+   "spriteSourceSize": {
+    "x": 0,
+    "y": 0,
+    "w": 32,
+    "h": 32
+   },
+   "sourceSize": {
+    "w": 32,
+    "h": 32
+   },
+   "duration": 83
+  },
+  {
+   "filename": "splice_swirl 5",
+   "frame": {
+    "x": 160,
+    "y": 0,
+    "w": 32,
+    "h": 32
+   },
+   "rotated": false,
+   "trimmed": false,
+   "spriteSourceSize": {
+    "x": 0,
+    "y": 0,
+    "w": 32,
+    "h": 32
+   },
+   "sourceSize": {
+    "w": 32,
+    "h": 32
+   },
+   "duration": 83
+  },
+  {
+   "filename": "splice_swirl 6",
+   "frame": {
+    "x": 192,
+    "y": 0,
+    "w": 32,
+    "h": 32
+   },
+   "rotated": false,
+   "trimmed": false,
+   "spriteSourceSize": {
+    "x": 0,
+    "y": 0,
+    "w": 32,
+    "h": 32
+   },
+   "sourceSize": {
+    "w": 32,
+    "h": 32
+   },
+   "duration": 83
+  },
+  {
+   "filename": "splice_swirl 7",
+   "frame": {
+    "x": 224,
+    "y": 0,
+    "w": 32,
+    "h": 32
+   },
+   "rotated": false,
+   "trimmed": false,
+   "spriteSourceSize": {
+    "x": 0,
+    "y": 0,
+    "w": 32,
+    "h": 32
+   },
+   "sourceSize": {
+    "w": 32,
+    "h": 32
+   },
+   "duration": 83
+  }
+ ],
+ "meta": {
+  "app": "growsociaety docs/art/make_respawn_fx.py",
+  "version": "1",
+  "image": "splice_swirl.png",
+  "format": "RGBA8888",
+  "size": {
+   "w": 256,
+   "h": 32
+  },
+  "scale": "1",
+  "frameTags": [
+   {
+    "name": "splice_swirl",
+    "from": 0,
+    "to": 7,
+    "direction": "forward"
+   }
+  ],
+  "pixelfx": {
+   "id": "spawn/splice_swirl",
+   "name": "Splice swirl",
+   "fps": 12,
+   "loop": false,
+   "frames": 8,
+   "frameSize": [
+    32,
+    32
+   ],
+   "pivot": [
+    16,
+    16
+   ],
+   "columns": 8
+  }
+ }
+}

@@ -5393,3 +5393,72 @@ mod fern_splice_tests {
         assert_eq!(plant_dirt(&mut state, at), Err(Reject::Occupied));
     }
 }
+
+#[cfg(test)]
+mod every_splice_tests {
+    use super::*;
+    use crate::farming::RECIPES as SPLICES;
+    use crate::items::seed_of;
+    use crate::worldgen::generate;
+
+    const ME: PlayerId = PlayerId(1);
+
+    /// Real play: the player joins on the door, both seeds in the backpack, and plants beside the
+    /// door on the surface (in reach, solid ground below), then splices on that sapling.
+    fn splice_in_play(
+        a: ItemId,
+        b: ItemId,
+    ) -> Result<(Vec<Event>, WorldState, (u32, u32)), String> {
+        let mut state = WorldState::new(generate("SPLICE"), 1);
+        state.join(ME);
+        let (seed_a, seed_b) = (
+            seed_of(a).ok_or(format!("{a:?} has no seed"))?,
+            seed_of(b).ok_or(format!("{b:?} has no seed"))?,
+        );
+        let player = state.players.get_mut(&ME).ok_or("joined")?;
+        player.inventory.add(seed_a, 1);
+        player.inventory.add(seed_b, 1);
+        let (dx, dy) = state.world.door;
+        let at = (dx + 1, dy);
+        let place = |item| Action::Place {
+            x: at.0,
+            y: at.1,
+            item,
+        };
+        apply(&mut state, ME, place(seed_a), 1.0).map_err(|r| format!("plant {a:?}: {r:?}"))?;
+        let events = apply(&mut state, ME, place(seed_b), 2.0)
+            .map_err(|r| format!("splice {b:?}: {r:?}"))?;
+        Ok((events, state, at))
+    }
+
+    #[test]
+    fn every_recipe_splices_in_both_orders_through_apply() {
+        let mut failures = Vec::new();
+        for &(a, b, result) in SPLICES {
+            for (first, second) in [(a, b), (b, a)] {
+                match splice_in_play(first, second) {
+                    Ok((events, state, at)) => {
+                        let spliced = events.iter().any(
+                            |e| matches!(e, Event::TreeSpliced { tree, .. } if tree.item == result),
+                        );
+                        let tree = state.world.tree(at.0, at.1).map(|t| t.item);
+                        let left = state.players[&ME]
+                            .inventory
+                            .count(seed_of(second).unwrap_or(EMPTY));
+                        if !spliced || tree != Some(result) || left != 0 {
+                            failures.push(format!("{first:?}+{second:?}: spliced={spliced} tree={tree:?} seed left={left}"));
+                        }
+                    }
+                    Err(e) => failures.push(format!("{first:?}+{second:?}: {e}")),
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} of {} failed:\n{}",
+            failures.len(),
+            SPLICES.len() * 2,
+            failures.join("\n")
+        );
+    }
+}

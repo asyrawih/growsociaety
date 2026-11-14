@@ -8,6 +8,7 @@ use game_shared::commands::{Admin, held_before, report};
 use game_shared::rules::{Action, Event, Player, PlayerId, Reject, WorldState, apply, apply_admin};
 use game_shared::worldgen::generate;
 
+use crate::hud::Notice;
 use crate::net::Net;
 
 const START_WORLD: &str = "START";
@@ -76,6 +77,9 @@ impl Plugin for StatePlugin {
             .add_message::<ActionResult>()
             .add_message::<AdminMsg>()
             .add_message::<SystemLine>()
+            .add_message::<WorldReplaced>()
+            // Also added by the HUD; here so the state runs without it (tests).
+            .add_message::<Notice>()
             .configure_sets(Update, (Phase::Input, Phase::Apply, Phase::View).chain())
             .add_systems(Update, apply_actions.in_set(Phase::Apply));
     }
@@ -91,18 +95,26 @@ fn apply_actions(
     mut events: MessageWriter<GameEvent>,
     mut results: MessageWriter<ActionResult>,
     mut lines: MessageWriter<SystemLine>,
+    mut replaced: MessageWriter<WorldReplaced>,
+    mut notices: MessageWriter<Notice>,
 ) {
     let now = time.elapsed_secs_f64();
     if let Some(mut net) = net {
         for &ActionMsg(action) in actions.read() {
+            log_sent(action);
             net.act(action);
         }
-        net.pump(&mut game, now, &mut events, &mut results);
+        if net.pump(&mut game, now, &mut events, &mut results) {
+            replaced.write(WorldReplaced);
+            notices.write(Notice(WORLD_RESET_TOAST.into()));
+        }
         return;
     }
     let me = game.1;
     for &ActionMsg(action) in actions.read() {
+        log_sent(action);
         let result = apply(&mut game.0, me, action, now);
+        log_result(action, &result);
         for event in result.iter().flatten() {
             events.write(GameEvent(event.clone()));
         }
@@ -115,6 +127,34 @@ fn apply_actions(
             events.write(GameEvent(event.clone()));
         }
         lines.write(SystemLine(report(&admin, held, &result)));
+    }
+}
+
+/// The server swapped in a whole new world (`/resetworld`): views redraw everything.
+#[derive(Message)]
+pub struct WorldReplaced;
+
+/// docs/knowledge/ux/reset-world.md.
+const WORLD_RESET_TOAST: &str = "This world was reset by the owner";
+
+/// Placing is logged both ways (sent, answered) so a player's log shows what happened to a
+/// placement or splice even when the HUD stays quiet. Punches are too frequent to log.
+pub fn log_sent(action: Action) {
+    if let Action::Place { x, y, item } = action {
+        info!("place sent: item {} at ({x}, {y})", item.0);
+    }
+}
+
+pub fn log_result(action: Action, result: &Result<Vec<Event>, Reject>) {
+    if let Action::Place { x, y, item } = action {
+        match result {
+            Ok(events) => info!(
+                "place ok: item {} at ({x}, {y}): {} events",
+                item.0,
+                events.len()
+            ),
+            Err(reject) => info!("place refused: item {} at ({x}, {y}): {reject:?}", item.0),
+        }
     }
 }
 
@@ -281,5 +321,36 @@ mod tests {
         let game = app.world().resource::<Game>();
         let key = World::tile_key(x, y).expect("in the world");
         assert!(game.0.world.claim(key).is_some_and(|claim| claim.public));
+    }
+
+    #[test]
+    fn every_splice_works_through_the_message_pipeline() {
+        use game_shared::farming::RECIPES as SPLICES;
+        use game_shared::items::seed_of;
+
+        for &(a, b, result) in SPLICES {
+            let mut app = App::new();
+            app.add_plugins((MinimalPlugins, StatePlugin));
+            let (seed_a, seed_b) = (seed_of(a).expect("seed"), seed_of(b).expect("seed"));
+            let door = {
+                let mut game = app.world_mut().resource_mut::<Game>();
+                let me = game.1;
+                let player = game.0.players.get_mut(&me).expect("joined");
+                player.inventory.add(seed_a, 1);
+                player.inventory.add(seed_b, 1);
+                game.0.world.door
+            };
+            let (x, y) = (door.0 + 1, door.1);
+            let (_, planted) = send(&mut app, Action::Place { x, y, item: seed_a });
+            assert!(planted.is_ok(), "{a:?}: {planted:?}");
+            let (events, spliced) = send(&mut app, Action::Place { x, y, item: seed_b });
+            assert!(spliced.is_ok(), "{a:?}+{b:?}: {spliced:?}");
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, Event::TreeSpliced { tree, .. } if tree.item == result)),
+                "{a:?}+{b:?}: {events:?}"
+            );
+        }
     }
 }

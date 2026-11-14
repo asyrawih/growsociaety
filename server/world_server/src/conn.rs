@@ -9,13 +9,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use game_protocol::{
-    Auth, ClientMsg, MAX_CLIENT_MSG, MAX_LOOKUP, MAX_TOKEN_LEN, PROTOCOL_VERSION, ReadError,
-    ServerMsg, clean_chat, encode, read_msg, valid_country, valid_name, write_msg,
+    ACTIVE_WORLDS_LISTED, Auth, ClientMsg, MAX_CLIENT_MSG, MAX_LOOKUP, MAX_TOKEN_LEN,
+    NEW_WORLDS_PER_HOUR, PROTOCOL_VERSION, ReadError, ServerMsg, WORLD_CAPACITY, WorldStatus,
+    clean_chat, encode, read_msg, valid_country, valid_name, world_name_allowed, write_msg,
 };
 use game_shared::commands::Role;
 use game_shared::physics::TICK_RATE;
 use game_shared::rules::PlayerId;
-use game_shared::worldgen::validate_world_name;
 use tokio::sync::mpsc;
 
 use crate::accounts::Accounts;
@@ -317,6 +317,8 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) {
             .iter()
             .any(|n| n.eq_ignore_ascii_case(&account.name));
     let role = if owner { Role::Owner } else { account.role };
+    // Who `RefreshToken` issues for; development logins have no token.
+    let refresh = (!token.is_empty()).then(|| account.clone());
     let (id, name) = (account.id, account.name);
     let Some(_session) = server.online.claim(id) else {
         return refuse(send, "That account is already online").await;
@@ -388,9 +390,17 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) {
         let to_world = match (msg, &world) {
             (ClientMsg::Join { world: wanted }, None) => {
                 let world_name = wanted.to_uppercase();
-                if !validate_world_name(&world_name) {
-                    let _ = out.try_send(Out::Reliable(kick("invalid world name")));
-                    break Some("invalid world name");
+                // A refused name is answered like a lookup, not punished: the deny-list can
+                // refuse an innocent name, and a typo is no offence. The lookups bucket keeps
+                // refused joins from hammering the database.
+                let status = world_status(&server, id, &world_name).await;
+                if matches!(status, WorldStatus::NotAllowed | WorldStatus::LimitReached) {
+                    if lookups.take(now) {
+                        let name = world_name;
+                        let _ =
+                            out.try_send(Out::Reliable(ServerMsg::WorldStatus { name, status }));
+                    }
+                    continue;
                 }
                 // Read after any earlier world of this session saved (see `leave`).
                 let save = server.accounts.load_player(id).await.map(Box::new);
@@ -442,6 +452,36 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) {
                 }
                 continue;
             }
+            (ClientMsg::WorldStatus { name: asked }, _) => {
+                if !lookups.take(now) {
+                    strikes += 1;
+                } else {
+                    let name = asked.to_ascii_uppercase();
+                    let status = world_status(&server, id, &name).await;
+                    let _ = out.try_send(Out::Reliable(ServerMsg::WorldStatus { name, status }));
+                }
+                continue;
+            }
+            (ClientMsg::RefreshToken, _) => {
+                if !lookups.take(now) {
+                    strikes += 1;
+                } else {
+                    let token = refresh
+                        .as_ref()
+                        .map_or_else(String::new, |account| server.signer.issue(account));
+                    let _ = out.try_send(Out::Reliable(ServerMsg::Token { token }));
+                }
+                continue;
+            }
+            (ClientMsg::ListWorlds, _) => {
+                if !lookups.take(now) {
+                    strikes += 1;
+                } else {
+                    let active = active_worlds(&server);
+                    let _ = out.try_send(Out::Reliable(ServerMsg::Worlds { active }));
+                }
+                continue;
+            }
             (ClientMsg::VoiceMute { player, muted }, Some(name)) => voice_mutes
                 .take(now)
                 .then(|| (name.clone(), ToWorld::VoiceMute { id, player, muted })),
@@ -472,6 +512,47 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) {
     let _ = writer.await;
     conn.close(0u32.into(), reason.unwrap_or("bye").as_bytes());
     println!("player {} left ({})", id.0, reason.unwrap_or("closed"));
+}
+
+/// What entering `name` (upper-case) would do for player `id`.
+async fn world_status(server: &Server, id: PlayerId, name: &str) -> WorldStatus {
+    if !world_name_allowed(name) {
+        return WorldStatus::NotAllowed;
+    }
+    let loaded = server.registry.lock().ok().and_then(|worlds| {
+        worlds
+            .get(name)
+            .map(|world| world.players.load(Ordering::Relaxed))
+    });
+    if let Some(players) = loaded {
+        return if players >= WORLD_CAPACITY {
+            WorldStatus::Full
+        } else {
+            WorldStatus::Open { players }
+        };
+    }
+    if server.accounts.world_exists(name).await {
+        WorldStatus::Open { players: 0 }
+    } else if server.accounts.worlds_opened_last_hour(id).await >= u32::from(NEW_WORLDS_PER_HOUR) {
+        WorldStatus::LimitReached
+    } else {
+        WorldStatus::New
+    }
+}
+
+/// The busiest loaded worlds with anyone in them, most players first.
+fn active_worlds(server: &Server) -> Vec<(String, u8)> {
+    let Ok(worlds) = server.registry.lock() else {
+        return Vec::new();
+    };
+    let mut active: Vec<(String, u8)> = worlds
+        .iter()
+        .map(|(name, world)| (name.clone(), world.players.load(Ordering::Relaxed)))
+        .filter(|&(_, players)| players > 0)
+        .collect();
+    active.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    active.truncate(ACTIVE_WORLDS_LISTED);
+    active
 }
 
 #[cfg(test)]

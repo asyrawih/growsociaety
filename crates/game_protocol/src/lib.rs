@@ -11,7 +11,7 @@ use game_shared::world::World;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change; a mismatch is refused at `Hello`.
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 11;
 pub const DEFAULT_PORT: u16 = 7777;
 /// The name the dev certificate is issued for and the client connects to.
 pub const SERVER_NAME: &str = "localhost";
@@ -79,6 +79,37 @@ pub enum ClientMsg {
     FindPlayer {
         name: String,
     },
+    /// What entering world `name` would do, for the world menu's status line. Answer: `WorldStatus`.
+    WorldStatus {
+        name: String,
+    },
+    /// The busiest loaded worlds. Answer: `Worlds`.
+    ListWorlds,
+    /// A fresh login token for this account, asked right before a world switch re-starts the
+    /// game (tokens are short-lived). Answer: `Token`.
+    RefreshToken,
+}
+
+/// Players allowed in one world at a time.
+pub const WORLD_CAPACITY: u8 = 64;
+/// Worlds an account may open per hour (`WorldStatus::LimitReached`).
+pub const NEW_WORLDS_PER_HOUR: u8 = 10;
+/// Entries in `ServerMsg::Worlds`.
+pub const ACTIVE_WORLDS_LISTED: usize = 10;
+
+/// What entering a world would do (docs/knowledge/ux/world-select.md).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum WorldStatus {
+    /// It exists; `players` are in it now.
+    Open { players: u8 },
+    /// Nobody has built there: entering creates it.
+    New,
+    /// `WORLD_CAPACITY` players are in it.
+    Full,
+    /// An invalid or denied name.
+    NotAllowed,
+    /// New, and this account opened `NEW_WORLDS_PER_HOUR` worlds in the last hour.
+    LimitReached,
 }
 
 /// Ids per `LookupNames`.
@@ -173,6 +204,28 @@ pub enum ServerMsg {
     PlayerFound {
         asked: String,
         found: Option<(PlayerId, String)>,
+    },
+    /// The answer to `WorldStatus` (docs/knowledge/ux/world-select.md).
+    WorldStatus {
+        name: String,
+        status: WorldStatus,
+    },
+    /// Another player in this world punched (or placed at) tile `(x, y)`, accepted or not: their
+    /// arm reaches out (docs/knowledge/ux/vfx-farming-punch.md (a)). A datagram, never sent back
+    /// to the player who swung.
+    Swing {
+        player: PlayerId,
+        x: u32,
+        y: u32,
+        place: bool,
+    },
+    /// The answer to `RefreshToken`; empty on development logins, which have no token.
+    Token {
+        token: String,
+    },
+    /// The answer to `ListWorlds`: the busiest loaded worlds, name and player count.
+    Worlds {
+        active: Vec<(String, u8)>,
     },
     /// Already cleaned by the server; draw it as given.
     Chat {
@@ -286,6 +339,35 @@ fn squash(word: &str) -> String {
     out
 }
 
+/// Names nobody may give a world: they would pass as official.
+const RESERVED_WORLDS: &[&str] = &[
+    "ADMIN",
+    "ADMINS",
+    "STAFF",
+    "MOD",
+    "MODS",
+    "MODERATOR",
+    "OWNER",
+    "SERVER",
+    "SYSTEM",
+    "SUPPORT",
+    "OFFICIAL",
+    "GROWSOCIETY",
+];
+
+/// The server's deny-list on top of `validate_world_name`: reserved names, and names containing a
+/// rude word anywhere (a name is one word, so whole-word matching would miss "FUCKWORLD").
+/// ponytail: substring matching can refuse an innocent name; add exceptions when one is reported.
+pub fn world_name_allowed(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    let squashed = squash(name);
+    game_shared::worldgen::validate_world_name(name)
+        && !RESERVED_WORLDS.contains(&upper.as_str())
+        && !PROFANITY
+            .iter()
+            .any(|word| squashed.contains(&squash(word)))
+}
+
 fn mask_profanity(text: &str) -> String {
     let banned: Vec<String> = PROFANITY.iter().map(|w| squash(w)).collect();
     let mut out = String::with_capacity(text.len());
@@ -361,6 +443,25 @@ pub async fn read_msg<T: for<'a> Deserialize<'a>>(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn world_names_deny_reserved_and_rude_names() {
+        for name in ["START", "MYFARM", "W7", "CLASSROOM"] {
+            assert!(world_name_allowed(name), "{name}");
+        }
+        for name in [
+            "",
+            "ADMIN",
+            "staff",
+            "FUCKWORLD",
+            "MyShiiitFarm",
+            "has space",
+            "TOOLONGNAMEXXXXXXXXXXXXXX",
+        ] {
+            assert!(!world_name_allowed(name), "{name}");
+        }
+    }
+
     use super::*;
     use game_shared::items::DIRT;
     use game_shared::worldgen::generate;

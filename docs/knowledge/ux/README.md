@@ -103,6 +103,11 @@ Approved by the owner 2026-11-14; specs owned by the UI/UX session (growsociaety
 2. [refusals-and-big-buys.md](refusals-and-big-buys.md) (U2 + U7) → 1a.
 3. [item-tooltip.md](item-tooltip.md) (U3, with U4 + U9) → 1a.
 4. [first-run-hints.md](first-run-hints.md) (U15) → f0.
+Feature specs added since (owner requests via c8): [platforms.md](platforms.md) · [respawn.md](respawn.md) ·
+[farming-feedback.md](farming-feedback.md) · [ladders.md](ladders.md) · [workbench.md](workbench.md) ·
+[vfx-farming-punch.md](vfx-farming-punch.md) · [inventory-categories.md](inventory-categories.md) ·
+[almanac.md](almanac.md) · [reset-world.md](reset-world.md) · [world-select.md](world-select.md).
+
 5. Not yet specced: U5, U6, U8, U10, U11, U12, U13, U14 (U10/U11 are also in the craft review sent to 1a).
 6. Gap found while implementing: Inventory and Wardrobe grids have no keyboard/gamepad focus yet (store, craft and
    tabs do). Spec it with the gamepad pass.

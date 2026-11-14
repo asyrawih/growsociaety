@@ -16,11 +16,12 @@ use game_shared::world_to_tile;
 
 use crate::audio::Sfx;
 use crate::hud::{
-    FIT_PANEL_TOP, FitWindow, HUD_MARGIN, ICON_SIZE, INK_COLOR, ItemTip, KIT_SCALE, OpenPanel,
-    PANEL_PADDING, SCROLLBAR_SPACE, SLOT_GAP, SLOT_IMAGE, SLOT_SELECTED_IMAGE, SLOT_SIZE, bag_tabs,
-    count_label, grid_width, icon_node, ink, key_name, label, scroll_grid, sliced, slot_cell,
-    spawn_centre_panel, spawn_mods,
+    CRAFT_PANEL_KEY, FIT_PANEL_TOP, FitWindow, HUD_MARGIN, ICON_SIZE, INK_COLOR, ItemTip,
+    KIT_SCALE, Notice, OpenPanel, PANEL_PADDING, SCROLLBAR_SPACE, SEP, SLOT_GAP, SLOT_IMAGE,
+    SLOT_SELECTED_IMAGE, SLOT_SIZE, bag_tabs, count_label, grid_width, icon_node, ink, key_name,
+    label, scroll_grid, sliced, slot_cell, spawn_centre_panel, spawn_mods,
 };
+use crate::settings::Settings;
 use crate::state::{ActionMsg, Game, GameEvent, Phase};
 use crate::world_view::item_icon;
 
@@ -49,10 +50,12 @@ const UNAVAILABLE_ICON_COLOR: Color = Color::srgba(1.0, 1.0, 1.0, 0.45);
 /// The output slot after a craft: this tint, fading back to white.
 const PULSE_COLOR: Color = Color::srgb(1.0, 0.85, 0.3);
 const PULSE_SECS: f32 = 0.4;
-/// Crafts the selected recipe while the panel is open; the button names it. Enter crafts too: the
-/// chat line leaves it alone while the panel is open (`hud::TextFocus`, set in `claim_ui.rs`).
-const CRAFT_KEY: KeyCode = KeyCode::KeyC;
-const CRAFT_ENTER: KeyCode = KeyCode::Enter;
+/// Crafts the selected recipe while the panel is open; the button names it. The chat line leaves
+/// Enter alone while the panel is open (`hud::TextFocus`, set in `claim_ui.rs`). C only opens and
+/// closes the panel (`hud::CRAFT_PANEL_KEY`), so a double tap cannot craft by accident.
+const CRAFT_KEY: KeyCode = KeyCode::Enter;
+/// The panel's line while no Workbench is in reach (docs/knowledge/ux/workbench.md).
+const NO_STATION_TEXT: &str = "Stand near a Workbench to unlock the greyed recipes";
 const NAV_KEYS: [KeyCode; 4] = [
     KeyCode::ArrowLeft,
     KeyCode::ArrowRight,
@@ -140,6 +143,7 @@ impl Plugin for CraftUiPlugin {
                     (track_workbench, refresh_craft).chain(),
                     skin_button,
                     pulse_output,
+                    workbench_tip,
                 )
                     .in_set(Phase::View),
             );
@@ -262,7 +266,7 @@ fn spawn_panel(mut commands: Commands, assets: Res<AssetServer>) {
                             };
                             detail.spawn((mods, DetailMods));
                             detail.spawn((
-                                label("Needs a Workbench nearby"),
+                                label(NO_STATION_TEXT),
                                 TextColor(SHORT_COLOR),
                                 StationLine,
                             ));
@@ -331,6 +335,33 @@ fn spawn_panel(mut commands: Commands, assets: Res<AssetServer>) {
     commands
         .entity(panel)
         .insert(FitWindow { top: FIT_PANEL_TOP });
+}
+
+/// "Workbench nearby · press C to craft".
+fn workbench_tip_text() -> String {
+    format!(
+        "Workbench nearby{SEP}press {} to craft",
+        key_name(CRAFT_PANEL_KEY)
+    )
+}
+
+/// Once ever (`Settings::workbench_tip_seen`): the first time the player stands within reach of a
+/// Workbench (placing one counts, it lands in reach), the message line says how to craft.
+fn workbench_tip(
+    game: Res<Game>,
+    mut settings: ResMut<Settings>,
+    mut notices: MessageWriter<Notice>,
+) {
+    if settings.workbench_tip_seen {
+        return;
+    }
+    if game
+        .me()
+        .is_some_and(|me| workbench_near(&game.0.world, &me.body))
+    {
+        settings.workbench_tip_seen = true;
+        notices.write(Notice(workbench_tip_text()));
+    }
 }
 
 /// While the panel is open: whether a Workbench is in reach. Written only when it flips.
@@ -525,7 +556,8 @@ fn refresh_craft(
             node.display = display;
         }
     }
-    let display = if r.station.is_some() && !near {
+    // Some recipe is greyed for want of a station.
+    let display = if !near && RECIPES.iter().any(|r| r.station.is_some()) {
         Display::Flex
     } else {
         Display::None
@@ -607,9 +639,9 @@ fn take_keys(
     if dx != 0 || dy != 0 {
         out.step = Some((dx, dy));
     }
-    out.craft |= key(CRAFT_KEY) || key(CRAFT_ENTER) || pad(GamepadButton::South);
+    out.craft |= key(CRAFT_KEY) || pad(GamepadButton::South);
     out.close |= pad(GamepadButton::East);
-    for code in NAV_KEYS.into_iter().chain([CRAFT_KEY, CRAFT_ENTER]) {
+    for code in NAV_KEYS.into_iter().chain([CRAFT_KEY]) {
         if keys.pressed(code) {
             keys.reset(code);
         }
@@ -762,6 +794,12 @@ mod tests {
             disabled_reason(crate_recipe, have(8, 2), false).as_deref(),
             Some("Find a Workbench")
         );
+    }
+
+    #[test]
+    fn the_workbench_texts_name_their_keys() {
+        assert_eq!(workbench_tip_text(), "Workbench nearby · press C to craft");
+        assert_eq!(craft_label(), "Craft (Enter)");
     }
 
     #[test]

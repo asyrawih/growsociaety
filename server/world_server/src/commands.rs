@@ -32,7 +32,7 @@ impl Room {
         (until > now).then(|| ((until - now) / 60.0).ceil() as u64)
     }
 
-    fn system(&mut self, to: PlayerId, text: String) {
+    pub(crate) fn system(&mut self, to: PlayerId, text: String) {
         let msg = ServerMsg::Chat {
             from: to,
             text,
@@ -123,6 +123,7 @@ impl Room {
     fn run(&mut self, id: PlayerId, command: Command, now: f64) -> Result<String, String> {
         let missing = || "No such player in this world".to_owned();
         match command {
+            Command::ResetWorld(step) => self.reset_command(id, step, now),
             Command::Help { topic } => Ok(commands::help(topic.as_deref(), |spec| {
                 self.allowed(id, spec.needs)
             })),
@@ -306,6 +307,7 @@ impl Room {
                 }
                 let held = held_before(&self.state, &admin);
                 let result = apply_admin(&mut self.state, id, admin, now);
+                self.touched |= result.is_ok();
                 if let Ok(events) = &result {
                     self.broadcast(events, None);
                 }
@@ -791,5 +793,213 @@ mod tests {
     #[test]
     fn json_escapes() {
         assert_eq!(json("a\"b\\c\n"), "\"a\\\"b\\\\c\\u000a\"");
+    }
+}
+
+#[cfg(test)]
+mod reset_tests {
+    use super::*;
+    use crate::store::PlayerSave;
+    use crate::world::ToWorld;
+    use game_shared::claims::Claim;
+    use game_shared::commands::RESET_CONFIRM_SECS;
+    use game_shared::items::{SMALL_CLAIM, item};
+    use game_shared::rules::WorldState;
+    use game_shared::world::{Tile, World};
+    use game_shared::worldgen::generate;
+    use tokio::sync::mpsc;
+
+    struct Seat {
+        id: PlayerId,
+        rx: mpsc::Receiver<Out>,
+    }
+
+    impl Seat {
+        fn drain(&mut self) -> Vec<ServerMsg> {
+            std::iter::from_fn(|| self.rx.try_recv().ok())
+                .map(|out| match out {
+                    Out::Reliable(msg) | Out::Datagram(msg) => msg,
+                })
+                .collect()
+        }
+
+        fn replies(&mut self) -> Vec<String> {
+            self.drain()
+                .into_iter()
+                .filter_map(|msg| match msg {
+                    ServerMsg::Chat {
+                        text,
+                        kind: ChatKind::System,
+                        ..
+                    } => Some(text),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    fn join(room: &mut Room, id: u32, role: Role, save: Option<PlayerSave>) -> Seat {
+        let (out, rx) = mpsc::channel(crate::world::OUTBOX);
+        let id = PlayerId(id);
+        room.handle(
+            ToWorld::Join {
+                id,
+                name: format!("p{}", id.0),
+                country: None,
+                role,
+                save: save.map(Box::new),
+                out,
+            },
+            0.0,
+        );
+        Seat { id, rx }
+    }
+
+    fn say(room: &mut Room, seat: &Seat, line: &str, now: f64) {
+        let text = line.into();
+        room.handle(ToWorld::Chat { id: seat.id, text }, now);
+    }
+
+    /// A small claim block owned by `owner` at `(x, 30)`.
+    fn claim_at(room: &mut Room, x: u32, owner: PlayerId) {
+        let world = &mut room.state.world;
+        world.set(
+            x,
+            30,
+            Tile {
+                fg: SMALL_CLAIM,
+                bg: game_shared::items::EMPTY,
+            },
+        );
+        let key = World::tile_key(x, 30).expect("in range");
+        let claim = Claim {
+            owner,
+            access: vec![],
+            public: false,
+            tiles: vec![key],
+        };
+        world.insert_claim(key, claim);
+    }
+
+    fn room() -> Room {
+        Room::new(WorldState::new(generate("RESET"), 1))
+    }
+
+    #[test]
+    fn only_the_owner_and_only_with_a_timely_confirm_by_the_same_caller() {
+        let mut room = room();
+        let mut owner = join(&mut room, 1, Role::Owner, None);
+        let mut admin = join(&mut room, 2, Role::Admin, None);
+        claim_at(&mut room, 10, admin.id);
+        let before = room.state.world.clone();
+        owner.drain();
+        admin.drain();
+
+        say(&mut room, &admin, "/resetworld", 1.0);
+        assert_eq!(admin.replies(), ["You cannot use /resetworld here"]);
+
+        say(&mut room, &owner, "/resetworld", 1.0);
+        let prepared = owner.replies();
+        assert!(prepared[0].starts_with("Reset RESET? This wipes 1 claims (owned by 1 players)"));
+        assert!(
+            prepared[0].ends_with("2 players are inside. Type /resetworld confirm within 15s.")
+        );
+        assert_eq!(room.state.world, before, "prepare changes nothing");
+
+        say(&mut room, &admin, "/resetworld confirm", 2.0);
+        assert_eq!(admin.replies(), ["You cannot use /resetworld here"]);
+        say(
+            &mut room,
+            &owner,
+            "/resetworld confirm",
+            1.0 + RESET_CONFIRM_SECS + 0.1,
+        );
+        assert_eq!(
+            owner.replies(),
+            ["Nothing to confirm. Run /resetworld again"]
+        );
+        assert_eq!(room.state.world, before, "too late changes nothing");
+
+        say(&mut room, &owner, "/resetworld", 30.0);
+        say(&mut room, &owner, "/resetworld cancel", 31.0);
+        say(&mut room, &owner, "/resetworld confirm", 32.0);
+        assert_eq!(
+            owner.replies().last().unwrap(),
+            "Nothing to confirm. Run /resetworld again"
+        );
+        say(&mut room, &owner, "/resetworld OTHER", 33.0);
+        assert!(owner.replies()[0].starts_with("Join OTHER first"));
+        assert_eq!(room.state.world, before);
+    }
+
+    #[test]
+    fn a_reset_returns_claims_wipes_the_world_and_moves_everyone_to_the_door() {
+        let mut room = room();
+        let mut owner = join(&mut room, 1, Role::Owner, None);
+        let mut builder = join(&mut room, 2, Role::Player, None);
+        let away = PlayerId(99);
+        claim_at(&mut room, 10, builder.id);
+        claim_at(&mut room, 20, away);
+        room.state.world.drops.clear();
+        if let Some(player) = room.state.players.get_mut(&builder.id) {
+            player.body.pos.0 += 64.0;
+        }
+        let held = room.state.players[&builder.id].inventory.count(SMALL_CLAIM);
+        owner.drain();
+        builder.drain();
+
+        say(&mut room, &owner, "/resetworld seed=5", 1.0);
+        say(&mut room, &owner, "/resetworld confirm", 2.0);
+        assert_eq!(
+            owner.replies().last().unwrap(),
+            "RESET was reset (2 claims returned, 0 trees, 0 drops removed)."
+        );
+
+        let world = &room.state.world;
+        assert!(world.extras.is_empty() && world.drops.is_empty() && world.world_claim.is_none());
+        let door = spawn_body(world);
+        for player in room.state.players.values() {
+            assert_eq!(player.body.pos, door.pos);
+        }
+        assert_eq!(
+            room.state.players[&builder.id].inventory.count(SMALL_CLAIM),
+            held + 1
+        );
+        let msgs = builder.drain();
+        assert!(
+            msgs.iter().any(|m| matches!(m, ServerMsg::Joined { .. })),
+            "new world sent"
+        );
+        let name = item(SMALL_CLAIM).unwrap().name;
+        assert!(msgs.iter().any(|m| matches!(m, ServerMsg::Chat { text, .. }
+            if text.starts_with("Your ") && text.to_lowercase().contains(name))));
+        assert_eq!(
+            room.returned.len(),
+            1,
+            "the absent owner's claim waits in the store"
+        );
+        assert_eq!(room.returned[0].player, away);
+        assert!(room.backup.is_some() && room.save_due);
+    }
+
+    #[test]
+    fn a_join_shows_returned_notices_and_pays_nothing_itself() {
+        // `load_player` already paid in the database; a world save that fails afterwards cannot
+        // pay again, because the world never pays on join.
+        let mut room = room();
+        let notice = "Your Small Claim in START was returned because the owner reset the world.";
+        let save = PlayerSave {
+            id: PlayerId(3),
+            gems: 0,
+            capacity: game_shared::inventory::Inventory::default().capacity,
+            items: vec![(SMALL_CLAIM, 1)],
+            equipped: [None; game_shared::items::SLOT_COUNT],
+            level: 1,
+            xp: 0,
+            notices: vec![notice.into()],
+        };
+        let mut seat = join(&mut room, 3, Role::Player, Some(save));
+        assert_eq!(room.state.players[&seat.id].inventory.count(SMALL_CLAIM), 1);
+        assert!(seat.replies().iter().any(|line| line == notice));
     }
 }

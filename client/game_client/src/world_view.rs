@@ -10,10 +10,10 @@ use game_shared::farming::{GROWN_STAGE, SAPLING_HITS, growth_stage};
 use game_shared::items::{Collision, ItemId, Sprite as ItemSprite, item};
 use game_shared::mods::DAMAGE_PER_HIT;
 use game_shared::rules::{DAMAGE_RESET, Event, Layer, drop_position};
-use game_shared::world::{Tile, World};
+use game_shared::world::{Drop, Tile, World};
 use game_shared::{TILE_SIZE, WORLD_HEIGHT, WORLD_WIDTH, tile_to_world};
 
-use crate::state::{Game, GameEvent, Phase};
+use crate::state::{Game, GameEvent, Phase, WorldReplaced};
 
 const SKY_COLOR: Color = Color::srgb(0.47, 0.71, 0.92);
 
@@ -74,12 +74,19 @@ struct TileSprites(HashMap<(u32, u32), Vec<Entity>>);
 #[derive(Resource, Default)]
 struct DropSprites(HashMap<u32, Entity>);
 
-/// The stage a tree's sprite currently shows.
+/// The stage a tree's sprite currently shows. `vfx.rs` pops a new sapling's sprite.
 #[derive(Component)]
-struct TreeView {
-    x: u32,
-    y: u32,
+pub(crate) struct TreeView {
+    pub(crate) x: u32,
+    pub(crate) y: u32,
     stage: u8,
+}
+
+/// A drop's sprite, for `vfx.rs` (toss, wobble, glow). Spawned again when a merge re-announces it.
+#[derive(Component)]
+pub(crate) struct DropView {
+    pub(crate) id: u32,
+    pub(crate) item: ItemId,
 }
 
 /// Darkens a damaged tile.
@@ -106,6 +113,7 @@ impl Plugin for WorldViewPlugin {
             .add_systems(
                 Update,
                 (
+                    (draw_world, reset_drops).run_if(on_message::<WorldReplaced>),
                     on_game_events,
                     grow_trees.run_if(on_timer(TREE_REFRESH)),
                     expire_temporary,
@@ -409,12 +417,9 @@ fn on_game_events(
                 ));
             }
             Event::ItemDropped { drop } => {
-                let Some(def) = item(drop.item) else { continue };
-                let (cx, cy) = drop_position(&drop);
-                let sprite = item_icon(&assets, def.sprite).sprite(DROP_SIZE);
-                let entity = commands
-                    .spawn((sprite, Transform::from_xyz(cx, cy, Z_DROP)))
-                    .id();
+                let Some(entity) = spawn_drop(&mut commands, &assets, &drop) else {
+                    continue;
+                };
                 // A merge re-announces an existing drop: replace its sprite.
                 if let Some(old) = drops.0.insert(drop.id, entity) {
                     commands.entity(old).despawn();
@@ -444,6 +449,44 @@ fn on_game_events(
             | Event::LevelUp { .. }
             | Event::Crafted { .. }
             | Event::Respawned { .. } => {}
+        }
+    }
+}
+
+/// A drop's sprite, marked for `vfx.rs`.
+fn spawn_drop(commands: &mut Commands, assets: &AssetServer, drop: &Drop) -> Option<Entity> {
+    let def = item(drop.item)?;
+    let (cx, cy) = drop_position(drop);
+    let sprite = item_icon(assets, def.sprite).sprite(DROP_SIZE);
+    let view = DropView {
+        id: drop.id,
+        item: drop.item,
+    };
+    Some(
+        commands
+            .spawn((sprite, Transform::from_xyz(cx, cy, Z_DROP), view))
+            .id(),
+    )
+}
+
+/// A whole new world (`WorldReplaced`): the old drops and cracks go, the new world's drops come.
+/// The tiles are `draw_world`'s, which replaces each tile's sprites.
+fn reset_drops(
+    mut commands: Commands,
+    assets: Res<AssetServer>,
+    game: Res<Game>,
+    mut drops: ResMut<DropSprites>,
+    cracks: Query<Entity, With<Crack>>,
+) {
+    for (_, entity) in drops.0.drain() {
+        commands.entity(entity).try_despawn();
+    }
+    for entity in &cracks {
+        commands.entity(entity).try_despawn();
+    }
+    for drop in &game.0.world.drops {
+        if let Some(entity) = spawn_drop(&mut commands, &assets, drop) {
+            drops.0.insert(drop.id, entity);
         }
     }
 }

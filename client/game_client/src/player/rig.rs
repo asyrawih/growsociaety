@@ -141,7 +141,7 @@ const FLAP_HZ: f32 = 1.2;
 pub fn flap(motion: Motion, seconds: f32) -> f32 {
     let (amp, hz) = match motion {
         Motion::Air => (FLAP * 2.0, FLAP_HZ * 3.0),
-        Motion::Idle | Motion::Walk => (FLAP, FLAP_HZ),
+        Motion::Idle | Motion::Walk | Motion::Climb { .. } => (FLAP, FLAP_HZ),
     };
     amp * (seconds * hz * TAU).sin()
 }
@@ -163,6 +163,98 @@ const STRIDE: f32 = 14.0 * PI / 180.0;
 const PUNCH_REACH: f32 = 95.0 * PI / 180.0;
 /// Full walk cycles per second.
 const WALK_HZ: f32 = 1.7;
+/// Climbing (docs/knowledge/ux/ladders.md): both arms raised, hands alternating while moving.
+const CLIMB_ARM: f32 = 160.0 * PI / 180.0;
+const CLIMB_REACH: f32 = 20.0 * PI / 180.0;
+const CLIMB_HZ: f32 = 6.0;
+
+/// Shoulder pivot to the hand in the rig canvas, px (`ArmFront` pivot [21, 25], `HAND` [22, 36]).
+pub const ARM_LEN: f32 = 11.0;
+/// The longest reach-out, world px: past the farthest tile in reach, so it never falls short.
+/// ponytail: one length for everyone; per-player reach mods only change which tiles count.
+pub const MAX_REACH_PX: f32 = (game_shared::rules::REACH as f32 + 2.0) * game_shared::TILE_SIZE;
+/// Reach-out timing, seconds (docs/knowledge/ux/vfx-farming-punch.md (a)).
+const PUNCH_OUT: f32 = 0.08;
+const PUNCH_BACK: f32 = 0.10;
+const PLACE_OUT: f32 = 0.06;
+const PLACE_BACK: f32 = 0.08;
+/// A place stretches this fraction of a punch's length.
+const PLACE_LENGTH: f32 = 0.6;
+
+/// One reach-out of the front arm towards a tile: out fast, back a little slower.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Reach {
+    pub started: f32,
+    /// Arm length (px) when it started: a new swing during the return starts from there.
+    pub from: f32,
+    /// Full length (px), clamped to `MAX_REACH_PX` and shortened for a place.
+    pub length: f32,
+    /// Arm rotation (radians, CCW, as drawn facing east; the root mirrors it): 0 hangs down.
+    pub angle: f32,
+    pub place: bool,
+    pub tile: (u32, u32),
+    /// `ArmContact` has been sent for this reach.
+    pub contacted: bool,
+}
+
+impl Reach {
+    /// From the shoulder (world px) towards the target tile's centre (world px).
+    pub fn new(
+        now: f32,
+        from: f32,
+        shoulder: [f32; 2],
+        target: [f32; 2],
+        tile: (u32, u32),
+        place: bool,
+        facing_west: bool,
+    ) -> Self {
+        let side = if facing_west { -1.0 } else { 1.0 };
+        let (dx, dy) = ((target[0] - shoulder[0]) * side, target[1] - shoulder[1]);
+        let full = dx.hypot(dy).clamp(ARM_LEN, MAX_REACH_PX);
+        let length = if place {
+            ARM_LEN + (full - ARM_LEN) * PLACE_LENGTH
+        } else {
+            full
+        };
+        Reach {
+            started: now,
+            from,
+            length,
+            angle: dy.atan2(dx) + PI / 2.0,
+            place,
+            tile,
+            contacted: false,
+        }
+    }
+
+    fn times(&self) -> (f32, f32) {
+        if self.place {
+            (PLACE_OUT, PLACE_BACK)
+        } else {
+            (PUNCH_OUT, PUNCH_BACK)
+        }
+    }
+
+    /// When the arm is fully out: the moment of contact (hit particles line up with it).
+    pub fn contact(&self) -> f32 {
+        self.started + self.times().0
+    }
+
+    /// Arm length at `now` (px): ease-out to full, then ease-in back. `None` once back.
+    pub fn length_at(&self, now: f32) -> Option<f32> {
+        let (out, back) = self.times();
+        let t = now - self.started;
+        if t < out {
+            let k = (t / out).max(0.0);
+            Some(self.from + (self.length - self.from) * (1.0 - (1.0 - k) * (1.0 - k)))
+        } else if t < out + back {
+            let k = (t - out) / back;
+            Some(self.length + (ARM_LEN - self.length) * k * k)
+        } else {
+            None
+        }
+    }
+}
 
 /// How the body moves this frame. `swing` is punch progress in `0..1`.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -170,10 +262,28 @@ pub enum Motion {
     Idle,
     Walk,
     Air,
+    /// On a ladder; `moving` = climbing or sliding sideways, not hanging still.
+    Climb {
+        moving: bool,
+    },
 }
 
 /// Rotation (radians, CCW) and vertical shift (px, world up) of each part, indexed like `Part::ALL`.
 pub fn pose(motion: Motion, seconds: f32, swing: Option<f32>) -> [(f32, f32); 6] {
+    if let Motion::Climb { moving } = motion {
+        let reach = if moving {
+            CLIMB_REACH * (seconds * CLIMB_HZ * TAU).sin()
+        } else {
+            0.0
+        };
+        return Part::ALL.map(|part| match part {
+            ArmFront => (CLIMB_ARM + reach, 0.0),
+            ArmBack => (CLIMB_ARM - reach, 0.0),
+            LegFront => (-reach / 2.0, 0.0),
+            LegBack => (reach / 2.0, 0.0),
+            Torso | Head => (0.0, 0.0),
+        });
+    }
     let (leg, bob) = match motion {
         Motion::Idle => (0.0, 0.0),
         Motion::Walk => {
@@ -182,7 +292,7 @@ pub fn pose(motion: Motion, seconds: f32, swing: Option<f32>) -> [(f32, f32); 6]
             (STRIDE * phase, if phase.abs() > 0.5 { -1.0 } else { 0.0 })
         }
         // A frozen mid-stride while airborne.
-        Motion::Air => (STRIDE, 0.0),
+        Motion::Air | Motion::Climb { .. } => (STRIDE, 0.0),
     };
     let punch = swing.map(|progress| PUNCH_REACH * (progress.clamp(0.0, 1.0) * PI).sin());
     Part::ALL.map(|part| match part {
@@ -324,5 +434,41 @@ mod tests {
         assert!(punch(0.0).abs() < 1e-5);
         assert!((punch(0.5) - PUNCH_REACH).abs() < 1e-5);
         assert!(punch(1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_reach_goes_out_to_the_target_and_comes_back() {
+        // Straight right of the shoulder, facing east: the arm points right (a quarter turn CCW).
+        let reach = Reach::new(1.0, ARM_LEN, [0.0, 0.0], [40.0, 0.0], (3, 4), false, false);
+        assert!((reach.angle - PI / 2.0).abs() < 1e-5);
+        assert_eq!(reach.length, 40.0);
+        assert_eq!(reach.length_at(1.0), Some(ARM_LEN));
+        assert_eq!(reach.contact(), 1.0 + PUNCH_OUT);
+        assert!(
+            (reach.length_at(1.0 + PUNCH_OUT).unwrap() - 40.0).abs() < 1e-3,
+            "full at contact"
+        );
+        assert!(
+            reach
+                .length_at(1.0 + PUNCH_OUT + PUNCH_BACK + 0.01)
+                .is_none(),
+            "back"
+        );
+        // Facing west, the same target behind is mirrored; a far target is clamped; a place is shorter.
+        let west = Reach::new(0.0, ARM_LEN, [0.0, 0.0], [-40.0, 0.0], (0, 0), false, true);
+        assert!((west.angle - PI / 2.0).abs() < 1e-5);
+        let far = Reach::new(
+            0.0,
+            ARM_LEN,
+            [0.0, 0.0],
+            [0.0, -900.0],
+            (0, 0),
+            false,
+            false,
+        );
+        assert_eq!(far.length, MAX_REACH_PX);
+        assert!(far.angle.abs() < 1e-5, "straight down hangs at 0");
+        let place = Reach::new(0.0, ARM_LEN, [0.0, 0.0], [40.0, 0.0], (0, 0), true, false);
+        assert!(place.length < reach.length && place.contact() < PUNCH_OUT);
     }
 }

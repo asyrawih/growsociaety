@@ -18,7 +18,7 @@ use crate::hud::OpenPanel;
 use crate::levels_ui::LevelUpSound;
 use crate::screenshot;
 use crate::settings::{MAX_VOLUME, Settings};
-use crate::state::{ActionResult, Game, GameEvent, Phase};
+use crate::state::{ActionResult, Game, GameEvent, Phase, WorldReplaced};
 
 const WORLD_BGM: &str = "audio/bgm/world.ogg";
 /// Seconds between two footsteps while walking on the ground.
@@ -63,9 +63,11 @@ pub enum Sfx {
     UiClick,
     PanelOpen,
     Craft,
+    /// A sapling took a second seed (docs/knowledge/ux/vfx-farming-punch.md §b).
+    Splice,
 }
 
-const SFX_COUNT: usize = Sfx::Craft as usize + 1;
+const SFX_COUNT: usize = Sfx::Splice as usize + 1;
 
 impl Sfx {
     fn file(self) -> &'static str {
@@ -90,6 +92,7 @@ impl Sfx {
             Sfx::UiClick => "audio/sfx/ui_click.ogg",
             Sfx::PanelOpen => "audio/sfx/panel_open.ogg",
             Sfx::Craft => "audio/sfx/craft.ogg",
+            Sfx::Splice => "audio/sfx/splice.ogg",
         }
     }
 }
@@ -162,9 +165,14 @@ fn listen(
     mut chats: MessageReader<ChatReceived>,
     mut level_ups: MessageReader<LevelUpSound>,
     mut ears: Local<Ears>,
+    mut replaced: MessageReader<WorldReplaced>,
     mut sfx: MessageWriter<Sfx>,
 ) {
     let me = game.1;
+    // A reset keeps the world's name: the stored copy is stale, take a new one.
+    if replaced.read().count() > 0 {
+        ears.tiles = None;
+    }
     if !ears.entered {
         ears.entered = true;
         sfx.write(Sfx::Door);
@@ -264,6 +272,7 @@ fn event_sfx(event: &Event, me: PlayerId, gems: &mut u32) -> Option<Sfx> {
         }
         Event::TreeHarvested { .. } => Some(Sfx::Harvest),
         Event::TreePlanted { .. } => Some(Sfx::Plant),
+        Event::TreeSpliced { .. } => Some(Sfx::Splice),
         Event::LeftWorld { player } if player == me => Some(Sfx::Door),
         Event::Equipped { player, .. } if player == me => Some(Sfx::Equip),
         Event::Crafted { player, .. } if player == me => Some(Sfx::Craft),
