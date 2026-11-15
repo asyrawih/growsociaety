@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["client/game_client", "crates/game_shared", "crates/game_protocol", "server/world_server"]
+members = ["client/game_client", "crates/game_shared", "crates/game_protocol", "crates/rttex_viewer", "server/world_server"]
 
 [workspace.package]
 version = "0.1.0"

@@ -3,7 +3,8 @@
 # Release builds play online against production by default (net.rs PROD_SERVER).
 #
 # usage: scripts/release-mac.sh [version]        (default 0.11.0)
-# Notarization runs when a notarytool keychain profile named "growsociety" exists:
+# Notarization uses APPLE_API_KEY/APPLE_API_KEY_PATH/APPLE_API_ISSUER (App Store Connect key) if set,
+# else a notarytool keychain profile named "growsociety":
 #   xcrun notarytool store-credentials growsociety --apple-id <id> --team-id XT3J546N4R --password <app-specific>
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -56,12 +57,17 @@ rm -f "$entitlements"
 codesign --verify --deep --strict --verbose=2 "$app"
 
 ditto -c -k --keepParent "$app" "$zip"
-if xcrun notarytool history --keychain-profile growsociety >/dev/null 2>&1; then
-  xcrun notarytool submit "$zip" --keychain-profile growsociety --wait
+if [ -n "${APPLE_API_KEY:-}" ]; then
+  notary_auth=(--key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER")
+elif xcrun notarytool history --keychain-profile growsociety >/dev/null 2>&1; then
+  notary_auth=(--keychain-profile growsociety)
+fi
+if [ -n "${notary_auth:-}" ]; then
+  xcrun notarytool submit "$zip" "${notary_auth[@]}" --wait
   xcrun stapler staple "$app"
   rm -f "$zip" && ditto -c -k --keepParent "$app" "$zip"
   spctl -a -vv "$app"
 else
-  echo "NOT NOTARIZED: no 'growsociety' notarytool profile (see the header of this script)"
+  echo "NOT NOTARIZED: no APPLE_API_* env and no 'growsociety' notarytool profile (see the header of this script)"
 fi
 ls -lh "$zip"
